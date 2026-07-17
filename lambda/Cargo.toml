@@ -1,0 +1,144 @@
+[package]
+name = "axiom-lambda"
+version.workspace = true
+edition = "2021"
+license = "GPL-3.0"
+authors = ["AXIOM Project"]
+description = "AXIOM Lambda - k=3 consensus engine"
+
+[dependencies]
+# Core validation logic (for types).
+# `ceremony` feature gates sign_sphincs / sign_dilithium — needed for
+# validator_withdrawal test fixtures (operator SPHINCS+ signature).
+axiom-core-logic = { git = "https://github.com/AXIOM-Origin-Validator/axiom-core", tag = "core-b77fd28a", features = ["ceremony"] }
+# Structured error responses (AXIOM_YellowPaper_Errors.md Phase 2b).
+axiom-errors = { workspace = true, features = ["std"] }
+# AXC/L$/atom conversion for display and API
+axiom-denomination = { git = "https://github.com/AXIOM-Origin-Validator/axiom-lib", tag = "lib-v3.3.0" }
+# Shared per-IP TCP rate limiter (single source, also used by ANTIE)
+axiom-rate-limit = { git = "https://github.com/AXIOM-Origin-Validator/axiom-lib", tag = "lib-v3.3.0" }
+
+# zkVM host for proof generation/verification
+axiom-zk-vm = { git = "https://github.com/AXIOM-Origin-Validator/axiom-core", tag = "core-b77fd28a" }
+
+# AVM — interpreter + DMAP attestation (riscv-interpreter enables real RV32IM execution)
+axiom-dmap-vm = { git = "https://github.com/AXIOM-Origin-Validator/axiom-core", tag = "core-b77fd28a", default-features = true, features = ["riscv-interpreter"] }
+
+# Async runtime
+tokio = { version = "1.0", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# CRITICAL: use workspace ciborium (default-features = false). Without
+# this, lambda's ciborium had std features enabled while sdk/core/etc.
+# used no_std. The two paths produced subtly different CBOR for the same
+# FactChain struct, which surfaced as FactInvalidSignature on chain
+# round-trip in update_fact_chain_confirmation. CL1-DIAG hint
+# ("ciborium decode dropped a field on a code path with different feature
+# flags") was literal.
+ciborium = { workspace = true }
+
+# Cryptography
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+fips204 = { version = "0.4", features = ["ml-dsa-65", "default-rng"] }
+fips205 = { version = "0.4", features = ["slh_dsa_sha2_128s"] }
+blake3 = "1.5"
+sha3 = "0.10"
+rand = "0.8"
+
+# Storage (SQLCipher — AES-256 encryption at rest)
+rusqlite = { version = "0.31", features = ["bundled-sqlcipher"] }
+
+# Logging
+tracing = "0.1"
+# The `tracing-log` feature on tracing-subscriber bridges the `log`
+# crate (used by Cranelift, regalloc2, wasmtime) into tracing — without
+# it, EnvFilter directives targeting those JIT crates were silently
+# bypassed (Linux's first chaos preview found ~90 MB/min of CLIF IR
+# dumps surviving `cranelift=off`). tracing-subscriber 0.3.22+ installs
+# the LogTracer automatically inside `.init()`, so no explicit
+# tracing-log direct dep + no LogTracer::init() call needed.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "tracing-log"] }
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Mutex without poisoning (no cascading panics)
+parking_lot = "0.12"
+
+# Hex encoding
+hex = "0.4"
+
+# Config
+toml = "0.8"
+
+# CLI
+clap = { version = "4.0", features = ["derive"] }
+
+# TLS for inter-service TCP (opt-in for multi-host deployment)
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+
+# KI#23 mitigation — periodic `malloc_trim(0)` against glibc arena
+# retention. See `lambda/src/malloc_trim.rs`.
+libc = "0.2"
+
+# Step 9B.9 — required by `consensus::tests::create_test_engine` so
+# integration tests in `lambda/tests/*.rs` can build a Lambda engine.
+# Only pulled when the `test-helpers` feature is on (default off in
+# production; enabled transitively by `dev-mode`).
+tempfile = { version = "3.0", optional = true }
+
+[[bin]]
+name = "lambda"
+path = "src/main.rs"
+
+[[bin]]
+name = "validator-setup"
+path = "src/bin/validator_setup.rs"
+
+[[bin]]
+name = "genesis-ceremony"
+path = "src/bin/genesis_ceremony.rs"
+
+# This integration test uses `consensus::tests::create_test_engine`, exposed only
+# under the `test-helpers` feature (which `dev-mode` enables). Mark it so a plain
+# `cargo test -p axiom-lambda` (feature off) gracefully SKIPS it instead of failing
+# to compile with E0432 — run it via `--features test-helpers` (or dev-mode).
+[[test]]
+name = "withdrawal_mint_e2e"
+required-features = ["test-helpers"]
+
+[features]
+default = ["zkp"]
+# Real ZKP proving (requires RISC Zero toolchain + zkVM artifacts)
+zkp = ["axiom-zk-vm/prove"]
+# Expose `consensus::tests::create_test_engine` for integration tests
+# (lambda/tests/*.rs) so they can spin up a consensus engine without
+# duplicating the ~80-line VBC/Ed25519/AvmConfig wiring. Default-off —
+# production builds and other crates don't see the test helpers.
+test-helpers = ["tempfile"]
+# Gate pulse calibration behind Lambda benchmark (production release only)
+pulse-gate = ["axiom-dmap-vm/pulse-gate"]
+# Disable YPX-009 audit chain (Argon2id) entirely. NOT FOR PRODUCTION.
+disable-audit = ["axiom-dmap-vm/disable-audit"]
+# Cranelift JIT for AVM — 2-3x faster consensus execution
+cranelift-jit = ["axiom-dmap-vm/cranelift-jit-backend"]
+# Reduce Argon2id from 32MB to 512KB. Full chain logic, fast execution. For testing.
+light-audit = ["axiom-dmap-vm/light-audit"]
+dev-mode = ["axiom-dmap-vm/dev-mode", "test-helpers"]  # Relaxed VBC requirements + test-helpers visibility. NOT FOR PRODUCTION.
+
+[dev-dependencies]
+tempfile = "3.0"
+axiom-test-utils = { git = "https://github.com/AXIOM-Origin-Validator/axiom-core", tag = "core-b77fd28a" }
+# YP §19.6 fee ledger end-to-end integration test (Step 8.5): exercises
+# CL5 redeem → Nabla /register → DEED pool credit → earnings query →
+# Lambda withdrawal verify. Spans both crates in one cohesive test.
+axiom-nabla = { git = "https://github.com/AXIOM-Origin-Validator/axiom-nabla", tag = "nabla-v3.3.0", features = ["dev-mode"] }
+ed25519-dalek = "2.1"
+fips205 = "0.4"
+blake3 = "1.5"
+ciborium = "0.2"

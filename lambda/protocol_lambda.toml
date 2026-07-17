@@ -1,0 +1,26 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  AXIOM · LAMBDA tuning registers          →  tuning_gen::*   (consensus engine)
+# ═══════════════════════════════════════════════════════════════════════════
+#  Edit a value here, rebuild Lambda, and build.rs regenerates the Rust constants.
+#  Lambda-only tuning (governance / protection timing) — NO CoreID impact.
+#
+#  FORMAT      key = value    # optional inline comment. Values are LITERAL u64
+#              integers (the parser does no arithmetic); `_` digit separators ok.
+#  DEV/PROD    `foo` = production value; `foo_dev` = the value used in a
+#              `--features dev-mode` build (build.rs emits ONE cfg-selected FOO).
+#              None of the knobs below have a `_dev` twin yet — all long-horizon
+#              governance windows that could take one when dev testing needs it.
+# ───────────────────────────────────────────────────────────────────────────
+
+
+# ── Console engine (YPX-013) — validator-operator governance timing (ticks) ─
+console_cooldown_ticks          = 1_555_200   # ~90 days between proposals
+console_voting_window_ticks     = 17_280      # ~24h voting window
+console_liveness_interval_ticks = 1_555_200   # ~90 days liveness cadence
+console_liveness_response_ticks = 51_840      # ~72h to respond to a liveness ping
+
+# ── DWP (Decentralized Wallet Protection) ──────────────────────────────────
+dwp_expiry_secs = 31_536_000   # 1 year (365 * 86400)
+
+# ── JFP (Judicial Freeze Protocol) ─────────────────────────────────────────
+jfp_freeze_duration_secs = 31_536_000   # 1 year (365 * 24 * 60 * 60)

@@ -1,0 +1,9 @@
+# Reproducible-build path sanitization (exported config uses the generic
+# 'builder' username — substitute your own, or build as /home/builder): strip the builder's home directory from
+# compiler-embedded source paths (file!() panic locations) so no binary carries an
+# operator username. Applies to host-target builds (lambda/antie/nabla/wheel on Linux;
+# the axiom-sdk-ffi dylib the macOS wallet/DMG links on macOS); the riscv Core ELF
+# carries the same remap via core/avm-guest/.cargo/config.toml. Both prefixes are listed
+# so one config sanitizes on either build host — the non-matching prefix is a no-op.
+[build]
+rustflags = ["--remap-path-prefix=/home/builder=/build", "--remap-path-prefix=/Users/builder=/build"]

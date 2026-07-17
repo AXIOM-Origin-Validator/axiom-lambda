@@ -1,0 +1,64 @@
+[workspace]
+resolver = "2"
+members = [
+    "lambda",
+]
+
+# zkvm-guest and avm-guest require separate RISC-V cross-compilation
+# Build with: ./core/build-zkvm.sh (zkvm) or cargo build --target riscv32im-unknown-none-elf (avm)
+# core/bin is deprecated (replaced by direct AVM interpreter execution)
+# core/ipc re-included for conformance tool (integer-keyed CBOR encoding)
+exclude = []
+
+[workspace.package]
+version = "3.3.0"
+edition = "2021"
+license = "GPL-3.0"
+authors = ["AXIOM-Origin-Validator"]
+
+[workspace.dependencies]
+# Hashing
+blake3 = { version = "1.5", default-features = false }
+sha3 = { version = "0.10", default-features = false }
+tiny-keccak = { version = "2.0", default-features = false, features = ["sha3"] }
+
+# Signatures
+ed25519-dalek = { version = "2.1", default-features = false, features = ["alloc"] }
+fips204 = { version = "0.4", default-features = false, features = ["ml-dsa-65", "default-rng"] }
+fips205 = { version = "0.4", features = ["slh_dsa_sha2_128s"] }
+
+# Transport encryption (forward-direction UMP encryption — see
+# docs/AXIOM_DESIGN_PublicMailCarriers.md §3). Ed25519 keypairs are converted
+# to X25519 for ECDH; ChaCha20Poly1305 wraps the inner UMP body. These are
+# transport-layer only — NEVER pulled into the AVM guest. Each consumer
+# enables them explicitly (default-features = false here so we stay no_std-
+# clean at the workspace layer; consumers add features as needed).
+x25519-dalek = { version = "2.0", default-features = false, features = ["static_secrets"] }
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+sha2 = { version = "0.10", default-features = false }
+rand_core = { version = "0.6", default-features = false }
+
+# Serialization
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
+
+# CBOR — Canonical Binary Object Representation (YP §5.10)
+ciborium = { version = "0.2", default-features = false }
+
+# Encoding
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
+
+# Error handling
+thiserror = { version = "1.0", default-features = false }
+
+# Structured error responses (AXIOM_YellowPaper_Errors.md).
+# Uses path-based workspace dep so every layer picks up the same version.
+# `default-features = false` — core-logic compiles no_std for the AVM guest
+# and must not pull in std. Host code (lambda, nabla, antie, sdk) enables
+# the `std` feature explicitly at its own dep declaration.
+axiom-errors = { git = "https://github.com/AXIOM-Origin-Validator/axiom-lib", tag = "lib-v3.3.0", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = true
