@@ -79,7 +79,15 @@ pub struct LambdaConfig {
 }
 
 fn default_min_validators_for_fees() -> usize { 6 }
-fn default_max_fact_links() -> usize { 16 }
+/// NOT a hardcoded literal — the value is a tuning register in
+/// protocol_lambda.toml, baked by build.rs into `tuning_gen::MAX_FACT_LINKS`.
+/// Delete that key and this FAILS TO COMPILE (no const is emitted), which is
+/// deliberate: the previous `{ 16 }` meant a lambda.toml with no value silently
+/// got 16 and nothing reported it. That silently wedged a low-activity wallet
+/// on 2026-08-18 — chain legitimately at 23 links while its SEC-07 checkpoint
+/// accumulated co-signs, refused by Lambda at 16 under an error naming
+/// MAX_FACT_DEPTH, a constant that is not even on the live path.
+fn default_max_fact_links() -> usize { crate::tuning_gen::MAX_FACT_LINKS as usize }
 fn default_scarred_fee_cap() -> u64 { 100_000 } // 0.00001 AXC
 fn default_vacuum_interval() -> u64 { 1800 } // 30 minutes
 fn default_vbc_renewal() -> u64 { 86_400 } // 24 hours
@@ -119,10 +127,6 @@ pub struct StorageConfig {
     #[serde(default = "default_max_hints")]
     pub max_hints: usize,
 
-    /// Path to seed hints JSON file (optional — loaded once at startup)
-    /// Contains initial validator hints for network bootstrap
-    #[serde(default)]
-    pub seed_hints_path: Option<PathBuf>,
 
     // Legacy fields — ignored, kept for backwards compatibility during migration
     #[serde(default, skip_serializing, rename = "state_db")]
@@ -226,7 +230,7 @@ impl Default for ProofConfig {
 /// Example TOML:
 /// ```toml
 /// [fees]
-/// rate_bps = 50           # 0.50% per transaction
+/// rate_bps = 30           # 0.30% per transaction (= MAX_VALIDATOR_FEE_BPS cap; higher is clamped)
 /// valid_until = 1735689600  # 2025-01-01 — when this rate expires
 /// min_amount = 10000      # minimum fee in atoms (dust floor)
 /// ```
@@ -247,7 +251,10 @@ pub struct FeeConfig {
     pub min_amount: u64,
 }
 
-fn default_fee_rate() -> u32 { 50 } // 0.50%
+fn default_fee_rate() -> u32 { 30 } // 0.30% = MAX_VALIDATOR_FEE_BPS. Was a
+// misleading 50 (0.50%): consensus clamps every rate to the 30-bps cap
+// (`MAX_VALIDATOR_FEE_BPS`, validation.rs), so 50 charged 30 anyway and only
+// misled operators into thinking they earned 0.50%. Audit Area 2 fix.
 fn default_min_fee() -> u64 { 10_000 }
 
 impl Default for FeeConfig {
@@ -331,9 +338,18 @@ impl Default for OracleConfig {
 impl OracleConfig {
     /// Compute AXC payout for a given platform and credit delta.
     /// Returns 0 if platform not configured or rate is 0.
+    /// Compute the payout for a claim, **in atoms**.
+    ///
+    /// `conversion_rates` are credits-per-AXC, so `credit_delta / rate` yields
+    /// whole AXC; the result is converted to atoms via the denomination lib.
+    /// Before the D6 fix (2026-07-28) this returned the raw AXC count, which
+    /// Core then compared against an atom cap and credited into an atom balance
+    /// — a 10^10 under-payment. Keep the `axc()` conversion here: Core's cap and
+    /// the credited balance are both atoms, and this is the only place the rate
+    /// is applied.
     pub fn compute_payout(&self, platform_url: &str, credit_delta: u64) -> u64 {
         match self.conversion_rates.get(platform_url) {
-            Some(&rate) if rate > 0 => credit_delta / rate,
+            Some(&rate) if rate > 0 => axiom_denomination::axc(credit_delta / rate),
             _ => 0,
         }
     }
@@ -417,7 +433,6 @@ impl Default for LambdaConfig {
                 transaction_db: PathBuf::from("./data/lambda.db"),
                 management_db: PathBuf::from("./data/management.db"),
                 max_hints: 1024,
-                seed_hints_path: None,
                 _state_db: None,
                 _receipts_db: None,
             },
@@ -428,7 +443,7 @@ impl Default for LambdaConfig {
                 dilithium_pub_path: Some(PathBuf::from("./config/dilithium.pub")),
                 sphincs_key_path: Some(PathBuf::from("./config/sphincs.key")),
                 sphincs_pub_path: Some(PathBuf::from("./config/sphincs.pub")),
-                vbc_path: Some(PathBuf::from("./config/vbc.json")),
+                vbc_path: Some(PathBuf::from("./config/vbc-bundle.cbor")), // §6b.12 — the CBOR bundle
                 min_witnesses: 3,
                 generate_proofs: false,
             },
@@ -468,5 +483,27 @@ impl LambdaConfig {
             .map_err(|e| LambdaError::ConfigError(format!("Failed to write config: {}", e)))?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod retired_key_tests {
+    use super::*;
+
+    /// KI#174 — `seed_hints_path` was removed with the retired `seed-hints.json`
+    /// loader. Operator `lambda.toml` files still carry the key and are never
+    /// edited for them, so a config with it must keep loading (the key is ignored).
+    #[test]
+    fn a_config_with_the_retired_seed_hints_path_still_loads() {
+        let text = toml::to_string_pretty(&LambdaConfig::default()).unwrap();
+        assert!(text.contains("[storage]"));
+        let with_key = text.replacen(
+            "[storage]\n",
+            "[storage]\nseed_hints_path = \"/var/lib/axiom/config/seed-hints.json\"\n",
+            1,
+        );
+        assert!(with_key.contains("seed_hints_path"));
+        let parsed: LambdaConfig = toml::from_str(&with_key).expect("retired key must be ignored");
+        assert_eq!(parsed.storage.max_hints, LambdaConfig::default().storage.max_hints);
     }
 }

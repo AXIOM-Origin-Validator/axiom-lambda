@@ -16,7 +16,7 @@
 //!
 //! Output:
 //!   {output_dir}/root-keys/root_{1,2,3}.{key,pub}  — Root authority key pairs
-//!   {output_dir}/{validator}/vbc.json               — Signed VBC per validator
+//!   {output_dir}/{validator}/vbc-bundle.cbor        — Signed VBC per validator (VBCProofBundle CBOR, ValidatorJoin §6b.12)
 //!   {validator_path}/config/{ed25519,sphincs,dilithium}.{key,pub} — Validator keys
 //!   Core genesis.rs — auto-installed (with confirmation)
 
@@ -27,7 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use fips205::slh_dsa_sha2_128s;
 use fips205::traits::{SerDes, Signer, Verifier};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 // SPHINCS+ sizes (SLH-DSA-SHA2-128s)
 const SPHINCS_PK_SIZE: usize = 32;
@@ -70,31 +70,95 @@ struct ValidatorConfig {
     path: String,
     wallet_email: Option<String>,
     pgp_fingerprint: Option<String>,
-    notes: Option<String>,
+    // Genesis re-domaining (the owner, 2026-09-20). Genesis is not the public join
+    // path: the OPERATOR creates the stake wallet themselves (a validator never
+    // mints its own wallet — feedback_validator_never_creates_wallets) and hands
+    // the ceremony its id + Ed25519 key to bake into Core.
+    //   wallet_id      = the full stake wallet_id string, e.g.
+    //                    "alpha@trustmesh.org/27dbb7d0ba".
+    //   stake_key_path = path to the Ed25519 stake PRIVATE key to import
+    //                    (raw 32 bytes, as written to config/ed25519.key, or 64-hex).
+    // REAL ceremony: BOTH required (missing → error). REHEARSAL (--rehearsal):
+    // BOTH absent → the tool mints a fresh key + derives the id on the spot.
+    // Exactly one set without the other is a config error. When wallet_id is given
+    // it is verified for its key-independent binding (email + salt) to the imported
+    // key + wallet_email; the id that BAKES is derived under this network's key and
+    // printed (see `genesis_stake_wallet_id` — 2026-09-25 finding).
+    wallet_id: Option<String>,
+    stake_key_path: Option<String>,
+    // `notes` in genesis-ceremony.toml is for humans; the certificate carries no notes (§6b.12 point 6).
 }
 
-// ============================================================================
-// Output VBC (JSON)
-// ============================================================================
+/// The genesis STAKE wallet id that bakes into Core for one validator, given
+/// the operator's imported Ed25519 pk, their `wallet_email`, and (real run)
+/// the `wallet_id` they typed into the toml.
+///
+/// ⚠ FOUND 2026-09-25 on the first temporary re-domaining run. A wallet_id's
+/// checksum(6) AND pk_bind(2) are both keyed by `WALLET_IDENTITY_KEY`
+/// (`wallet_id::compute_checksum`, `compute_pk_bind` — the MASTER pk is in
+/// both preimages); only the trailing salt(2) = `default_salt(pk)` =
+/// BLAKE3(pk)[..2] comes from the key alone. The operator creates the stake
+/// wallet BEFORE the ceremony, i.e. under the PRE-ceremony key, and the
+/// MASTER key this network will use does not exist until the ceremony mints
+/// it. So the operator CANNOT know the post-ceremony id, and the old
+/// `provided == derived` check could only ever pass by accident of order
+/// (the 09-20/21 rehearsals minted keys and derived ids inside the tool).
+/// Measured: lockup `alpha@trustmesh.org/df7cfe1a94` (pre-ceremony key) vs
+/// the new network's own derivation `alpha@trustmesh.org/d0d3168494` — same
+/// pk, same email, only the salt `94` agrees. A baked id the network does
+/// not derive means `GENESIS_LOCKUP_WALLET_IDS` (the `E_GENESIS_STAKE_LOCKED`
+/// key) names nothing.
+///
+/// Therefore the provided id is verified for its KEY-INDEPENDENT binding —
+/// (i) its email == `wallet_email`, (ii) its salt == `default_salt(pk)`
+/// (8 bits of pk binding, the same width as pk_bind) — and the id that bakes
+/// is always the one DERIVED under `master_pk` (the compiled, post-bake
+/// `WALLET_IDENTITY_KEY` in the real tool). `verify_pk_binding` is NOT used
+/// here on purpose: under the new key it refuses every honestly-provided
+/// pre-ceremony id.
+///
+/// Returns `(baked_id, Some(provided))` when the operator's string differs
+/// from the baked one (expected on a real run — the caller prints the
+/// mapping), `(baked_id, None)` when they agree or nothing was provided.
+fn genesis_stake_wallet_id(
+    name: &str,
+    email: &str,
+    master_pk: &[u8; 32],
+    pk: &[u8; 32],
+    provided: Option<&str>,
+) -> Result<(String, Option<String>), String> {
+    use axiom_core_logic::wallet_id::{default_salt, extract_email, generate_wallet_id_with_identity_key, parse_wallet_id};
+    let salt = default_salt(pk);
+    // Derived with the SDK's own salt rule so the id written here is byte-equal
+    // to the address the SDK derives from the same key under this network's key.
+    let derived = generate_wallet_id_with_identity_key(email, &salt, master_pk, pk)
+        .map_err(|e| format!("ERROR [{}]: cannot derive a wallet_id for '{}': {:?}", name, email, e))?;
+    let Some(provided) = provided else { return Ok((derived, None)); };
+    let (p_email, _checksum, _pk_bind, p_salt) = parse_wallet_id(provided)
+        .map_err(|e| format!("ERROR [{}]: provided wallet_id '{}' is malformed: {:?}", name, provided, e))?;
+    let want_email = extract_email(&derived).expect("derived id parses");
+    if p_email != want_email {
+        return Err(format!(
+            "ERROR [{}]: provided wallet_id '{}' carries email '{}' but wallet_email is '{}'. Fix the toml wallet_id or wallet_email.",
+            name, provided, p_email, want_email));
+    }
+    if p_salt != salt {
+        return Err(format!(
+            "ERROR [{}]: provided wallet_id '{}' does NOT bind to the imported key (its salt '{}' ≠ BLAKE3(pk)[..2] = '{}' for stake_key_path's key). Point stake_key_path at the key that created this wallet, or fix the toml wallet_id.",
+            name, provided, p_salt, salt));
+    }
+    if provided == derived { Ok((derived, None)) } else { Ok((derived, Some(provided.to_string()))) }
+}
 
-#[derive(Serialize)]
-struct VBCOutput {
-    version: u8,
-    validator_id_hex: String,
-    subject_pubkey_sphincs_hex: String,
-    subject_pubkey_dilithium_hex: String,
-    subject_pubkey_ed25519_hex: String,
-    pgp_fingerprint_hex: String,
-    node_name: String,
-    issued_at: u64,
-    expires_at: u64,
-    chain_depth: u8,
-    issuer_set: Vec<String>,        // 3 root PK hex strings
-    signatures: Vec<String>,        // 3 SPHINCS+ sig hex strings
-    name: String,
-    notes: String,
-    ceremony_ca: String,
-    ceremony_ca_pgp: String,
+/// Parse an Ed25519 private key from a file's bytes: raw 32 bytes, or a 64-char
+/// hex string (whitespace trimmed). Returns None if it is neither.
+fn parse_ed25519_sk(raw: &[u8]) -> Option<[u8; 32]> {
+    if raw.len() == 32 {
+        return raw.try_into().ok();
+    }
+    let s = std::str::from_utf8(raw).ok()?.trim();
+    let bytes = hex::decode(s).ok()?;
+    bytes.try_into().ok()
 }
 
 // ============================================================================
@@ -109,10 +173,13 @@ fn main() {
     } else if args.len() > 1 {
         &args[1]
     } else {
-        eprintln!("Usage: genesis-ceremony --config <path-to-genesis-ceremony.toml>");
+        eprintln!("Usage: genesis-ceremony --config <path-to-genesis-ceremony.toml> [--rehearsal]");
         std::process::exit(1);
     };
-    
+    // Rehearsal lets a validator without wallet_id/stake_key_path mint a fresh key
+    // on the spot; a real ceremony REQUIRES both to be provided per validator.
+    let rehearsal = args.iter().any(|a| a == "--rehearsal");
+
     println!("╔════════════════════════════════════════════════════════╗");
     println!("║           AXIOM Genesis Ceremony Tool                 ║");
     println!("║           VBC v0.9 — SPHINCS+ Root Authority          ║");
@@ -211,6 +278,8 @@ fn main() {
     println!("═══ Step 2: Generating Genesis Validator Keys & Signing VBCs ═══");
     
     let mut genesis_sphincs_pks: Vec<(String, Vec<u8>)> = Vec::new();
+    // §6c — the ten genesis stake wallet ids, written to genesis_lockup_wallets.txt.
+    let mut genesis_stake_wallet_ids: Vec<String> = Vec::new();
     
     for validator in &config.validators {
         println!("\n  --- {} ---", validator.name);
@@ -218,15 +287,45 @@ fn main() {
         let vdir = PathBuf::from(&validator.path);
         let config_dir = vdir.join("config");
         fs::create_dir_all(&config_dir).ok();
-        
-        // GENERATE Ed25519 operational key
-        // For genesis validators, ALL keys come from the CA.
-        // Ed25519 is used for day-to-day witness signing and encryption.
-        let ed25519_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+
+        if validator.wallet_id.is_some() && validator.wallet_email.is_none() {
+            eprintln!("ERROR [{}]: wallet_id is set but wallet_email is missing — the id can only be verified against its email.", validator.name);
+            std::process::exit(1);
+        }
+
+        // Ed25519 = the genesis STAKE wallet key (it is this VBC's subject key AND
+        // the key the stake wallet_id derives from, below). Real ceremony: import
+        // the operator's pre-created key; rehearsal with nothing provided: mint one.
+        let (ed25519_sk_bytes, ed25519_key_imported): (Vec<u8>, bool) =
+            match (&validator.wallet_id, &validator.stake_key_path) {
+                (Some(_), Some(kp)) => {
+                    let raw = fs::read(kp).unwrap_or_else(|e| {
+                        eprintln!("ERROR [{}]: cannot read stake_key_path '{}': {}", validator.name, kp, e);
+                        std::process::exit(1);
+                    });
+                    let key = parse_ed25519_sk(&raw).unwrap_or_else(|| {
+                        eprintln!("ERROR [{}]: stake_key_path '{}' is not a 32-byte Ed25519 key (raw 32 bytes or 64-hex).", validator.name, kp);
+                        std::process::exit(1);
+                    });
+                    (key.to_vec(), true)
+                }
+                (None, None) => {
+                    if !rehearsal {
+                        eprintln!("ERROR [{}]: a REAL genesis ceremony requires `wallet_id` + `stake_key_path` in genesis-ceremony.toml — the operator creates the stake wallet and the ceremony imports it (never mints). Provide both, or run with --rehearsal to mint on the spot.", validator.name);
+                        std::process::exit(1);
+                    }
+                    (ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng).to_bytes().to_vec(), false)
+                }
+                _ => {
+                    eprintln!("ERROR [{}]: set BOTH `wallet_id` and `stake_key_path`, or NEITHER (rehearsal mints). One without the other is a config error.", validator.name);
+                    std::process::exit(1);
+                }
+            };
+        let ed25519_sk = ed25519_dalek::SigningKey::from_bytes(
+            ed25519_sk_bytes.as_slice().try_into().expect("Ed25519 SK must be 32 bytes"));
         let ed25519_pk = ed25519_sk.verifying_key();
         let ed25519_pk_bytes = ed25519_pk.as_bytes().to_vec();
-        let ed25519_sk_bytes = ed25519_sk.to_bytes().to_vec();
-        
+
         let ed25519_pk_path = config_dir.join("ed25519.pub");
         let ed25519_sk_path = config_dir.join("ed25519.key");
         fs::write(&ed25519_pk_path, &ed25519_pk_bytes).expect("Failed to write Ed25519 PK");
@@ -237,7 +336,8 @@ fn main() {
             fs::set_permissions(&ed25519_sk_path, fs::Permissions::from_mode(0o600))
                 .expect("Failed to set Ed25519 SK permissions");
         }
-        println!("  Ed25519 PK:   {} (GENERATED by CA)", hex::encode(&ed25519_pk_bytes[..8]));
+        println!("  Ed25519 PK:   {} ({})", hex::encode(&ed25519_pk_bytes[..8]),
+                 if ed25519_key_imported { "IMPORTED from stake_key_path" } else { "GENERATED (rehearsal)" });
         
         // GENERATE SPHINCS+ keypair (VBC identity — primary quantum-resistant)
         let (sphincs_pk_obj, sphincs_sk_obj) = slh_dsa_sha2_128s::try_keygen()
@@ -309,6 +409,8 @@ fn main() {
             signatures: vec![],  // not yet signed — payload doesn't include signatures
             max_tx: 0,  // VBCs (Lambda) don't use TX budget — 0 = unlimited
             founding_vbc_hash: [0u8; 32],  // genesis VBC — self-referential, set after signing
+            genesis_lineage: [0u8; 32],
+            nabla_registration: None,
         };
         let commitment = axiom_core_logic::compute::compute_vbc_signing_payload(&core_vbc);
         
@@ -343,45 +445,62 @@ fn main() {
         let vbc_output_dir = output_dir.join(&validator.name);
         fs::create_dir_all(&vbc_output_dir).expect("Failed to create VBC output dir");
         
-        let vbc = VBCOutput {
-            version: config.ceremony.vbc_version,
-            validator_id_hex: hex::encode(validator_id),
-            subject_pubkey_sphincs_hex: hex::encode(&sphincs_pk),
-            subject_pubkey_dilithium_hex: hex::encode(&dilithium_pk),
-            subject_pubkey_ed25519_hex: hex::encode(&ed25519_pk_bytes),
-            pgp_fingerprint_hex: hex::encode(&pgp_bytes),
-            node_name: validator.name.clone(),
-            issued_at: now,
-            expires_at,
-            chain_depth: 0,
-            issuer_set: root_pks.iter().map(hex::encode).collect(),
-            signatures: signatures.iter().map(hex::encode).collect(),
-            name: validator.name.clone(),
-            notes: validator.notes.clone().unwrap_or_default(),
-            ceremony_ca: config.certificate_authority.name.clone(),
-            ceremony_ca_pgp: config.certificate_authority.pgp_fingerprint.clone(),
-        };
-        
-        let vbc_json = serde_json::to_string_pretty(&vbc).expect("Failed to serialize VBC");
-        let vbc_path = vbc_output_dir.join("vbc.json");
-        fs::write(&vbc_path, &vbc_json).expect("Failed to write VBC");
-        println!("  VBC saved:    {}", vbc_path.display());
-        
+        // ValidatorJoin §6b.12 point 6 — the ceremony's certificate output is Core's typed bundle in
+        // CBOR (depth 0, no issuer certificates): the one file validators load. The hand-rolled
+        // `VBCOutput` JSON copy that stood here is gone; its extra fields (name, notes, CA) are this
+        // ceremony's own input config.
+        let signed_vbc = axiom_core_logic::types::VBC { signatures: signatures.clone(), ..core_vbc.clone() };
+        let bundle = axiom_core_logic::types::VBCProofBundle { target_vbc: signed_vbc, supporting_vbcs: vec![], candidacy_pulse: None, renewal_work_receipt: None };
+        let mut bundle_cbor = Vec::new();
+        ciborium::into_writer(&bundle, &mut bundle_cbor).expect("Failed to encode VBC bundle");
+        let bundle_path = vbc_output_dir.join("vbc-bundle.cbor");
+        fs::write(&bundle_path, &bundle_cbor).expect("Failed to write VBC bundle");
+        println!("  VBC saved:    {}", bundle_path.display());
+
         // Also copy to validator's config directory
-        let validator_vbc_path = vdir.join("config/vbc.json");
         if vdir.join("config").exists() {
-            fs::write(&validator_vbc_path, &vbc_json).ok();
-            println!("  VBC copied:   {}", validator_vbc_path.display());
+            let validator_bundle_path = vdir.join("config/vbc-bundle.cbor");
+            fs::write(&validator_bundle_path, &bundle_cbor).ok();
+            println!("  VBC copied:   {}", validator_bundle_path.display());
         }
 
-        // Generate genesis wallet_id from wallet_email (e.g. "validator_alpha@axiom/hex10")
+        // §6c — the GENESIS STAKE WALLET id (e.g. "alpha@trustmesh.org/d0d3168494"):
+        // the wallet whose key IS this validator's Ed25519 key, opening at the
+        // ceremony-minted 1,000,000 AXC (GenesisDistribution §2.3a). Derived
+        // with the SDK's own salt rule (`wallet_id::default_salt`) so the id
+        // written here is byte-equal to the address the SDK derives from the
+        // same key — a fixed "00" salt (until 2026-09-08) produced a second
+        // address for one key. Collected into genesis_lockup_wallets.txt below:
+        // Core compiles that list in, and it is what makes the wallet a genesis
+        // stake wallet everywhere (`genesis::genesis_opening_balance`).
+        //
+        // The id that bakes is ALWAYS the one derived under the COMPILED
+        // WALLET_IDENTITY_KEY — which is why g1-full-ceremony.sh bakes the MASTER
+        // key into wallet_id.rs and REBUILDS this tool before running it. A
+        // provided (real-run) id is verified for its key-independent binding only;
+        // see `genesis_stake_wallet_id` for the 2026-09-25 finding. An earlier
+        // version required `provided == derived`, which under the pre-ceremony
+        // key baked ids this network never derives.
         if let Some(ref email) = validator.wallet_email {
             let pk_arr: [u8; 32] = ed25519_pk_bytes.as_slice().try_into().expect("Ed25519 pk must be 32 bytes");
-            let wallet_id = axiom_core_logic::wallet_id::generate_wallet_id(email, "00", &pk_arr)
-                .unwrap_or_else(|e| panic!("Failed to generate wallet_id for {}: {:?}", email, e));
+            let (wallet_id, operator_id) = genesis_stake_wallet_id(
+                &validator.name, email, &axiom_core_logic::wallet_id::WALLET_IDENTITY_KEY, &pk_arr,
+                validator.wallet_id.as_deref(),
+            ).unwrap_or_else(|msg| { eprintln!("{}", msg); std::process::exit(1); });
             let wallet_id_path = config_dir.join("wallet_id.txt");
             fs::write(&wallet_id_path, &wallet_id).expect("Failed to write wallet_id");
-            println!("  Wallet ID:    {}", wallet_id);
+            println!("  Stake wallet: {}", wallet_id);
+            if let Some(op) = operator_id {
+                // Expected on a real run, not an error: the operator's wallet was
+                // created under the PRE-ceremony key; this is the id the network
+                // derives for the same key + email. RECORD the baked id.
+                println!("  [{}] operator id {} (pre-ceremony key) → baked id {} (this network's key)", validator.name, op, wallet_id);
+            }
+            // `<wallet_id> <ed25519_pk_hex>` — the KEY column is the identity Core
+            // compiles in (GENESIS_STAKE_WALLET_PKS); the id is an address.
+            genesis_stake_wallet_ids.push(format!("{} {}", wallet_id, hex::encode(&pk_arr)));
+        } else {
+            println!("  ⚠ no wallet_email — this validator gets NO genesis stake wallet id (§6c)");
         }
 
         genesis_sphincs_pks.push((validator.name.clone(), sphincs_pk));
@@ -405,10 +524,13 @@ fn main() {
     rs.push_str("/// Genesis validators - hardcoded in Core.bin\n");
     rs.push_str("///\n");
     rs.push_str(&format!("/// These are the SPHINCS+ public keys of the {} Genesis validators (First Penguins).\n", genesis_sphincs_pks.len()));
-    rs.push_str("/// They define the \"reality anchor\" - the root of trust for all VBCs.\n");
-    rs.push_str("/// A VBC chain is valid if and only if all branches terminate at one of these keys.\n");
-    rs.push_str("/// Used for backward-compatible overlap detection.\n");
-    rs.push_str("/// VBC chain verification uses ROOT_AUTHORITY_PKS as trust anchor.\n");
+    rs.push_str("/// ⚠ These are NOT the VBC trust anchor. VBC chain verification terminates at\n");
+    rs.push_str("/// `ROOT_AUTHORITY_PKS` (`vbc.rs::verify_chain_recursive`, `root_check`); this\n");
+    rs.push_str("/// table is used for reserved-name enforcement\n");
+    rs.push_str("/// (`vbc.rs::enforce_genesis_name_reservation`, which compares\n");
+    rs.push_str("/// `subject_pubkey_sphincs`) and for backward-compatible overlap detection.\n");
+    rs.push_str("/// An earlier version of this comment called it \"the root of trust for all\n");
+    rs.push_str("/// VBCs\" and said chains terminate here — that was wrong.\n");
     rs.push_str(&format!("pub const GENESIS_VALIDATORS: [[u8; 32]; {}] = [\n", genesis_sphincs_pks.len()));
     for (name, pk) in &genesis_sphincs_pks {
         rs.push_str(&format!("    // {}\n", name));
@@ -468,6 +590,23 @@ fn main() {
     // ========================================
     // Step 4: Auto-install into Core genesis.rs
     // ========================================
+    // §6c — genesis_lockup_wallets.txt: the ten genesis stake wallet ids, ONE per
+    // line. Core's build.rs compiles it into GENESIS_LOCKUP_WALLET_IDS, which is
+    // both the 3-year lock's key and the membership test behind
+    // `genesis::genesis_opening_balance`. Saved with the constants; installed
+    // beside genesis.rs (core/logic/genesis_lockup_wallets.txt) on the same
+    // confirmation as the constants below.
+    let lockup_list = {
+        let mut t = String::from("# Genesis STAKE wallets — `<wallet_id> <ed25519_pk_hex>` per line, exactly the genesis validators (§6c).\n");
+        t.push_str("# Written by the G1 ceremony (lambda/src/bin/genesis_ceremony.rs) from each\n");
+        t.push_str("# validator's wallet_email + Ed25519 key. Core compiles this list in.\n");
+        for id in &genesis_stake_wallet_ids { t.push_str(id); t.push('\n'); }
+        t
+    };
+    let lockup_list_path = output_dir.join("genesis_lockup_wallets.txt");
+    fs::write(&lockup_list_path, &lockup_list).expect("Failed to write genesis_lockup_wallets.txt");
+    println!("  Lockup list:  {} ({} ids)", lockup_list_path.display(), genesis_stake_wallet_ids.len());
+
     let core_genesis_path = config.ceremony.core_genesis_path.as_ref()
         .map(PathBuf::from);
     
@@ -536,14 +675,25 @@ fn main() {
                     fs::write(genesis_path, &new_genesis)
                         .expect("Failed to write genesis.rs");
                     println!("  ✓ genesis.rs updated successfully");
+                    // §6c — the lockup list lives at core/logic/genesis_lockup_wallets.txt,
+                    // i.e. two levels up from core/logic/src/genesis.rs.
+                    if let Some(core_logic_dir) = genesis_path.parent().and_then(|p| p.parent()) {
+                        let list_target = core_logic_dir.join("genesis_lockup_wallets.txt");
+                        fs::write(&list_target, &lockup_list)
+                            .expect("Failed to write genesis_lockup_wallets.txt");
+                        println!("  ✓ {} written ({} genesis stake wallet ids)", list_target.display(), genesis_stake_wallet_ids.len());
+                    }
                     println!("  ✓ Rebuild Core to activate new keys");
                 } else {
                     println!("  Skipped. Constants saved to: {}", rs_path.display());
                 }
             } else {
-                eprintln!("  WARNING: Could not find auto-generated marker in genesis.rs");
+                // 2026-09-11 (G1 rehearsal 3): this used to be a WARNING followed by exit 0 —
+                // a ceremony that did not install its constants reported success. Hard error.
+                eprintln!("  ERROR: Could not find the auto-generated marker in genesis.rs — constants NOT installed");
                 eprintln!("  This file may have been manually edited.");
-                eprintln!("  Constants saved to {} — install manually.", rs_path.display());
+                eprintln!("  Constants saved to {} — restore the two-line marker and re-run.", rs_path.display());
+                std::process::exit(1);
             }
         }
     } else {
@@ -558,7 +708,7 @@ fn main() {
     println!("║           Genesis Ceremony Complete                   ║");
     println!("╠════════════════════════════════════════════════════════╣");
     println!("║  Root keys:      {}/root_{{1,2,3}}.{{key,pub}}", root_keys_dir.display());
-    println!("║  Signed VBCs:    {}/*/vbc.json", output_dir.display());
+    println!("║  Signed VBCs:    {}/*/vbc-bundle.cbor", output_dir.display());
     println!("║  Rust constants: {}", rs_path.display());
     if core_genesis_path.is_some() {
         println!("║  Core genesis:   auto-installed (if confirmed)");
@@ -627,4 +777,86 @@ fn format_bytes_inline(bytes: &[u8]) -> String {
         .map(|b| format!("0x{:02X}", b))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::genesis_stake_wallet_id;
+    use axiom_core_logic::wallet_id::{default_salt, generate_wallet_id_with_identity_key, parse_wallet_id};
+
+    const EMAIL: &str = "alpha@trustmesh.org";
+    // PRE-ceremony master key (what the operator's wallet was created under) and
+    // the key the ceremony bakes (what the tool is compiled with when it runs).
+    const PRE_KEY: [u8; 32] = [0x11; 32];
+    const NEW_KEY: [u8; 32] = [0x22; 32];
+
+    fn pk(seed: u8) -> [u8; 32] {
+        ed25519_dalek::SigningKey::from_bytes(&[seed; 32]).verifying_key().to_bytes()
+    }
+
+    /// The 2026-09-25 shape: the operator's id (pre-ceremony key) differs in
+    /// checksum + pk_bind, agrees in email + salt → ACCEPTED, and what bakes is
+    /// the id derived under the NEW key, with the operator's string reported.
+    #[test]
+    fn provided_pre_ceremony_id_is_accepted_and_the_derived_id_bakes() {
+        let pk = pk(7);
+        let salt = default_salt(&pk);
+        let operator_id = generate_wallet_id_with_identity_key(EMAIL, &salt, &PRE_KEY, &pk).unwrap();
+        let network_id = generate_wallet_id_with_identity_key(EMAIL, &salt, &NEW_KEY, &pk).unwrap();
+        assert_ne!(operator_id, network_id, "test premise: the two keys derive different ids");
+        // Prove the premise the fix rests on: prefix differs, salt agrees.
+        let (_, oc, ob, os) = parse_wallet_id(&operator_id).unwrap();
+        let (_, nc, nb, ns) = parse_wallet_id(&network_id).unwrap();
+        assert!(oc != nc || ob != nb, "checksum/pk_bind must be key-dependent");
+        assert_eq!(os, ns, "salt is key-independent");
+
+        let (baked, reported) = genesis_stake_wallet_id("alpha", EMAIL, &NEW_KEY, &pk, Some(&operator_id)).unwrap();
+        assert_eq!(baked, network_id, "the DERIVED id is what bakes");
+        assert_eq!(reported.as_deref(), Some(operator_id.as_str()), "the operator's id is reported for the mapping line");
+    }
+
+    #[test]
+    fn provided_id_equal_to_derived_is_accepted_silently() {
+        let pk = pk(8);
+        let network_id = generate_wallet_id_with_identity_key(EMAIL, &default_salt(&pk), &NEW_KEY, &pk).unwrap();
+        let (baked, reported) = genesis_stake_wallet_id("alpha", EMAIL, &NEW_KEY, &pk, Some(&network_id)).unwrap();
+        assert_eq!(baked, network_id);
+        assert!(reported.is_none());
+    }
+
+    #[test]
+    fn no_provided_id_derives_under_the_compiled_key() {
+        let pk = pk(9);
+        let network_id = generate_wallet_id_with_identity_key(EMAIL, &default_salt(&pk), &NEW_KEY, &pk).unwrap();
+        let (baked, reported) = genesis_stake_wallet_id("alpha", EMAIL, &NEW_KEY, &pk, None).unwrap();
+        assert_eq!(baked, network_id);
+        assert!(reported.is_none());
+    }
+
+    /// The id was created from a DIFFERENT Ed25519 key than stake_key_path's:
+    /// its salt = BLAKE3(other_pk)[..2] ≠ BLAKE3(pk)[..2] → refused.
+    #[test]
+    fn wrong_key_is_refused_by_the_salt() {
+        let pk = super::tests::pk(10);
+        // find a pk whose salt differs (BLAKE3 prefix collides 1/256 of the time)
+        let other = (11u8..).map(super::tests::pk).find(|o| default_salt(o) != default_salt(&pk)).unwrap();
+        let operator_id = generate_wallet_id_with_identity_key(EMAIL, &default_salt(&other), &PRE_KEY, &other).unwrap();
+        let err = genesis_stake_wallet_id("alpha", EMAIL, &NEW_KEY, &pk, Some(&operator_id)).unwrap_err();
+        assert!(err.contains("does NOT bind to the imported key"), "{err}");
+    }
+
+    #[test]
+    fn wrong_email_is_refused() {
+        let pk = pk(12);
+        let operator_id = generate_wallet_id_with_identity_key("beta@trustmesh.org", &default_salt(&pk), &PRE_KEY, &pk).unwrap();
+        let err = genesis_stake_wallet_id("alpha", EMAIL, &NEW_KEY, &pk, Some(&operator_id)).unwrap_err();
+        assert!(err.contains("carries email 'beta@trustmesh.org' but wallet_email is 'alpha@trustmesh.org'"), "{err}");
+    }
+
+    #[test]
+    fn malformed_provided_id_is_refused() {
+        let pk = pk(13);
+        let err = genesis_stake_wallet_id("alpha", EMAIL, &NEW_KEY, &pk, Some("alpha@trustmesh.org/zz")).unwrap_err();
+        assert!(err.contains("is malformed"), "{err}");
+    }
 }

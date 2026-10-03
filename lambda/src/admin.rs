@@ -3,14 +3,30 @@
 //! Serves JSON stats from ConsensusEngine and Storage for the operator console.
 //! Binds to 127.0.0.1 only (localhost). No public network exposure.
 //!
+//! **JSON boundary (KI#178, ruled by the owner; YP §16.8.5.2).** This is the LOCAL
+//! admin / monitoring surface: loopback-bound, every route but `/health` behind
+//! the admin token, read by the operator, the console and the harness. It is NOT
+//! a protocol path, so its routes answer JSON. `/peers` and `/work-receipt` answer
+//! CBOR because they carry Core types. Its ONE in-validator reader is ANTIE's
+//! YPX-015 busy gate, which polls its OWN Lambda's `/stats` for `avg_witness_ms`
+//! (same host, same validator, a load signal — never consensus; the port comes
+//! from the validator's own Lambda config with no default — 2c880556, where every
+//! ANTIE polled alpha's `:7780` with zero failures and wrong data). The POST
+//! governance routes are operator input on loopback and forward nothing onward
+//! (verified 2026-10-01; `/console/finalize` builds a Core `FanOutMessage` and
+//! returns only its id). `scripts/check_json_protocol_path.py` holds this file at
+//! its classified `serde_json` count (ADMIN_HTTP).
+//!
 //! Endpoints:
 //! - `GET /health`    -> Lightweight health check (always accessible, no auth)
-//! - `GET /stats`     -> Witness/redeem counters from ValidatorStats
+//! - `GET /stats`     -> Witness/redeem counters from ValidatorStats + `jemalloc`
+//!                      allocator counters (KI#89; glibc/SQLCipher NOT included)
+//!                      + `idempotency` cache footprint and hit/miss (KI#89)
 //! - `GET /proof`     -> Proof pipeline status (DMAP/ZKP mode, timing)
 //! - `GET /identity`  -> Validator ID, VBC chain, NBC status
 //! - `GET /db`        -> Storage metrics (record count, size)
 //! - `GET /fees`      -> v3.x earnings (this validator's slot atoms + count)
-//! - `GET /peers`     -> Discovered validators (hint table)
+//! - `GET /peers`     -> Discovered validators: CBOR `Vec<ValidatorHint>` (KI#173)
 //! - `GET /capacity`  -> Hardware capacity snapshot (CPU/RAM/disk/GPU/net) for operator
 
 use crate::consensus::ConsensusEngine;
@@ -31,17 +47,6 @@ fn parse_hex32(hex_str: &str) -> Result<[u8; 32], String> {
     Ok(arr)
 }
 
-/// AUDIT-FIX v2.11.14: Validate Nabla address against known safe peers.
-/// Only localhost Nabla HTTP ports (6226-6231) are accepted.
-/// This prevents SSRF via caller-controlled nabla_url in /jfp/scar.
-fn is_allowed_nabla_addr(addr: &str) -> bool {
-    // Known Nabla HTTP ports: 6226-6231 (6 genesis nodes)
-    const ALLOWED: &[&str] = &[
-        "127.0.0.1:6226", "127.0.0.1:6227", "127.0.0.1:6228",
-        "127.0.0.1:6229", "127.0.0.1:6230", "127.0.0.1:6231",
-    ];
-    ALLOWED.contains(&addr)
-}
 
 /// Extract a query parameter value from a query string.
 /// E.g., extract_query_param("token=abc&foo=bar", "token") => Some("abc")
@@ -193,81 +198,70 @@ pub fn spawn_admin_server_with_rate_limit(
                 let path = path.to_string();
                 let query = query.map(|s| s.to_string());
                 let body_str = body_str.to_string();
-                let body_str_for_async = body_str.clone();
                 let header_section = header_section.map(|s| s.to_string());
-                let engine_for_async = engine.clone();
 
-                let (status, body) = tokio::task::spawn_blocking(move || {
+                let (status, body, content_type) = tokio::task::spawn_blocking(move || {
                 let query_ref = query.as_deref();
                 let header_ref = header_section.as_deref();
                 if !check_auth(&path, query_ref, &auth_token, header_ref) {
                     warn!("Admin auth failed from client (path={})", path);
-                    ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_string())
+                    json_body("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_string())
                 } else if method == "GET" || method == "HEAD" {
                     match path.as_str() {
-                        "/health" => ("200 OK", health_json(&engine)),
-                        "/stats" => ("200 OK", stats_json(&engine)),
-                        "/proof" => ("200 OK", proof_json(&engine)),
-                        "/identity" => ("200 OK", identity_json(&engine)),
-                        "/db" => ("200 OK", db_json(&engine)),
-                        "/fees" => ("200 OK", fees_json(&engine)),
-                        "/peers" => ("200 OK", peers_json(&engine)),
-                        "/capacity" => ("200 OK", capacity_json(&engine)),
-                        "/audit" => ("200 OK", audit_json(&engine)),
-                        "/approvals" => ("200 OK", approvals_json(&engine)),
-                        "/dwp" => ("200 OK", dwp_json(&engine)),
-                        "/dwp/wallets" => ("200 OK", dwp_wallets_json(&engine)),
-                        "/dwp/detail" => ("200 OK", dwp_detail_json(&engine, query_ref)),
-                        "/jfp/result" => ("200 OK", jfp_result_json(&engine, query_ref)),
-                        "/mv/select" => ("200 OK", mv_select_json(&engine, query_ref)),
-                        "/mv/status" => ("200 OK", mv_status_json(&engine, query_ref)),
-                        "/console" => ("200 OK", console_json(&engine)),
-                        "/scar-passcode" => ("200 OK", scar_passcode_json(&engine, query_ref)),
-                        "/delivery-status" => ("200 OK", delivery_status_json(&engine, query_ref)),
-                        _ => ("404 Not Found", r#"{"error":"not found"}"#.to_string()),
+                        "/health" => json_body("200 OK", health_json(&engine)),
+                        "/stats" => json_body("200 OK", stats_json(&engine)),
+                        "/proof" => json_body("200 OK", proof_json(&engine)),
+                        "/identity" => json_body("200 OK", identity_json(&engine)),
+                        "/db" => json_body("200 OK", db_json(&engine)),
+                        "/fees" => json_body("200 OK", fees_json(&engine)),
+                        "/peers" => ("200 OK", peers_cbor(&engine), "application/cbor"),
+                        "/work-receipt" => ("200 OK", work_receipt_cbor(&engine, query_ref), "application/cbor"),
+                        "/capacity" => json_body("200 OK", capacity_json(&engine)),
+                        "/audit" => json_body("200 OK", audit_json(&engine)),
+                        "/pulse" => json_body("200 OK", pulse_json(&engine)),
+                        "/approvals" => json_body("200 OK", approvals_json(&engine)),
+                        "/dwp" => json_body("200 OK", dwp_json(&engine)),
+                        "/dwp/wallets" => json_body("200 OK", dwp_wallets_json(&engine)),
+                        "/dwp/detail" => json_body("200 OK", dwp_detail_json(&engine, query_ref)),
+                        "/jfp/result" => json_body("200 OK", jfp_result_json(&engine, query_ref)),
+                        "/mv/select" => json_body("200 OK", mv_select_json(&engine, query_ref)),
+                        "/mv/status" => json_body("200 OK", mv_status_json(&engine, query_ref)),
+                        "/console" => json_body("200 OK", console_json(&engine)),
+                        "/scar-passcode" => json_body("200 OK", scar_passcode_json(&engine, query_ref)),
+                        "/delivery-status" => json_body("200 OK", delivery_status_json(&engine, query_ref)),
+                        _ => json_body("404 Not Found", r#"{"error":"not found"}"#.to_string()),
                     }
                 } else if method == "POST" {
                     match path.as_str() {
-                        "/dwp/query" => ("200 OK", handle_dwp_query(&engine, &body_str)),
-                        "/dwp/case" => ("200 OK", handle_dwp_case(&engine, &body_str)),
-                        "/dwp/vote" => ("200 OK", handle_dwp_vote(&engine, &body_str)),
-                        "/jfp/scar" => ("200 OK", handle_jfp_scar(&engine, &body_str)),
-                        "/console/bootstrap" => ("200 OK", handle_console_bootstrap(&engine)),
-                        "/console/propose" => ("200 OK", handle_console_propose(&engine, &body_str)),
-                        "/console/dismiss" => ("200 OK", handle_console_dismiss(&engine, &body_str)),
-                        "/console/core-update" => ("200 OK", handle_console_core_update(&engine, &body_str)),
-                        "/console/vote" => ("200 OK", handle_console_vote(&engine, &body_str)),
-                        "/console/finalize" => ("200 OK", handle_console_finalize(&engine)),
-                        "/delivery-update" => ("200 OK", handle_delivery_update(&engine, &body_str)),
-                        "/scar-passcode/recover" => ("200 OK", handle_scar_passcode_recover(&engine, &body_str)),
-                        // /withdrawal/mint is handled async outside spawn_blocking
-                        // (network fan-out, not DB-bound). Sentinel returned here
-                        // so the outer match knows to handle it.
-                        "/withdrawal/mint" => ("__ASYNC__", String::new()),
-                        _ => ("404 Not Found", r#"{"error":"not found"}"#.to_string()),
+                        "/dwp/query" => json_body("200 OK", handle_dwp_query(&engine, &body_str)),
+                        "/dwp/case" => json_body("200 OK", handle_dwp_case(&engine, &body_str)),
+                        "/dwp/vote" => json_body("200 OK", handle_dwp_vote(&engine, &body_str)),
+                        "/jfp/scar" => json_body("200 OK", handle_jfp_scar(&engine, &body_str)),
+                        "/console/bootstrap" => json_body("200 OK", handle_console_bootstrap(&engine)),
+                        "/console/propose" => json_body("200 OK", handle_console_propose(&engine, &body_str)),
+                        "/console/dismiss" => json_body("200 OK", handle_console_dismiss(&engine, &body_str)),
+                        "/console/core-update" => json_body("200 OK", handle_console_core_update(&engine, &body_str)),
+                        "/console/vote" => json_body("200 OK", handle_console_vote(&engine, &body_str)),
+                        "/console/finalize" => json_body("200 OK", handle_console_finalize(&engine)),
+                        "/delivery-update" => json_body("200 OK", handle_delivery_update(&engine, &body_str)),
+                        "/scar-passcode/recover" => json_body("200 OK", handle_scar_passcode_recover(&engine, &body_str)),
+                        _ => json_body("404 Not Found", r#"{"error":"not found"}"#.to_string()),
                     }
                 } else {
-                    ("405 Method Not Allowed", r#"{"error":"method not allowed"}"#.to_string())
+                    json_body("405 Method Not Allowed", r#"{"error":"method not allowed"}"#.to_string())
                 }
-                }).await.unwrap_or(("500 Internal Server Error", r#"{"error":"handler panicked"}"#.to_string()));
+                }).await.unwrap_or(json_body("500 Internal Server Error", r#"{"error":"handler panicked"}"#.to_string()));
 
-                // Async-path handlers (network fan-out — must NOT live in
-                // spawn_blocking). Dispatch on the sentinel returned above.
-                let (status, body) = if status == "__ASYNC__" {
-                    let result = handle_withdrawal_mint_async(&engine_for_async, &body_str_for_async).await;
-                    ("200 OK", result)
-                } else {
-                    (status, body)
-                };
 
                 // SECURITY FIX #4: CORS restricted from wildcard (*) to localhost only.
                 // Wildcard allowed any website to query admin stats via cross-origin requests.
                 // Admin endpoint already binds to 127.0.0.1, so only localhost origins are valid.
-                let response = format!(
-                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: http://127.0.0.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    status, body.len(), body
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
+                let mut response = format!(
+                    "HTTP/1.1 {}\r\nContent-Type: {}\r\nAccess-Control-Allow-Origin: http://127.0.0.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    status, content_type, body.len()
+                ).into_bytes();
+                response.extend_from_slice(&body);
+                let _ = stream.write_all(&response).await;
                 debug!("Admin request: {} -> {}", first_line, status);
             });
         }
@@ -330,11 +324,71 @@ fn stats_json(engine: &ConsensusEngine) -> String {
         concat!(
             r#"{{"witness_count":{},"witness_dmap_count":{},"witness_zkvm_count":{},"witness_success":{},"witness_errors":{},"atoms_witnessed":{},"avg_witness_us":{},"avg_witness_ms":{},"#,
             r#""redeem_count":{},"redeem_success":{},"redeem_errors":{},"atoms_redeemed":{},"avg_redeem_us":{},"#,
-            r#""genesis_inits":{},"hint_count":{},"last_tx_at":{},"fee_redemption_available":{},"oracle_qualified":{},"last_error":"{}"}}"#,
+            r#""genesis_inits":{},"hint_count":{},"last_tx_at":{},"fee_redemption_available":{},"oracle_qualified":{},"last_error":"{}","jemalloc":{},"idempotency":{}}}"#,
         ),
         wc, w_dmap, w_zkvm, ws, we, aw, avg_witness_us, avg_witness_ms,
         rc, rs, re, ar, avg_redeem_us,
-        gi, hc, last_tx, fee_available, oracle_enabled, escaped_err,
+        gi, hc, last_tx, fee_available, oracle_enabled, escaped_err, jemalloc_json(),
+        idempotency_json(engine),
+    )
+}
+
+/// KI#89 (2026-10-02): the two request_id idempotency caches — footprint
+/// (entries, bytes; each cache ≤ `idempotency_cache_bytes`) and the gates'
+/// hit/miss counters. The load soak reads `witness_bytes` plateauing at ≤ the
+/// budget beside `jemalloc.allocated`; misses vs hits say whether the window
+/// covers the SDK's retry horizon.
+fn idempotency_json(engine: &ConsensusEngine) -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let s = &engine.stats;
+    let (we, wb, re, rb) = engine.idempotency_cache_footprint();
+    format!(
+        concat!(
+            r#"{{"witness_entries":{},"witness_bytes":{},"redeem_entries":{},"redeem_bytes":{},"#,
+            r#""budget_bytes":{},"witness_hits":{},"witness_misses":{},"redeem_hits":{},"redeem_misses":{}}}"#,
+        ),
+        we, wb, re, rb, crate::consensus::IDEMPOTENCY_CACHE_BYTES,
+        s.idempotency_witness_hits.load(Relaxed), s.idempotency_witness_misses.load(Relaxed),
+        s.idempotency_redeem_hits.load(Relaxed), s.idempotency_redeem_misses.load(Relaxed),
+    )
+}
+
+/// KI#89 (2026-10-01): jemalloc's own counters, in bytes, for the `/stats`
+/// `jemalloc` object — the deciding number for the RSS climb.
+///
+/// - `allocated` ≈ `resident` and both growing under load → live LEAK
+///   (the hunt then points into `core/avm` / `core/zkvm-host` — Core, owner ruling).
+/// - `allocated` ≪ `resident` → RETENTION (allocator config, not a leak).
+///
+/// ⚠ BLIND SPOT, by construction: tikv-jemallocator exports PREFIXED symbols, so
+/// bundled SQLCipher (C, `libsqlite3-sys` bundled) allocates through **glibc**
+/// malloc and is invisible here. Process RSS + VmSwap − `resident` ≈ the glibc
+/// share (SQLCipher page cache, C deps). That is why `malloc_trim.rs` stays.
+///
+/// RULE 6: a counter that cannot be read is `null` (UNKNOWN), never 0, and never
+/// a panic on the admin task. `epoch::advance()` refreshes jemalloc's cached
+/// totals first; if THAT fails every field is `null` (a stale snapshot would
+/// otherwise read as live).
+fn jemalloc_json() -> String {
+    use tikv_jemalloc_ctl::{epoch, stats};
+    if epoch::advance().is_err() {
+        return jemalloc_fields_json([None, None, None, None, None]);
+    }
+    jemalloc_fields_json([
+        stats::allocated::read().ok(),
+        stats::resident::read().ok(),
+        stats::active::read().ok(),
+        stats::mapped::read().ok(),
+        stats::retained::read().ok(),
+    ])
+}
+
+/// Render `[allocated, resident, active, mapped, retained]` — `None` → `null`.
+fn jemalloc_fields_json(v: [Option<usize>; 5]) -> String {
+    let f = |x: Option<usize>| x.map_or_else(|| "null".to_string(), |n| n.to_string());
+    format!(
+        r#"{{"allocated":{},"resident":{},"active":{},"mapped":{},"retained":{}}}"#,
+        f(v[0]), f(v[1]), f(v[2]), f(v[3]), f(v[4]),
     )
 }
 
@@ -342,7 +396,9 @@ fn proof_json(engine: &ConsensusEngine) -> String {
     use std::sync::atomic::Ordering::Relaxed;
     let s = &engine.stats;
     let mode = s.proof_mode_str.lock().clone();
-    let zkp_qualified = s.zkp_qualified.load(Relaxed);
+    // YPX-007 §9 — derived from the one record; the status says why not.
+    let zkp_qualified = engine.zkp_qualification.lock().is_some();
+    let zkp_qual_status = json_escape(&s.zkp_qual_status.lock());
     // Proof count approximated by witness_success (one proof per witness)
     let proofs_generated = s.witness_success.load(Relaxed);
     let proof_failures = s.witness_errors.load(Relaxed);
@@ -351,8 +407,8 @@ fn proof_json(engine: &ConsensusEngine) -> String {
     let avg_proof_ms = if ws > 0 { wt as f64 / ws as f64 / 1000.0 } else { 0.0 };
 
     format!(
-        r#"{{"mode":"{}","proofs_generated":{},"proof_failures":{},"avg_proof_time_ms":{:.1},"zkp_qualified":{}}}"#,
-        mode, proofs_generated, proof_failures, avg_proof_ms, zkp_qualified,
+        r#"{{"mode":"{}","proofs_generated":{},"proof_failures":{},"avg_proof_time_ms":{:.1},"zkp_qualified":{},"zkp_qual_status":"{}"}}"#,
+        mode, proofs_generated, proof_failures, avg_proof_ms, zkp_qualified, zkp_qual_status,
     )
 }
 
@@ -417,6 +473,36 @@ fn fees_json(engine: &ConsensusEngine) -> String {
     )
 }
 
+/// §5.2.2e — this validator's latest signed Pulse proof, the credential a
+/// candidate attaches to its PROVISIONAL certificate request. `cbor_hex` is
+/// the exact `PulseProofRequest` bytes to carry; the other fields are for a
+/// human. `null` proof = no audit has passed yet (a fresh node needs ~5 min
+/// of traffic).
+fn pulse_json(engine: &ConsensusEngine) -> String {
+    // YPX-009 §7.2: executions refused for a failed self-audit — a counter
+    // consumers can read, so "never failed" and "never checked" differ.
+    let refused = engine.pulse_audit_failures();
+    match engine.last_pulse_proof() {
+        None => format!(r#"{{"proof":null,"audit_failures":{},"note":"no Pulse audit has passed yet — a validator needs ingested transactions and one 5-minute audit"}}"#, refused),
+        Some(p) => {
+            let mut cbor = Vec::new();
+            let _ = ciborium::into_writer(&p, &mut cbor);
+            serde_json::json!({
+                "proof": {
+                    "validator_pk_hex": hex::encode(p.validator_pk),
+                    "epoch": p.epoch,
+                    "entry_count": p.entry_count,
+                    "sample_size": p.sample_size,
+                    "argon2id_per_sec": p.argon2id_per_sec,
+                    "audit_hash_hex": hex::encode(p.audit_hash),
+                },
+                "cbor_hex": hex::encode(cbor),
+                "audit_failures": refused,
+            }).to_string()
+        }
+    }
+}
+
 fn audit_json(engine: &ConsensusEngine) -> String {
     let pending = engine.pending_audit();
     let txs_since = engine.audit_txs_since_demand();
@@ -435,13 +521,15 @@ fn audit_json(engine: &ConsensusEngine) -> String {
     let remaining = countdown_max.saturating_sub(txs_since);
 
     // Build banned validators JSON array
+    // `null` = the core lock was busy for this read: UNKNOWN, not "no bans".
     let bans = engine.peer_audit_bans();
     let mut bans_json = String::from("[");
-    for (i, ban) in bans.iter().enumerate() {
+    for (i, ban) in bans.iter().flatten().enumerate() {
         if i > 0 { bans_json.push(','); }
         let reason = match ban.reason {
             axiom_core_logic::types::PeerAuditBanReason::HashMismatch => "HashMismatch",
             axiom_core_logic::types::PeerAuditBanReason::NonResponds => "NonResponds",
+            axiom_core_logic::types::PeerAuditBanReason::NotHeldByCoWitness => "NotHeldByCoWitness",
         };
         bans_json.push_str(&format!(
             r#"{{"validator_pk":"{}","banned_at_tick":{},"reason":"{}"}}"#,
@@ -449,7 +537,65 @@ fn audit_json(engine: &ConsensusEngine) -> String {
         ));
     }
     bans_json.push(']');
+    if bans.is_none() {
+        bans_json = "null".into();
+    }
+    let nh = engine.peer_audit_not_held_counts();
+    let misc = engine.peer_audit_misc_counts();
+    let trig = engine.peer_audit_trigger_counts();
 
+    let mut body = audit_json_body(engine, pending, is_peer, txs_since, remaining, &bans_json, nh, misc, trig, countdown_max);
+    // Operator counts for the validator dashboard (2026-09-26). The AVM half is
+    // `null` when the core lock was busy for this read — never a fake 0.
+    body.pop();
+    body.push_str(&operator_counts_json(engine.audit_operator_counts(), engine.peer_audit_operator_counts()));
+    // Last AVM restart (operator display): wall clock + first attested tick after
+    // restart. `null` when the core lock was busy for this read.
+    let (rw, rt) = match engine.avm_restart_info() {
+        Some((w, t)) => (w.to_string(), t.to_string()),
+        None => ("null".into(), "null".into()),
+    };
+    body.push_str(&format!(r#","avm_restart_wall":{},"avm_restart_tick":{}"#, rw, rt));
+    body.push('}');
+    // Dev-only §23.14 audit chaos: injected counts ride /audit (docs/AXIOM_DESIGN_AuditChaos.md).
+    #[cfg(feature = "audit-chaos")]
+    {
+        body.pop();
+        body.push_str(&format!(r#","audit_chaos":{}}}"#, crate::audit_chaos::json()));
+    }
+    body
+}
+
+/// `,"self_audits_armed":…,"self_audits_passed":…,"peer_audit_bans_issued":…,
+/// "peer_audits_passed":…,"peer_audit_requests_answered":…,
+/// "peer_audit_reply_hint_unresolved":…` (KI#229) — the AVM three are
+/// `null` when their read was unavailable.
+/// A count as JSON: the number, or `null` when it could not be read.
+fn opt_u64(v: Option<u64>) -> String {
+    v.map(|n| n.to_string()).unwrap_or_else(|| "null".into())
+}
+
+fn operator_counts_json(avm: Option<(u64, u64, u64)>, lam: (u64, u64, u64)) -> String {
+    let f = opt_u64;
+    format!(
+        r#","self_audits_armed":{},"self_audits_passed":{},"peer_audit_bans_issued":{},"peer_audits_passed":{},"peer_audit_requests_answered":{},"peer_audit_reply_hint_unresolved":{}"#,
+        f(avm.map(|a| a.0)), f(avm.map(|a| a.1)), f(avm.map(|a| a.2)), lam.0, lam.1, lam.2,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn audit_json_body(
+    engine: &ConsensusEngine,
+    pending: Option<axiom_core_logic::types::AuditDemand>,
+    is_peer: bool,
+    txs_since: u64,
+    remaining: u64,
+    bans_json: &str,
+    nh: (u64, u64),
+    misc: (u64, u64, u64),
+    trig: Option<(u64, u64)>,
+    countdown_max: u64,
+) -> String {
     if let Some(demand) = pending {
         let target_hex = hex::encode(&demand.target_validator_pk);
         let nonce_hex = hex::encode(demand.challenge_nonce);
@@ -457,14 +603,18 @@ fn audit_json(engine: &ConsensusEngine) -> String {
         format!(
             concat!(
                 r#"{{"pending":true,"is_peer":{},"target_validator_pk":"{}","challenge_nonce":"{}","#,
-                r#""trigger_txid":"{}","txs_since_demand":{},"txs_remaining":{},"banned_validators":{}}}"#,
+                r#""trigger_txid":"{}","txs_since_demand":{},"txs_remaining":{},"banned_validators":{},"#,
+                r#""peer_audit_target_unresolved":{},"peer_audit_not_held_cleared":{},"peer_audit_not_held_banned":{},"#,
+                r#""peer_audit_dispatch_failed":{},"peer_audit_reply_unexpected":{},"peer_audit_mirror_drift":{},"#,
+                r#""peer_audits_armed_volume":{},"peer_audits_armed_time_bond":{}}}"#,
             ),
             is_peer, target_hex, nonce_hex, trigger_txid_hex, txs_since, remaining, bans_json,
+            engine.peer_audit_target_unresolved(), nh.0, nh.1, misc.0, misc.1, misc.2, opt_u64(trig.map(|t| t.0)), opt_u64(trig.map(|t| t.1)),
         )
     } else {
         format!(
-            r#"{{"pending":false,"is_peer":false,"txs_since_demand":0,"txs_remaining":{},"banned_validators":{}}}"#,
-            countdown_max, bans_json,
+            r#"{{"pending":false,"is_peer":false,"txs_since_demand":0,"txs_remaining":{},"banned_validators":{},"peer_audit_target_unresolved":{},"peer_audit_not_held_cleared":{},"peer_audit_not_held_banned":{},"peer_audit_dispatch_failed":{},"peer_audit_reply_unexpected":{},"peer_audit_mirror_drift":{},"peer_audits_armed_volume":{},"peer_audits_armed_time_bond":{}}}"#,
+            countdown_max, bans_json, engine.peer_audit_target_unresolved(), nh.0, nh.1, misc.0, misc.1, misc.2, opt_u64(trig.map(|t| t.0)), opt_u64(trig.map(|t| t.1)),
         )
     }
 }
@@ -674,283 +824,9 @@ fn dwp_wallets_json(engine: &ConsensusEngine) -> String {
 
 // --- POST handlers ---
 
-/// Step 9B.7 — CBOR-serializable shape of `WitnessSignature` for
-/// persisting the mint receipt's signature list. Mirror struct (not
-/// the runtime one) so storage encoding stays explicit and the
-/// runtime type stays free to evolve.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct SerWitSig {
-    witness_id: [u8; 32],
-    witness_pk: Vec<u8>,
-    sig: Vec<u8>,
-    #[serde(default)]
-    claim_sig: Vec<u8>,
-}
 
-impl SerWitSig {
-    fn from_runtime(s: &crate::withdrawal_mint_orchestrator::WitnessSignature) -> Self {
-        Self {
-            witness_id: s.witness_id,
-            witness_pk: s.witness_pk.clone(),
-            sig: s.sig.clone(),
-            claim_sig: s.claim_sig.clone(),
-        }
-    }
-    fn into_runtime(self) -> crate::withdrawal_mint_orchestrator::WitnessSignature {
-        crate::withdrawal_mint_orchestrator::WitnessSignature {
-            witness_id: self.witness_id,
-            witness_pk: self.witness_pk,
-            claim_sig: self.claim_sig,
-            sig: self.sig,
-        }
-    }
-}
 
-fn encode_signatures_cbor(
-    receipt: &crate::withdrawal_mint_orchestrator::WithdrawalMintReceipt,
-) -> Result<Vec<u8>, String> {
-    let wire: Vec<SerWitSig> = receipt.signatures.iter()
-        .map(SerWitSig::from_runtime)
-        .collect();
-    let mut buf = Vec::with_capacity(256);
-    ciborium::into_writer(&wire, &mut buf)
-        .map_err(|e| e.to_string())?;
-    Ok(buf)
-}
 
-/// Step 9B.5 — operator-driven validator withdrawal mint.
-///
-/// Body schema:
-/// ```json
-/// {
-///   "withdrawal": { ...full ValidatorWithdrawalRequest CBOR-shape JSON... },
-///   "chosen_witness_addrs": ["host:port", "host:port", "host:port"]
-/// }
-/// ```
-///
-/// The endpoint is async because it fans out TCP CBOR RPCs to the k=3
-/// chosen-witness Lambda gateways via
-/// `withdrawal_mint_orchestrator::collect_witness_signatures`. The
-/// operator-side `verify_validator_withdrawal` chain runs first
-/// (Step 8.4) — only VERIFIED proofs are fanned out.
-///
-/// Response shapes:
-///
-/// - VERIFIED + quorum reached:
-///   ```json
-///   {
-///     "status": "MINTED",
-///     "mint": { "validator_id": "...", "linked_wallet_id": "...",
-///               "net_amount": N, "claimed_through_tick": T },
-///     "signatures": [ { "witness_id": "...", "witness_pk": "...",
-///                       "sig": "..." }, ... ]
-///   }
-///   ```
-///   (Persistence of the mint into `linked_wallet_id` + the
-///   `MarkValidatorEarningsClaimedRequest` to Nabla land in
-///   subsequent commits.)
-///
-/// - VERIFIED-but-quorum-missed / RPC failures:
-///   ```json
-///   { "status": "QUORUM_NOT_REACHED",
-///     "ok_count": N, "required": 3,
-///     "failures": [ { "address": "...", "reason": "..." }, ... ] }
-///   ```
-///
-/// - Anything `verify_validator_withdrawal` rejects:
-///   ```json
-///   { "status": "REJECTED_*",
-///     "validator_id": "...", "net_amount": 0,
-///     "linked_wallet_id": "...", "claimed_through_tick": T }
-///   ```
-async fn handle_withdrawal_mint_async(
-    engine: &ConsensusEngine,
-    body: &str,
-) -> String {
-    use axiom_core_logic::wire_client::ValidatorWithdrawalRequest;
-    use crate::withdrawal_mint_orchestrator::{WithdrawalMintReceipt, WitnessSignature};
-
-    #[derive(serde::Deserialize)]
-    struct Body {
-        withdrawal: ValidatorWithdrawalRequest,
-        chosen_witness_addrs: Vec<String>,
-    }
-    let parsed: Body = match serde_json::from_str(body) {
-        Ok(v) => v,
-        Err(e) => return format!(
-            r#"{{"error":"bad JSON: {}"}}"#,
-            e.to_string().replace('"', "'")
-        ),
-    };
-
-    // Step 1 — operator-side verify (Step 8.4).
-    let verify = crate::validator_withdrawal::verify_validator_withdrawal(
-        &parsed.withdrawal,
-    );
-    if verify.status != "VERIFIED" {
-        return serde_json::to_string(&verify)
-            .unwrap_or_else(|_| r#"{"error":"serialize verify response"}"#.to_string());
-    }
-
-    // Step 1b — idempotency. If we already minted for this exact
-    // (validator_id, claimed_through_tick) pair, return the stored
-    // receipt verbatim instead of re-fanning-out + re-paying for the
-    // witness round.
-    let vid = parsed.withdrawal.validator_id;
-    let tick = parsed.withdrawal.earnings_attestation.until_tick;
-    if let Ok(Some((stored_linked, stored_net, stored_at, sigs_cbor))) =
-        engine.storage().get_validator_mint(&vid, tick)
-    {
-        let decoded: Result<Vec<WitnessSignature>, _> =
-            ciborium::from_reader(sigs_cbor.as_slice())
-                .map(|sigs: Vec<SerWitSig>| sigs.into_iter().map(SerWitSig::into_runtime).collect());
-        let sigs_json: Vec<serde_json::Value> = match decoded {
-            Ok(sigs) => sigs.iter().map(|s| serde_json::json!({
-                "witness_id": hex::encode(s.witness_id),
-                "witness_pk": hex::encode(&s.witness_pk),
-                "sig": hex::encode(&s.sig),
-            })).collect(),
-            Err(_) => vec![],
-        };
-        return serde_json::json!({
-            "status": "ALREADY_MINTED",
-            "mint": {
-                "validator_id": hex::encode(vid),
-                "linked_wallet_id": hex::encode(stored_linked),
-                "net_amount": stored_net,
-                "claimed_through_tick": tick,
-            },
-            "signatures": sigs_json,
-            "minted_at": stored_at,
-        }).to_string();
-    }
-
-    // Step 2 — fan out to chosen_witness Lambdas (Step 9B.4).
-    let request_id = format!(
-        "wmint-{}-{}",
-        hex::encode(&vid[..4]),
-        tick,
-    );
-    let receipt = crate::withdrawal_mint_orchestrator::collect_witness_signatures(
-        request_id,
-        parsed.withdrawal,
-        parsed.chosen_witness_addrs,
-    ).await;
-
-    use crate::withdrawal_mint_orchestrator::OrchestratorError;
-    match receipt {
-        Ok(rcpt) => {
-            // Step 3 — persist the receipt (Step 9B.7). Idempotency lock
-            // on (validator_id, claimed_through_tick) protects against
-            // races where multiple admin calls fire in parallel.
-            let sigs_cbor = match encode_signatures_cbor(&rcpt) {
-                Ok(b) => b,
-                Err(e) => return format!(
-                    r#"{{"error":"signatures CBOR encode failed: {}"}}"#,
-                    e.replace('"', "'"),
-                ),
-            };
-            let inserted = match engine.storage().record_validator_mint(
-                &rcpt.mint.validator_id,
-                rcpt.mint.claimed_through_tick,
-                &rcpt.mint.linked_wallet_id,
-                rcpt.mint.net_amount,
-                &sigs_cbor,
-            ) {
-                Ok(b) => b,
-                Err(e) => return format!(
-                    r#"{{"error":"persist mint receipt failed: {}"}}"#,
-                    e.to_string().replace('"', "'"),
-                ),
-            };
-            let status = if inserted { "MINTED" } else { "ALREADY_MINTED" };
-
-            // Step 9B.8 — send MarkValidatorEarningsClaimedRequest to
-            // Nabla so `last_claimed_tick` advances and the same
-            // earnings can't be claimed twice via a different operator
-            // session on a fresh Lambda (cross-Lambda replay defense).
-            //
-            // Best-effort: failure here does NOT undo the mint
-            // persistence (the mint is already committed to local
-            // storage). The operator's UI surfaces the Nabla outcome
-            // so an operator can manually retry if needed. The mint
-            // itself stays valid; only the cross-Lambda replay
-            // window is wider until Nabla actually advances.
-            //
-            // TODO: make nabla_addr configurable via lambda config
-            // (same TODO as `consensus.rs:1029` — multi-host
-            // deployment will need the operator-local Nabla pinned
-            // per Lambda).
-            let nabla_addr = "127.0.0.1:7300";
-            let claim_outcome = crate::withdrawal_mint_orchestrator::send_mark_validator_claimed(
-                nabla_addr,
-                rcpt.mint.validator_id,
-                rcpt.mint.claimed_through_tick,
-                &rcpt.signatures,
-            ).await;
-            let claim_json = match &claim_outcome {
-                crate::withdrawal_mint_orchestrator::MarkClaimedOutcome::Claimed {
-                    stored_last_claimed_tick,
-                } => serde_json::json!({
-                    "result": "CLAIMED",
-                    "stored_last_claimed_tick": stored_last_claimed_tick,
-                }),
-                crate::withdrawal_mint_orchestrator::MarkClaimedOutcome::Rejected {
-                    status, stored_last_claimed_tick,
-                } => serde_json::json!({
-                    "result": "REJECTED",
-                    "nabla_status": status,
-                    "stored_last_claimed_tick": stored_last_claimed_tick,
-                }),
-                crate::withdrawal_mint_orchestrator::MarkClaimedOutcome::RpcError {
-                    detail,
-                } => serde_json::json!({
-                    "result": "RPC_ERROR",
-                    "detail": detail,
-                }),
-            };
-
-            serde_json::json!({
-                "status": status,
-                "mint": {
-                    "validator_id": hex::encode(rcpt.mint.validator_id),
-                    "linked_wallet_id": hex::encode(rcpt.mint.linked_wallet_id),
-                    "net_amount": rcpt.mint.net_amount,
-                    "claimed_through_tick": rcpt.mint.claimed_through_tick,
-                },
-                "signatures": rcpt.signatures.iter().map(|s| {
-                    serde_json::json!({
-                        "witness_id": hex::encode(s.witness_id),
-                        "witness_pk": hex::encode(&s.witness_pk),
-                        "sig": hex::encode(&s.sig),
-                    })
-                }).collect::<Vec<_>>(),
-                "mark_claimed": claim_json,
-            }).to_string()
-        }
-        Err(OrchestratorError::NotEnoughWitnesses { supplied, required }) => {
-            serde_json::json!({
-                "status": "NOT_ENOUGH_WITNESSES",
-                "supplied": supplied,
-                "required": required,
-            }).to_string()
-        }
-        Err(OrchestratorError::QuorumNotReached { ok_count, required, failures }) => {
-            serde_json::json!({
-                "status": "QUORUM_NOT_REACHED",
-                "ok_count": ok_count,
-                "required": required,
-                "failures": failures.iter().map(|(addr, reason)| serde_json::json!({
-                    "address": addr,
-                    "reason": reason,
-                })).collect::<Vec<_>>(),
-            }).to_string()
-        }
-        Err(OrchestratorError::MintMismatch) => {
-            r#"{"status":"MINT_MISMATCH","detail":"chosen witnesses returned non-identical mint outputs"}"#.to_string()
-        }
-    }
-}
 
 fn handle_dwp_query(engine: &ConsensusEngine, body: &str) -> String {
     let dwp = match engine.dwp_engine() {
@@ -1566,34 +1442,42 @@ fn probe_net() -> (String, u64) {
     (String::new(), 0)
 }
 
-fn peers_json(engine: &ConsensusEngine) -> String {
-    let storage = engine.storage();
-    let hints = storage.get_all_hints().unwrap_or_default();
-    let count = hints.len();
+/// `GET /peers` — the discovered-validator table as CBOR `Vec<ValidatorHint>`, the Core type
+/// the table already stores (KI#173: the hand-built JSON copy of it is gone).
+fn peers_cbor(engine: &ConsensusEngine) -> Vec<u8> {
+    let hints = engine.storage().get_all_hints().unwrap_or_default();
+    let mut out = Vec::new();
+    let _ = ciborium::into_writer(&hints, &mut out);
+    out
+}
 
-    let mut peers = String::from("[");
-    for (i, h) in hints.iter().enumerate() {
-        if i > 0 { peers.push(','); }
-        let escaped_name = h.name.replace('\\', "\\\\").replace('"', "\\\"");
-        let escaped_id = hex::encode(h.validator_id);
-        let proof_cap = h.proof_cap.as_deref().unwrap_or("dmap");
-        let carriers = h.carriers.iter()
-            .map(|c| format!(r#""{}""#, c.replace('\\', "\\\\").replace('"', "\\\"")))
-            .collect::<Vec<_>>()
-            .join(",");
-        let last_seen = h.last_seen.unwrap_or(0);
-        // Encryption fields may contain newlines (PGP/GPG armoured key
-        // blocks always do) so full JSON escape is required.
-        let epk_esc = json_escape(&h.encryption_public_key);
-        let se_esc = json_escape(&h.supported_encryption);
-        peers.push_str(&format!(
-            r#"{{"validator_id":"{}","name":"{}","proof_cap":"{}","carriers":[{}],"last_seen":{},"encryption_public_key":"{}","supported_encryption":"{}"}}"#,
-            escaped_id, escaped_name, proof_cap, carriers, last_seen, epk_esc, se_esc,
-        ));
-    }
-    peers.push(']');
+/// `GET /work-receipt?since_tick=<n>` — Q2-b producer. Returns CBOR
+/// `Option<Receipt>`: ONE receipt this validator co-signed with
+/// `oods_flag.tick > since_tick`, which the operator's `validator-setup` renewal
+/// flow presents as `VBCProofBundle.renewal_work_receipt` (Core CL8
+/// `verify_renewal_work_receipt` re-verifies it — this is convenience, not
+/// enforcement; RULE 5). `since_tick` = the current cert's `baseline_tick`.
+/// `None` (empty) encodes when this validator has no PROVABLE witnessing work
+/// this term → the renewal is correctly refused by Core; witness a live round
+/// first. Off the hot path (renewal is rare).
+fn work_receipt_cbor(engine: &ConsensusEngine, query: Option<&str>) -> Vec<u8> {
+    let since_tick: u64 = query
+        .and_then(|q| extract_query_param(q, "since_tick"))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let our_pk = engine.public_key_bytes();
+    let found = engine
+        .storage()
+        .find_cosigned_work_receipt(our_pk, since_tick)
+        .unwrap_or(None);
+    let mut out = Vec::new();
+    let _ = ciborium::into_writer(&found, &mut out);
+    out
+}
 
-    format!(r#"{{"count":{},"validators":{}}}"#, count, peers)
+/// A JSON admin body with its content type (every endpoint except `/peers`).
+fn json_body(status: &'static str, body: String) -> (&'static str, Vec<u8>, &'static str) {
+    (status, body.into_bytes(), "application/json")
 }
 
 // ── Console governance endpoints ───────────────────────────────────────────
@@ -1951,7 +1835,69 @@ fn handle_delivery_update(engine: &ConsensusEngine, body: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn operator_counts_are_valid_json_and_null_never_zero_when_unread() {
+        let wrap = |frag: String| format!("{{\"pending\":false{}}}", frag);
+        let v: serde_json::Value = serde_json::from_str(&wrap(super::operator_counts_json(Some((3, 2, 1)), (7, 9, 4)))).unwrap();
+        assert_eq!((v["self_audits_armed"].as_u64(), v["self_audits_passed"].as_u64(), v["peer_audit_bans_issued"].as_u64()),
+                   (Some(3), Some(2), Some(1)));
+        assert_eq!((v["peer_audits_passed"].as_u64(), v["peer_audit_requests_answered"].as_u64()), (Some(7), Some(9)));
+        assert_eq!(v["peer_audit_reply_hint_unresolved"].as_u64(), Some(4), "KI#229 counter reaches /audit");
+        let busy: serde_json::Value = serde_json::from_str(&wrap(super::operator_counts_json(None, (0, 0, 0)))).unwrap();
+        assert!(busy["self_audits_armed"].is_null(), "a busy core lock must read as UNKNOWN, not 0 audits");
+        assert!(busy["peer_audit_bans_issued"].is_null());
+    }
     use super::*;
+
+    /// KI#89: `/stats` carries jemalloc's five counters as NUMBERS (jemalloc
+    /// built with stats on — `tikv-jemalloc-ctl` `stats` feature). Mutations:
+    /// drop the `"jemalloc"` field, or build jemalloc --disable-stats (remove
+    /// the `stats` feature) → every field reads null → this test goes red.
+    #[test]
+    fn stats_json_carries_jemalloc_counters_as_numbers() {
+        let engine = crate::consensus::tests::create_test_engine();
+        let v: serde_json::Value = serde_json::from_str(&stats_json(&engine)).expect("stats is JSON");
+        for k in ["allocated", "resident", "active", "mapped", "retained"] {
+            assert!(v["jemalloc"][k].is_u64(), "jemalloc.{k} must be a number, got {}", v["jemalloc"][k]);
+        }
+        assert!(v["jemalloc"]["mapped"].as_u64().unwrap() > 0, "jemalloc maps at least its own metadata");
+        // ANTIE's YPX-015 busy gate string-scans this key on the same body.
+        assert!(v["avg_witness_ms"].is_u64());
+    }
+
+    /// KI#89 test 6: `/stats` carries the idempotency footprint + hit/miss
+    /// counters as NUMBERS, and they move with the caches. Mutation: drop the
+    /// `"idempotency"` field, or report a constant → red.
+    #[test]
+    fn stats_json_carries_idempotency_counters() {
+        let engine = crate::consensus::tests::create_test_engine();
+        let v: serde_json::Value = serde_json::from_str(&stats_json(&engine)).expect("stats is JSON");
+        for k in ["witness_entries", "witness_bytes", "redeem_entries", "redeem_bytes", "budget_bytes",
+                  "witness_hits", "witness_misses", "redeem_hits", "redeem_misses"] {
+            assert!(v["idempotency"][k].is_u64(), "idempotency.{k} must be a number, got {}", v["idempotency"][k]);
+        }
+        assert_eq!(v["idempotency"]["budget_bytes"].as_u64(), Some(67_108_864));
+        assert_eq!(v["idempotency"]["redeem_entries"].as_u64(), Some(0));
+        engine.stats.idempotency_redeem_misses.fetch_add(3, std::sync::atomic::Ordering::Relaxed);
+        crate::consensus::tests::ki89_remember_small_redeem(&engine, "ki89-stats");
+        let v: serde_json::Value = serde_json::from_str(&stats_json(&engine)).unwrap();
+        assert_eq!(v["idempotency"]["redeem_entries"].as_u64(), Some(1));
+        assert!(v["idempotency"]["redeem_bytes"].as_u64().unwrap() > "ki89-stats".len() as u64);
+        assert_eq!(v["idempotency"]["redeem_misses"].as_u64(), Some(3));
+    }
+
+    /// RULE 6: an unreadable counter is UNKNOWN (`null`), never 0.
+    #[test]
+    fn jemalloc_unreadable_counter_is_null_not_zero() {
+        let v: serde_json::Value =
+            serde_json::from_str(&jemalloc_fields_json([Some(7), None, Some(0), None, Some(1)])).unwrap();
+        assert_eq!(v["allocated"].as_u64(), Some(7));
+        assert!(v["resident"].is_null());
+        assert_eq!(v["active"].as_u64(), Some(0));
+        assert!(v["mapped"].is_null());
+        assert_eq!(v["retained"].as_u64(), Some(1));
+    }
 
     #[tokio::test]
     async fn test_admin_endpoint_compiles() {
@@ -2018,18 +1964,6 @@ mod tests {
         assert_eq!(extract_query_param("tokenizer=bad", "token"), None);
     }
 
-    #[test]
-    fn test_is_allowed_nabla_addr() {
-        // AUDIT-FIX v2.11.14: Only known Nabla peers accepted
-        assert!(is_allowed_nabla_addr("127.0.0.1:6226"));
-        assert!(is_allowed_nabla_addr("127.0.0.1:6231"));
-        // Reject arbitrary addresses (SSRF prevention)
-        assert!(!is_allowed_nabla_addr("127.0.0.1:9999"));
-        assert!(!is_allowed_nabla_addr("169.254.169.254:80"));
-        assert!(!is_allowed_nabla_addr("10.0.0.1:6226"));
-        assert!(!is_allowed_nabla_addr("example.com:6226"));
-        assert!(!is_allowed_nabla_addr(""));
-    }
 
     /// SEC-08: handle_jfp_scar must NO LONGER post a synthetic, unauthenticated
     /// SCAR state to Nabla `/register`. The forgeable mesh-wide path (POST

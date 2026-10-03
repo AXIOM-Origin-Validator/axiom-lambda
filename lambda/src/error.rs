@@ -18,6 +18,27 @@ pub enum LambdaError {
     
     #[error("Core execution error: {0}")]
     CoreExecutionError(String),
+    /// YPX-009 §7.2 (RULED 2026-09-10): the validator's own Pulse audit
+    /// failed on this execution — refused, never signed. `String` = the
+    /// execution path (`CL3 finalize`, `CL5 redeem`, …).
+    #[error("Pulse audit failed on {0} — this validator refuses to sign (YPX-009 §7.2)")]
+    PulseAuditFailed(String),
+    /// §5.2.2e part iii — the candidacy proof's work does not reproduce at
+    /// this issuer (or exceeds its replay cap).
+    #[error("candidacy Pulse refused by the issuer's replay: {0}")]
+    CandidacyPulseWork(String),
+    /// §5.2.2e part iii — a second provisional request from the same key
+    /// inside the issuer's window.
+    #[error("candidacy request from key {key_hex} inside the issuer's window — wait {wait_ticks} more ticks")]
+    CandidacyPulseRate { key_hex: String, wait_ticks: u64 },
+    /// Fable review 2026-10-01 F-3 — a client-carried Nabla OODS attestation
+    /// whose tick is more than `ATTESTED_TICK_FUTURE_SKEW_SECS` (300 s,
+    /// protocol_lambda.toml) ahead of this validator's wall clock (the TARDIS
+    /// forward-only rule, applied at the validator with a wider stated skew).
+    /// Raised by `consensus::check_attested_tick_not_future` BEFORE any Core
+    /// execution; nothing is witnessed or signed.
+    #[error("attested tick {tick} is ahead of this validator's clock ({now_secs}) by more than the forward skew bound (max {bound})")]
+    AttestedTickInFuture { tick: u64, now_secs: u64, bound: u64 },
     
     #[error("Insufficient witnesses: got {got}, need {need}")]
     InsufficientWitnesses { got: usize, need: usize },

@@ -10,15 +10,14 @@
 //   6. Nabla credits DEED pool with 10% slice (Refactor C)
 //   7. Validator queries Nabla earnings with full fee_breakdown (Step 8.3.A)
 //   8. Validator registers pool linkage with SPHINCS+ (Step 8.1)
-//   9. Operator signs ValidatorWithdrawalRequest with SPHINCS+ (Step 8.3.B)
-//  10. Lambda verify_validator_withdrawal runs §20.10 + caps + chain (Step 8.4)
+//   (9-10: the withdrawal verify chain was RETIRED 2026-08-10, KI#83 — the
+//    fee claim is now the §10.0 standard-flow tx)
 //  11. Verifier reports net = gross × 90/100, links to wallet, claimed_through
 //
 // What's covered:
 //   * fee_breakdown carries through receipt + Nabla chain verify
 //   * DeedPool balance reflects 10% slice precisely
 //   * Earnings query returns full_fee_breakdown per entry
-//   * Withdrawal verification passes with disjoint chosen witnesses
 //   * §20.10 violation correctly rejects
 //   * Conservation: gross = net + DEED + (no leakage)
 
@@ -26,9 +25,7 @@ use axiom_core_logic::types::{FeeShare, MAX_VALIDATOR_FEE_BPS, MAX_TOTAL_TX_FEE_
 use axiom_core_logic::wire_client::{
     EarningsEntry, QueryValidatorEarningsResponse, QueryValidatorPoolResponse,
     QueryValidatorEarningsRequest, RegisterValidatorPoolRequest,
-    ValidatorWithdrawalRequest,
 };
-use axiom_lambda::validator_withdrawal::verify_validator_withdrawal;
 use axiom_nabla::validator_pool::ValidatorPoolStore;
 
 /// Build a SPHINCS+ keypair + derive the validator_id (BLAKE3(pk)).
@@ -51,7 +48,7 @@ fn fs(vid_byte: u8, amount: u64) -> FeeShare {
 ///
 /// `net_balance` is set to `total_amount × 90 / 100` to simulate
 /// /register-time DEED routing (the NET ledger reflects post-DEED
-/// values per Refactor C). The validator_withdrawal verifier's primary
+/// values per Refactor C). The surviving linkage/attestation machinery's primary
 /// path takes `net_balance` as-is when it's > 0; only the legacy
 /// rolling-deploy fallback (net_balance == 0) applies the 10% deduction
 /// directly. The fixture must encode the post-DEED amount or it'll
@@ -92,10 +89,10 @@ fn build_signed_earnings_attestation(
 }
 
 #[test]
-fn fee_ledger_full_chain_pool_register_then_withdrawal_verify() {
+fn fee_ledger_pool_register_and_earnings_attestation() {
     // ── Stage 1: Operator generates SPHINCS+ key → validator_id ────────
     let (sphincs_pk, sphincs_sk, validator_id) = sphincs_keypair();
-    let linked_wallet_id = [0xAA; 32];
+    let linked_wallet_id = "test-aa@axiom.test/aaaaaaaaaa-P".to_string();
 
     // ── Stage 2: Operator registers pool linkage with Nabla ───────────
     let mut pool_store = ValidatorPoolStore::new();
@@ -108,7 +105,7 @@ fn fee_ledger_full_chain_pool_register_then_withdrawal_verify() {
     ).expect("sphincs sign link");
     let link_req = RegisterValidatorPoolRequest {
         validator_id,
-        linked_wallet_id,
+        linked_wallet_id: linked_wallet_id.clone(),
         sphincs_pk: sphincs_pk.clone(),
         sphincs_sig: link_sig,
         linkage_epoch: 1,
@@ -147,115 +144,14 @@ fn fee_ledger_full_chain_pool_register_then_withdrawal_verify() {
     );
     assert!(pool_linkage.registered);
 
-    // ── Stage 5: Operator builds the ValidatorWithdrawalRequest     ────
-    //
-    // §20.10: chosen_witnesses MUST NOT overlap any validator in any
-    // entry's full_fee_breakdown. Our entries' breakdowns include
-    // {validator_id, V11, V22}. Pick V44, V55, V66 (disjoint).
-    let chosen_witnesses = vec![vid(0x44), vid(0x55), vid(0x66)];
-    let attestation_hash = axiom_core_logic::compute::compute_earnings_attestation_payload(
-        &earnings.nabla_node_id, &earnings.validator_id,
-        earnings.since_tick, earnings.until_tick, earnings.total_amount,
-        &earnings.entries, earnings.is_authoritative, earnings.net_balance,
-    );
-    let withdrawal_payload = axiom_core_logic::compute::compute_validator_withdrawal_payload(
-        &validator_id, &attestation_hash, &chosen_witnesses,
-    );
-    let sphincs_sig = axiom_core_logic::compute::sign_sphincs(
-        &sphincs_sk, &withdrawal_payload,
-    ).expect("sphincs sign withdrawal");
-
-    let req = ValidatorWithdrawalRequest {
-        validator_id,
-        earnings_attestation: earnings,
-        pool_linkage,
-        sphincs_pk,
-        sphincs_sig,
-        chosen_witnesses,
-    };
-
-    // ── Stage 6: Lambda verifies the withdrawal end-to-end          ────
-    let resp = verify_validator_withdrawal(&req);
-    assert_eq!(resp.status, "VERIFIED",
-        "all checks must pass on the clean path");
-    assert_eq!(resp.linked_wallet_id, linked_wallet_id,
-        "mint destination = operator-declared linked_wallet_id");
-    assert_eq!(resp.claimed_through_tick, current_tick);
-    // 10 gross × 90 / 100 = 9 net (the 1-atom DEED slice was credited
-    // at /register time per Refactor C).
-    assert_eq!(resp.net_amount, 9);
+    // Stages 5-6 (ValidatorWithdrawalRequest build + 7-step verify) REMOVED
+    // 2026-08-10 with the KI#83 retirement — the withdrawal is now the §10.0
+    // standard-flow fee-claim tx (AXIOM_DESIGN_BoundedPools.md §10.0). The
+    // machinery covered by stages 1-4 (SPHINCS+ identity, pool linkage
+    // register/query, signed earnings attestation) SURVIVES and feeds the
+    // new flow, so those stages remain the test.
 }
 
-#[test]
-fn fee_ledger_section_20_10_rejection_under_conflict() {
-    // Same setup as the happy-path test, but the operator picks one of
-    // the validators that already earned from the very TX they're trying
-    // to claim. §20.10 rejection.
-    let (sphincs_pk, sphincs_sk, validator_id) = sphincs_keypair();
-    let linked_wallet_id = [0xAA; 32];
-
-    let mut pool_store = ValidatorPoolStore::new();
-    let current_tick = 100;
-    let link_payload = axiom_core_logic::compute::compute_validator_pool_link_payload(
-        &validator_id, &linked_wallet_id, 1, current_tick,
-    );
-    let link_sig = axiom_core_logic::compute::sign_sphincs(
-        &sphincs_sk, &link_payload,
-    ).expect("sphincs sign link");
-    pool_store.process_register(
-        &RegisterValidatorPoolRequest {
-            validator_id, linked_wallet_id,
-            sphincs_pk: sphincs_pk.clone(), sphincs_sig: link_sig,
-            linkage_epoch: 1, tick: current_tick,
-        }, current_tick,
-    ).unwrap();
-
-    // Earnings from a TX whose breakdown includes V22.
-    let entries = vec![
-        EarningsEntry {
-            tx_hash: [0x02; 32],
-            amount: 10,
-            tick: 50,
-            full_fee_breakdown: vec![
-                FeeShare { validator_id, amount: 10 },
-                fs(0x11, 10),
-                fs(0x22, 10),
-            ],
-        },
-    ];
-    let nabla_sk = ed25519_dalek::SigningKey::from_bytes(&[0xAB; 32]);
-    let earnings = build_signed_earnings_attestation(
-        validator_id, entries, current_tick, &nabla_sk,
-    );
-    let pool_linkage = pool_store.process_query(
-        &axiom_core_logic::wire_client::QueryValidatorPoolRequest { validator_id },
-    );
-
-    // Operator picks V22 — conflict of interest.
-    let chosen_witnesses = vec![vid(0x22), vid(0x55), vid(0x66)];
-    let attestation_hash = axiom_core_logic::compute::compute_earnings_attestation_payload(
-        &earnings.nabla_node_id, &earnings.validator_id,
-        earnings.since_tick, earnings.until_tick, earnings.total_amount,
-        &earnings.entries, earnings.is_authoritative, earnings.net_balance,
-    );
-    let withdrawal_payload = axiom_core_logic::compute::compute_validator_withdrawal_payload(
-        &validator_id, &attestation_hash, &chosen_witnesses,
-    );
-    let sphincs_sig = axiom_core_logic::compute::sign_sphincs(
-        &sphincs_sk, &withdrawal_payload,
-    ).expect("sphincs sign");
-
-    let req = ValidatorWithdrawalRequest {
-        validator_id,
-        earnings_attestation: earnings,
-        pool_linkage,
-        sphincs_pk,
-        sphincs_sig,
-        chosen_witnesses,
-    };
-    let resp = verify_validator_withdrawal(&req);
-    assert_eq!(resp.status, "REJECTED_CONFLICT_OF_INTEREST");
-}
 
 #[test]
 fn fee_ledger_protocol_caps_are_enforced() {
@@ -291,7 +187,7 @@ fn fee_ledger_pool_query_can_be_used_unsigned_after_register() {
     // process_query is the correct shape for assembling a withdrawal
     // request without a signature on the pool linkage.
     let (sphincs_pk, sphincs_sk, validator_id) = sphincs_keypair();
-    let linked_wallet_id = [0xBB; 32];
+    let linked_wallet_id = "test-bb@axiom.test/bbbbbbbbbb-P".to_string();
 
     let mut pool_store = ValidatorPoolStore::new();
     let link_payload = axiom_core_logic::compute::compute_validator_pool_link_payload(
@@ -302,7 +198,7 @@ fn fee_ledger_pool_query_can_be_used_unsigned_after_register() {
     ).expect("sphincs sign link");
     pool_store.process_register(
         &RegisterValidatorPoolRequest {
-            validator_id, linked_wallet_id,
+            validator_id, linked_wallet_id: linked_wallet_id.clone(),
             sphincs_pk, sphincs_sig: link_sig,
             linkage_epoch: 1, tick: 100,
         }, 100,

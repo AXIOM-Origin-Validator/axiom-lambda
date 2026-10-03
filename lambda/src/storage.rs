@@ -137,22 +137,6 @@ impl Storage {
     }
 }
 
-/// Stored validator hint with metadata (for persistence)
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct StoredValidatorHint {
-    pub validator_id: String,
-    pub name: String,
-    pub carriers: Vec<String>,
-    /// YPX-007: "dmap" or "zkvm" — validator's proof capability
-    #[serde(default = "default_proof_cap")]
-    pub proof_cap: String,
-    pub last_seen: u64,
-    pub stored_at: u64,
-}
-
-fn default_proof_cap() -> String {
-    "dmap".into()
-}
 
 /// Resolve a validator's Ed25519 public key from the two possible
 /// sources in a JOIN row:
@@ -300,6 +284,10 @@ impl Storage {
                 auth_hash     BLOB,
                 wallet_id     TEXT,
                 hibernation_until INTEGER NOT NULL DEFAULT 0, -- YPX-020 (persist hibernation)
+                wall_clock_lock INTEGER NOT NULL DEFAULT 0,   -- §5.2.2c (persist the stake lock)
+                emission_claimed_epoch INTEGER NOT NULL DEFAULT 0, -- §4.2a (the sixth §15 field)
+                stake_floor_until INTEGER NOT NULL, -- ValidatorJoin §6b.13 (the seventh §15 field; no default)
+                wallet_format BLOB NOT NULL,        -- §6b.13 the CBOR `WalletFormat` block (no default)
                 updated_at    INTEGER NOT NULL DEFAULT (strftime('%s','now')),
                 PRIMARY KEY (public_key, k, proof_type)
             );
@@ -333,7 +321,7 @@ impl Storage {
                 wallet_seq_after  INTEGER NOT NULL,
                 group_members_after BLOB,
                 status            TEXT NOT NULL DEFAULT 'Pending',
-                required_k        INTEGER NOT NULL DEFAULT 3,
+                required_k        INTEGER NOT NULL DEFAULT 0, -- YP §17.3.1.4 v2.19.0 (KI#150): 0 = unset, NEVER 3
                 proof_type        INTEGER NOT NULL DEFAULT 1,
                 amount            INTEGER NOT NULL DEFAULT 0,
                 sender_balance    INTEGER NOT NULL DEFAULT 0,
@@ -358,6 +346,15 @@ impl Storage {
                 redeemed_at INTEGER NOT NULL
             );
 
+            -- YP §26.17.6.5 B4 (2026-09-11): every certificate bundle this validator
+            -- VERIFIED to the roots, keyed by vbc_reference_hash. Presented to Core
+            -- for the FACT witnesses a chain references; Core never fetches.
+            CREATE TABLE IF NOT EXISTS fact_certificates (
+                reference   BLOB PRIMARY KEY,
+                bundle      BLOB NOT NULL,
+                stored_at   INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS receipts (
                 txid               BLOB PRIMARY KEY,
                 state_hash         BLOB NOT NULL,
@@ -372,10 +369,36 @@ impl Storage {
                 fact_proof         BLOB,
                 receipt_commitment BLOB NOT NULL DEFAULT (zeroblob(32)),
                 core_id            BLOB NOT NULL DEFAULT (zeroblob(32)),
+                required_k         INTEGER NOT NULL DEFAULT 0, -- YP §17.3.1.4 v2.19.0 (KI#150): the round's k; 0 = never written, NEVER 3
+                -- Step 7 (Q2-b, 2026-09-21): the four remaining commitment-bound
+                -- fields, previously DROPPED on store so a read-back Receipt could
+                -- never re-verify its receipt_commitment. Now persisted so a stored
+                -- receipt round-trips through verify_receipt_witness_quorum (needed
+                -- by find_cosigned_work_receipt for VBC-renewal proof-of-validation).
+                -- All four are folded into receipt_commitment (crypto.rs).
+                oods_flag          BLOB,    -- YPX-021 §8.2: CBOR Option<OodsFlag>
+                confidence_index   BLOB,    -- YPX-010 §11.6 / P3.6: CBOR Option<ConfidenceIndex>
+                sender_state       BLOB,    -- raw 32 bytes or NULL: Option<[u8;32]>
+                is_dev_class       INTEGER NOT NULL DEFAULT 0, -- class-isolation flag
                 created_at         INTEGER NOT NULL DEFAULT (strftime('%s','now'))
             );
             CREATE INDEX IF NOT EXISTS idx_receipts_produced ON receipts(produced_state_id);
             CREATE INDEX IF NOT EXISTS idx_receipts_epoch ON receipts(epoch);
+
+            -- §23.14.6 (KI#213, ruled 2026-09-24): what a WITNESS keeps about a tx it
+            -- only witnessed at CL2 — exactly the fields the audit digest hashes
+            -- (`TxDigest`: sender_balance / state_id / amount; receiver_balance is
+            -- always 0 at the sender's validator). Only the finalizer stores a
+            -- receipt/transaction_record, so before this table a co-witness could
+            -- answer a peer audit only with NotHeld. Pruned by age with the
+            -- other stale data (well beyond the 100-TX / 600 s audit window).
+            CREATE TABLE IF NOT EXISTS witness_digests (
+                txid           BLOB PRIMARY KEY,
+                sender_balance INTEGER NOT NULL,
+                state_id       BLOB NOT NULL,
+                amount         INTEGER NOT NULL,
+                created_at     INTEGER NOT NULL
+            );
 
             -- fee_records / validator_fee_tracking retired in Step 9A2
             -- (YP §20.8 v3.x). The CREATE TABLE statements are gone; on
@@ -402,27 +425,6 @@ impl Storage {
                 is_dev_class  INTEGER NOT NULL DEFAULT 0
             );
 
-            -- Step 9B.7 — validator-withdrawal mint receipts (YP §20.10).
-            -- One row per completed mint witness round. PRIMARY KEY
-            -- (validator_id, claimed_through_tick) is the idempotency
-            -- lock: a retried admin POST against the same proof returns
-            -- the persisted receipt instead of re-minting / re-fanning-out
-            -- to chosen_witnesses. `signatures` is a CBOR-encoded
-            -- Vec<WitnessSignature> (witness_id + witness_pk + sig per
-            -- entry). After persistence, Step 9B.8 sends
-            -- MarkValidatorEarningsClaimedRequest to Nabla so
-            -- last_claimed_tick advances.
-            CREATE TABLE IF NOT EXISTS validator_withdrawal_mints (
-                validator_id          BLOB NOT NULL,
-                claimed_through_tick  INTEGER NOT NULL,
-                linked_wallet_id      BLOB NOT NULL,
-                net_amount            INTEGER NOT NULL,
-                minted_at             INTEGER NOT NULL,
-                signatures            BLOB NOT NULL,
-                PRIMARY KEY (validator_id, claimed_through_tick)
-            );
-            CREATE INDEX IF NOT EXISTS idx_withdrawal_mints_wallet
-                ON validator_withdrawal_mints(linked_wallet_id);
 
             CREATE TABLE IF NOT EXISTS validator_hints (
                 validator_id BLOB PRIMARY KEY,
@@ -514,10 +516,29 @@ impl Storage {
                 value TEXT NOT NULL
             );
             INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '1');
-            INSERT OR IGNORE INTO meta (key, value) VALUES ('vbc_signs_remaining', '6');
             ",
         )
         .map_err(|e| LambdaError::StorageError(format!("Schema creation failed: {}", e)))?;
+
+        // ── VBC signing budget seed (AXIOM_DESIGN_VBC.md E.3) ───────────────
+        //
+        // The value is a TUNING REGISTER (`lambda/protocol_lambda.toml`
+        // `vbc_signs_budget`), not a literal — it used to be a hardcoded '6'
+        // inside the schema batch above, where nothing named it and nothing
+        // could change it without editing SQL.
+        //
+        // ⚠ INSERT OR IGNORE IS DELIBERATE. A validator that already holds a
+        // `vbc_signs_remaining` row KEEPS it, including one already at 0.
+        // Raising the register does NOT refill an existing validator, and it
+        // must not: E.3's property is "permanent — does not refill", so a
+        // budget that tops itself up on restart (or on a config edit) is not a
+        // budget at all. Refilling an EXISTING row is an operator action with
+        // its own audit trail, never a side effect of starting up. KI#135.
+        conn.execute(
+            "INSERT OR IGNORE INTO meta (key, value) VALUES ('vbc_signs_remaining', ?1)",
+            [crate::tuning_gen::VBC_SIGNS_BUDGET.to_string()],
+        )
+        .map_err(|e| LambdaError::StorageError(format!("VBC budget seed failed: {}", e)))?;
 
         // Migration: add receipt_commitment column to receipts if missing.
         // Pre-existing DBs (from before the receipt-commitment feature
@@ -530,6 +551,14 @@ impl Storage {
         // already present).
         let _ = conn.execute_batch(
             "ALTER TABLE receipts ADD COLUMN receipt_commitment BLOB NOT NULL DEFAULT (zeroblob(32));",
+        );
+
+        // Migration: receipts.required_k — YP §17.3.1.4 v2.19.0 (KI#150).
+        // `get_receipt` used to fabricate `required_k: 3`; the column carries
+        // the round's k. Default 0 (= "never written") so a pre-column row can
+        // never be presented as a k=3 artifact.
+        let _ = conn.execute_batch(
+            "ALTER TABLE receipts ADD COLUMN required_k INTEGER NOT NULL DEFAULT 0;",
         );
 
         // Migration: attempts counter for the scar-passcode gate (YPX-001
@@ -568,6 +597,15 @@ impl Storage {
     // YPX-016: Witness Response Cache
     // =========================================================================
 
+    /// YP §16.14.12 v2.19.0 (KI#149) — wallet-state, genesis-state and
+    /// witness-cache rows are keyed by the STATE CLASS, never by the raw tier
+    /// of the address in hand: every online tier of a key shares ONE row (a
+    /// k=5 redeem and a k=3 send address the same ledger); the Ark tier keeps
+    /// its own. Called ONCE at the top of every `(k, proof_type)` accessor.
+    fn state_class_key(k: u8, proof_type: u8) -> (u8, u8) {
+        axiom_core_logic::wallet_id::state_class(k, proof_type)
+    }
+
     /// Check if we have a cached witness response for this exact TX.
     /// Returns Some(response_bytes) if cache hit, None if miss.
     pub fn get_witness_cache(
@@ -579,6 +617,7 @@ impl Storage {
         consumed_state_id: &[u8; 32],
         wallet_seq: u64,
     ) -> Result<Option<Vec<u8>>, LambdaError> {
+        let (k, proof_type) = Self::state_class_key(k, proof_type); // §16.14.12 (KI#149)
         let db = self.db()?;
         let mut stmt = db
             .prepare(
@@ -612,6 +651,7 @@ impl Storage {
         wallet_seq: u64,
         witness_response: &[u8],
     ) -> Result<(), LambdaError> {
+        let (k, proof_type) = Self::state_class_key(k, proof_type); // §16.14.12 (KI#149)
         let db = self.db()?;
         db.execute(
             "INSERT OR REPLACE INTO witness_cache \
@@ -642,10 +682,11 @@ impl Storage {
         k: u8,
         proof_type: u8,
     ) -> Result<Option<StoredWalletState>, LambdaError> {
+        let (k, proof_type) = Self::state_class_key(k, proof_type); // §16.14.12 (KI#149)
         let conn = self.db()?;
         let mut stmt = conn
             .prepare_cached(
-                "SELECT public_key, balance, wallet_seq, state_id, last_tx_id, status, group_members, auth_hash, wallet_id, hibernation_until
+                "SELECT public_key, balance, wallet_seq, state_id, last_tx_id, status, group_members, auth_hash, wallet_id, hibernation_until, wall_clock_lock, emission_claimed_epoch, stake_floor_until, wallet_format
                  FROM wallets WHERE public_key = ?1 AND k = ?2 AND proof_type = ?3",
             )
             .map_err(|e| LambdaError::StorageError(e.to_string()))?;
@@ -655,7 +696,7 @@ impl Storage {
         // group_members blob OUTSIDE the closure so decode failure
         // surfaces as LambdaError::StorageError (not silently None).
         // Per CLAUDE.md §13 — decode failure is an error.
-        type WalletRow = (Vec<u8>, i64, i64, Vec<u8>, Option<Vec<u8>>, String, Option<Vec<u8>>, Option<Vec<u8>>, Option<String>, i64);
+        type WalletRow = (Vec<u8>, i64, i64, Vec<u8>, Option<Vec<u8>>, String, Option<Vec<u8>>, Option<Vec<u8>>, Option<String>, i64, i64, i64, i64, Vec<u8>);
         let raw: Option<WalletRow> = stmt
             .query_row(params![public_key, k as i64, proof_type as i64], |row| {
                 Ok((
@@ -669,6 +710,10 @@ impl Storage {
                     row.get::<_, Option<Vec<u8>>>(7)?,
                     row.get::<_, Option<String>>(8)?,
                     row.get::<_, i64>(9)?, // YPX-020 hibernation_until
+                    row.get::<_, i64>(10)?, // §5.2.2c wall_clock_lock
+                    row.get::<_, i64>(11)?, // §4.2a emission_claimed_epoch
+                    row.get::<_, i64>(12)?, // §6b.13 stake_floor_until
+                    row.get::<_, Vec<u8>>(13)?, // §6b.13 wallet_format (CBOR)
                 ))
             })
             .optional()
@@ -676,7 +721,7 @@ impl Storage {
 
         let result = match raw {
             None => None,
-            Some((pk, balance, seq, sid, last_tx, status, gm_bytes, auth_bytes, wid, hib)) => {
+            Some((pk, balance, seq, sid, last_tx, status, gm_bytes, auth_bytes, wid, hib, wcl, ece, floor, wfmt)) => {
                 Some(StoredWalletState {
                     public_key: pk,
                     balance: from_db_int(balance),
@@ -687,6 +732,10 @@ impl Storage {
                     group_members: cbor_decode_opt(gm_bytes.as_deref(), "wallets.group_members")?,
                     auth_hash: auth_bytes.and_then(|b| b.try_into().ok()),
                     hibernation_until: from_db_int(hib),
+                    wall_clock_lock: from_db_int(wcl),
+                    emission_claimed_epoch: from_db_int(ece),
+                    stake_floor_until: from_db_int(floor),
+                    wallet_format: cbor_decode(&wfmt, "wallets.wallet_format")?,
                     wallet_id: wid,
                 })
             }
@@ -716,6 +765,7 @@ impl Storage {
     /// means concurrent TXs to the same wallet are rejected before reaching storage.
     /// No CAS/version guard needed — the seq constraint is the serialization point.
     pub fn set_wallet_state(&self, state: &StoredWalletState, k: u8, proof_type: u8) -> Result<(), LambdaError> {
+        let (k, proof_type) = Self::state_class_key(k, proof_type); // §16.14.12 (KI#149)
         let conn = self.db()?;
         // CBOR (not JSON) — group_members rides protocol consensus; a
         // silent serialization failure would corrupt S-ABR refill on
@@ -732,8 +782,8 @@ impl Storage {
 
         conn.execute(
             "INSERT OR REPLACE INTO wallets
-             (public_key, k, proof_type, balance, wallet_seq, state_id, last_tx_id, status, group_members, auth_hash, wallet_id, hibernation_until, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             (public_key, k, proof_type, balance, wallet_seq, state_id, last_tx_id, status, group_members, auth_hash, wallet_id, hibernation_until, wall_clock_lock, emission_claimed_epoch, updated_at, stake_floor_until, wallet_format)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 state.public_key,
                 k as i64,
@@ -747,7 +797,11 @@ impl Storage {
                 auth_hash_bytes,
                 state.wallet_id,
                 to_db_int(state.hibernation_until)?, // YPX-020 — persist hibernation
+                to_db_int(state.wall_clock_lock)?,   // §5.2.2c — persist the stake lock
+                to_db_int(state.emission_claimed_epoch)?,   // §4.2a
                 now as i64,
+                to_db_int(state.stake_floor_until)?,        // §6b.13
+                cbor_encode(&state.wallet_format, "wallets.wallet_format")?, // §6b.13
             ],
         )
         .map_err(|e| LambdaError::StorageError(e.to_string()))?;
@@ -880,6 +934,7 @@ impl Storage {
         k: u8,
         proof_type: u8,
     ) -> Result<bool, LambdaError> {
+        let (k, proof_type) = Self::state_class_key(k, proof_type); // §16.14.12 (KI#149)
         let conn = self.db()?;
         // CBOR — see set_wallet_state for the rule rationale.
         let group_members_cbor = cbor_encode_opt(&state.group_members, "wallets.group_members")?;
@@ -891,8 +946,9 @@ impl Storage {
         let rows = conn.execute(
             "UPDATE wallets SET balance=?1, wallet_seq=?2, state_id=?3,
              last_tx_id=?4, status=?5, group_members=?6,
-             auth_hash=?7, wallet_id=?8, hibernation_until=?9, updated_at=?10
-             WHERE public_key=?11 AND state_id=?12 AND k=?13 AND proof_type=?14",
+             auth_hash=?7, wallet_id=?8, hibernation_until=?9, wall_clock_lock=?10, emission_claimed_epoch=?11,
+             updated_at=?12, stake_floor_until=?17, wallet_format=?18
+             WHERE public_key=?13 AND state_id=?14 AND k=?15 AND proof_type=?16",
             params![
                 to_db_int(state.balance)?,
                 to_db_int(state.wallet_seq)?,
@@ -903,11 +959,15 @@ impl Storage {
                 auth_hash_bytes,
                 state.wallet_id,
                 to_db_int(state.hibernation_until)?, // YPX-020 — persist hibernation
+                to_db_int(state.wall_clock_lock)?,   // §5.2.2c — persist the stake lock
+                to_db_int(state.emission_claimed_epoch)?,   // §4.2a
                 now as i64,
                 state.public_key,
                 expected_state_id.as_ref(),
                 k as i64,
                 proof_type as i64,
+                to_db_int(state.stake_floor_until)?,        // §6b.13
+                cbor_encode(&state.wallet_format, "wallets.wallet_format")?, // §6b.13
             ],
         )
         .map_err(|e| LambdaError::StorageError(e.to_string()))?;
@@ -924,142 +984,6 @@ impl Storage {
         }
     }
 
-    /// YPX-018 — CLARA roll-forward.
-    ///
-    /// Atomically advance a wallet's stored state from a known-garbage state
-    /// to the healed state declared in a `ClaraAttestation`. The update only
-    /// succeeds if the wallet's current stored `state_id` is in the
-    /// `garbage_state_ids` set OR equals `healed_from_state_id`.
-    ///
-    /// This is the only protocol-defined exception to "stored state moves
-    /// only as a result of a witnessed-and-ACK'd TX." Safe because:
-    ///   1. Core CL2 has already verified the Nabla signature on the
-    ///      attestation (via verify_clara_signature).
-    ///   2. Core CL2 has already verified the wallet binding
-    ///      (clara.wallet_pk == transaction.client_pk).
-    ///   3. Core CL2 has already verified the eligibility rule (stored state
-    ///      in garbage_state_ids OR == healed_from_state_id).
-    ///   4. The validator only ever moves *forward* — never backward.
-    ///
-    /// Returns:
-    /// - Ok(true)  if the roll-forward applied (or was a no-op because the
-    ///   wallet was already at `healed_to_state_id` — idempotent)
-    /// - Ok(false) if the wallet's current state is not in the garbage set
-    ///   (caller should NOT proceed — Core would have rejected)
-    /// - Err(...)  on storage error
-    ///
-    /// Reference: YPX-018 §2.3, Yellow Paper §17.10.14, §26.17.10.
-    pub fn clara_roll_forward(
-        &self,
-        wallet_pk: &[u8],
-        k: u8,
-        proof_type: u8,
-        healed_from_state_id: &[u8; 32],
-        healed_to_state_id: &[u8; 32],
-        healed_at_seq: u64,
-        healed_balance: u64,
-        garbage_state_ids: &[[u8; 32]],
-    ) -> Result<bool, LambdaError> {
-        let conn = self.db()?;
-
-        // Read current state inside a transaction so the check + update is
-        // atomic against concurrent writes.
-        let tx = conn.unchecked_transaction()
-            .map_err(|e| LambdaError::StorageError(e.to_string()))?;
-
-        let current_state_id: Option<Vec<u8>> = tx.query_row(
-            "SELECT state_id FROM wallets WHERE public_key = ?1 AND k = ?2 AND proof_type = ?3",
-            params![wallet_pk, k as i64, proof_type as i64],
-            |row| row.get(0),
-        ).ok();
-
-        let current = match current_state_id {
-            Some(s) if s.len() == 32 => {
-                let mut a = [0u8; 32];
-                a.copy_from_slice(&s);
-                a
-            }
-            _ => {
-                // No stored state for this wallet — nothing to roll forward.
-                // Caller should treat this as success (the validator hasn't
-                // observed this wallet yet, so it can't be poisoned).
-                return Ok(true);
-            }
-        };
-
-        // Idempotent: already at the healed state.
-        if current == *healed_to_state_id {
-            return Ok(true);
-        }
-
-        // Eligibility check (mirrors Core CL2 §2.3): current must be in
-        // garbage_state_ids OR equal healed_from_state_id.
-        let eligible = current == *healed_from_state_id
-            || garbage_state_ids.iter().any(|g| g == &current);
-        if !eligible {
-            debug!(
-                "CLARA roll-forward refused: stored state not in garbage set (wallet pk={}, stored={}, from={}, garbage={})",
-                hex::encode(&wallet_pk[..8.min(wallet_pk.len())]),
-                hex::encode(&current[..8]),
-                hex::encode(&healed_from_state_id[..8]),
-                garbage_state_ids.len(),
-            );
-            return Ok(false);
-        }
-
-        // YPX-018 Phase 5f Finding 4: also refresh the stored balance.
-        //
-        // The validator's stored balance was wrong because it processed a
-        // partial TX whose debit was never matched by k=3 finalization.
-        // Without this refresh the validator stays functionally broken — it
-        // will reject the wallet's next TX larger than its (lowered) stored
-        // balance, even though every other validator sees the correct balance.
-        //
-        // The trust chain on `healed_balance`:
-        //   1. Wallet declared it in the CLARA registration request.
-        //   2. Nabla recomputed `BLAKE3(wallet_pk || healed_balance ||
-        //      healed_at_seq)` and verified it equals `cheque.state_hash`.
-        //   3. The cheque is k=3-witnessed, so each fresh validator signed
-        //      `state_hash` cryptographically committing to this balance.
-        //   4. Nabla's signed ClaraAttestation propagates the verified value.
-        //   5. Core CL2 verifies the Nabla signature + NBC trust anchor.
-        //   6. clara_roll_forward (here) trusts the value because every link
-        //      in the chain has been independently verified.
-        //
-        // No new trust assumption — every party in the chain has either
-        // observed or cryptographically attested to this balance.
-        let now = unix_now();
-        let rows = tx.execute(
-            "UPDATE wallets SET state_id=?1, wallet_seq=?2, balance=?3, updated_at=?4 WHERE public_key=?5 AND k=?6 AND proof_type=?7",
-            params![
-                healed_to_state_id.as_ref(),
-                to_db_int(healed_at_seq)?,
-                to_db_int(healed_balance)?,
-                now as i64,
-                wallet_pk,
-                k as i64,
-                proof_type as i64,
-            ],
-        ).map_err(|e| LambdaError::StorageError(e.to_string()))?;
-
-        tx.commit()
-            .map_err(|e| LambdaError::StorageError(e.to_string()))?;
-
-        if rows == 0 {
-            debug!("CLARA roll-forward: 0 rows updated for pk={}",
-                hex::encode(&wallet_pk[..8.min(wallet_pk.len())]));
-            return Ok(false);
-        }
-
-        info!(
-            "CLARA roll-forward applied: pk={} {}→{} seq={}",
-            hex::encode(&wallet_pk[..8.min(wallet_pk.len())]),
-            hex::encode(&current[..8]),
-            hex::encode(&healed_to_state_id[..8]),
-            healed_at_seq,
-        );
-        Ok(true)
-    }
 
     // =========================================================================
     // Fan-Out Dedup (replay prevention)
@@ -1177,6 +1101,13 @@ impl Storage {
             params![cutoff as i64],
         ).map_err(|e| LambdaError::StorageError(e.to_string()))?;
 
+        // §23.14.6 witness digests (KI#213): keep at least the peer-audit window
+        // (100 TXs / 600 s) — the caller's max_age is hours or days, far beyond it.
+        total += conn.execute(
+            "DELETE FROM witness_digests WHERE created_at < ?1",
+            params![cutoff as i64],
+        ).map_err(|e| LambdaError::StorageError(e.to_string()))?;
+
         // Always VACUUM — the inline cleanup in store_transaction_record frees
         // rows on every write, but SQLite doesn't reclaim disk space from DELETEs.
         // VACUUM rebuilds the file (~1-3s on 100MB encrypted DB).
@@ -1196,7 +1127,7 @@ impl Storage {
         let conn = self.db()?;
         let mut stmt = conn
             .prepare_cached(
-                "SELECT public_key, balance, wallet_seq, state_id, last_tx_id, status, group_members, auth_hash, wallet_id, hibernation_until
+                "SELECT public_key, balance, wallet_seq, state_id, last_tx_id, status, group_members, auth_hash, wallet_id, hibernation_until, wall_clock_lock, emission_claimed_epoch, stake_floor_until, wallet_format
                  FROM wallets WHERE state_id = ?1",
             )
             .map_err(|e| LambdaError::StorageError(e.to_string()))?;
@@ -1220,6 +1151,10 @@ impl Storage {
                     .and_then(|b| b.try_into().ok()),
                 wallet_id: row.get::<_, Option<String>>(8)?,
                 hibernation_until: row.get::<_, i64>(9)? as u64, // YPX-020 — persisted
+                wall_clock_lock: row.get::<_, i64>(10)? as u64,  // §5.2.2c — persisted
+                emission_claimed_epoch: row.get::<_, i64>(11)? as u64,
+                stake_floor_until: row.get::<_, i64>(12)? as u64, // §6b.13
+                wallet_format: cbor_decode_in_row(&row.get::<_, Vec<u8>>(13)?, "wallets.wallet_format")?,
             })
         })
         .optional()
@@ -1237,6 +1172,7 @@ impl Storage {
         k: u8,
         proof_type: u8,
     ) -> Result<Option<StoredWalletState>, LambdaError> {
+        let (k, proof_type) = Self::state_class_key(k, proof_type); // §16.14.12 (KI#149)
         let conn = self.db()?;
         let mut stmt = conn
             .prepare_cached(
@@ -1259,7 +1195,7 @@ impl Storage {
                     row.get::<_, Option<Vec<u8>>>(6)?,
                     "genesis_states.group_members",
                 )?,
-                auth_hash: None, hibernation_until: 0, // Genesis wallets have no auth_hash
+                auth_hash: None, hibernation_until: 0, wall_clock_lock: 0, emission_claimed_epoch: 0, stake_floor_until: 0, wallet_format: axiom_core_logic::types::WalletFormat::CURRENT, // Genesis wallets have no auth_hash
                 wallet_id: None, // Set on first TX (identity binding)
             })
         })
@@ -1275,6 +1211,7 @@ impl Storage {
         proof_type: u8,
         state: &StoredWalletState,
     ) -> Result<(), LambdaError> {
+        let (k, proof_type) = Self::state_class_key(k, proof_type); // §16.14.12 (KI#149)
         let conn = self.db()?;
         // CBOR — see set_wallet_state for rationale.
         let group_members_cbor = cbor_encode_opt(&state.group_members, "genesis_states.group_members")?;
@@ -1321,13 +1258,22 @@ impl Storage {
         // round-trip on the next read.  CBOR + fail-loud.
         let witness_sigs_cbor = cbor_encode(&receipt.witness_sigs, "receipts.witness_sigs")?;
         let fact_proof_cbor = cbor_encode_opt(&receipt.fact_proof, "receipts.fact_proof")?;
+        // "Step 7" (Q2-b): the four commitment-bound fields that used to be
+        // dropped. CBOR + fail-loud like witness_sigs — a silent encode failure
+        // would make the read-back receipt fail verify_receipt_witness_quorum.
+        let oods_flag_cbor = cbor_encode_opt(&receipt.oods_flag, "receipts.oods_flag")?;
+        let confidence_index_cbor =
+            cbor_encode_opt(&receipt.confidence_index, "receipts.confidence_index")?;
+        let sender_state_blob: Option<Vec<u8>> = receipt.sender_state.map(|s| s.to_vec());
 
         conn.execute(
             "INSERT OR REPLACE INTO receipts
              (txid, state_hash, produced_state_id, new_wallet_seq, commitment_hash,
               sdid, lineage_hash, core_version, witness_sigs, epoch, fact_proof,
-              receipt_commitment, core_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+              receipt_commitment, core_id, required_k,
+              oods_flag, confidence_index, sender_state, is_dev_class)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                     ?15, ?16, ?17, ?18)",
             params![
                 receipt.txid.as_ref(),
                 receipt.state_hash.as_ref(),
@@ -1342,6 +1288,11 @@ impl Storage {
                 fact_proof_cbor,
                 receipt.receipt_commitment.as_ref(),
                 receipt.core_id.as_ref(),
+                receipt.required_k as i64, // YP §17.3.1.4 v2.19.0 (KI#150)
+                oods_flag_cbor,            // "Step 7" (Q2-b): commitment-bound
+                confidence_index_cbor,     // "Step 7" (Q2-b): commitment-bound
+                sender_state_blob,         // "Step 7" (Q2-b): commitment-bound
+                receipt.is_dev_class as i64, // "Step 7" (Q2-b): commitment-bound
             ],
         )
         .map_err(|e| LambdaError::StorageError(e.to_string()))?;
@@ -1351,60 +1302,124 @@ impl Storage {
         Ok(())
     }
 
+    /// Column list for a full Receipt reconstruction, in the exact order
+    /// `row_to_receipt` reads. Shared by every receipt-reading query (RULE 1).
+    const RECEIPT_SELECT_COLS: &'static str =
+        "txid, state_hash, produced_state_id, new_wallet_seq, commitment_hash,
+         sdid, lineage_hash, core_version, witness_sigs, epoch, fact_proof,
+         receipt_commitment, core_id, required_k,
+         oods_flag, confidence_index, sender_state, is_dev_class";
+
+    /// Reconstruct a full `Receipt` from a row selected with
+    /// `RECEIPT_SELECT_COLS`. THE one reconstruction site (RULE 1) — used by
+    /// `get_receipt` and `find_cosigned_work_receipt`. As of "Step 7" (Q2-b,
+    /// 2026-09-21) it restores all four commitment-bound fields (oods_flag,
+    /// confidence_index, sender_state, is_dev_class) so the receipt re-verifies
+    /// its `receipt_commitment` via `verify_receipt_witness_quorum`.
+    fn row_to_receipt(row: &rusqlite::Row) -> rusqlite::Result<Receipt> {
+        let witness_sigs_bytes: Vec<u8> = row.get(8)?;
+        let fact_proof_bytes: Option<Vec<u8>> = row.get(10)?;
+        let oods_flag_bytes: Option<Vec<u8>> = row.get(14)?;
+        let confidence_index_bytes: Option<Vec<u8>> = row.get(15)?;
+        let sender_state_bytes: Option<Vec<u8>> = row.get(16)?;
+        let is_dev_class: bool = row.get::<_, i64>(17)? != 0;
+        Ok(Receipt {
+            sender_state: sender_state_bytes.map(blob_to_32),
+            txid: blob_to_32(row.get::<_, Vec<u8>>(0)?),
+            state_hash: blob_to_32(row.get::<_, Vec<u8>>(1)?),
+            produced_state_id: blob_to_32(row.get::<_, Vec<u8>>(2)?),
+            new_wallet_seq: row.get::<_, i64>(3)? as u64,
+            commitment_hash: blob_to_32(row.get::<_, Vec<u8>>(4)?),
+            sdid: blob_to_32(row.get::<_, Vec<u8>>(5)?),
+            lineage_hash: blob_to_32(row.get::<_, Vec<u8>>(6)?),
+            core_version: row.get(7)?,
+            witness_sigs: cbor_decode_in_row(&witness_sigs_bytes, "receipts.witness_sigs")?,
+            epoch: row.get::<_, i64>(9)? as u64,
+            fact_proof: cbor_decode_opt_in_row(fact_proof_bytes, "receipts.fact_proof")?,
+            // YP §17.3.1.4 v2.19.0 (KI#150): the stored round k. A row
+            // written before the column reads 0 — never fabricated as 3.
+            required_k: row.get::<_, i64>(13)? as u8,
+            receipt_commitment: blob_to_32(row.get::<_, Vec<u8>>(11)?),
+            core_id: blob_to_32(row.get::<_, Vec<u8>>(12)?),
+            // YP §19.6 — fee_breakdown is NOT folded into receipt_commitment
+            // (crypto.rs), so it is not needed for re-verification and remains
+            // unpersisted; an empty Vec matches what the commitment hashed over.
+            fee_breakdown: Vec::new(),
+            // "Step 7" (Q2-b, 2026-09-21): the three + is_dev_class below are now
+            // PERSISTED (schema above) and restored here, so a read-back Receipt
+            // reproduces its receipt_commitment and passes
+            // verify_receipt_witness_quorum. Previously dropped (→ None/false).
+            oods_flag: cbor_decode_opt_in_row(oods_flag_bytes, "receipts.oods_flag")?,
+            confidence_index: cbor_decode_opt_in_row(
+                confidence_index_bytes,
+                "receipts.confidence_index",
+            )?,
+            is_dev_class,
+        })
+    }
+
     /// Get a receipt by transaction ID
     pub fn get_receipt(&self, txid: &[u8; 32]) -> Result<Option<Receipt>, LambdaError> {
         let conn = self.db()?;
+        let sql = format!(
+            "SELECT {} FROM receipts WHERE txid = ?1",
+            Self::RECEIPT_SELECT_COLS
+        );
         let mut stmt = conn
-            .prepare_cached(
-                "SELECT txid, state_hash, produced_state_id, new_wallet_seq, commitment_hash,
-                        sdid, lineage_hash, core_version, witness_sigs, epoch, fact_proof,
-                        receipt_commitment, core_id
-                 FROM receipts WHERE txid = ?1",
-            )
+            .prepare_cached(&sql)
             .map_err(|e| LambdaError::StorageError(e.to_string()))?;
 
-        stmt.query_row(params![txid.as_ref()], |row| {
-            let witness_sigs_bytes: Vec<u8> = row.get(8)?;
-            let fact_proof_bytes: Option<Vec<u8>> = row.get(10)?;
-            Ok(Receipt {
-                txid: blob_to_32(row.get::<_, Vec<u8>>(0)?),
-                state_hash: blob_to_32(row.get::<_, Vec<u8>>(1)?),
-                produced_state_id: blob_to_32(row.get::<_, Vec<u8>>(2)?),
-                new_wallet_seq: row.get::<_, i64>(3)? as u64,
-                commitment_hash: blob_to_32(row.get::<_, Vec<u8>>(4)?),
-                sdid: blob_to_32(row.get::<_, Vec<u8>>(5)?),
-                lineage_hash: blob_to_32(row.get::<_, Vec<u8>>(6)?),
-                core_version: row.get(7)?,
-                witness_sigs: cbor_decode_in_row(&witness_sigs_bytes, "receipts.witness_sigs")?,
-                epoch: row.get::<_, i64>(9)? as u64,
-                fact_proof: cbor_decode_opt_in_row(fact_proof_bytes, "receipts.fact_proof")?,
-                // required_k column doesn't exist in this schema — defaults to 3.
-                // (separate pre-existing gap, not introduced by this commit)
-                required_k: 3,
-                receipt_commitment: blob_to_32(row.get::<_, Vec<u8>>(11)?),
-                core_id: blob_to_32(row.get::<_, Vec<u8>>(12)?),
-                // YP §19.6 — Step 2 ships the field but no storage column
-                // yet. Step 7 adds the schema migration + write path; until
-                // then every stored Receipt is pre-fee-breakdown era and
-                // round-trips with an empty Vec (which matches what the
-                // commitment was hashed over).
-                fee_breakdown: Vec::new(),
-                // YPX-021 — same no-column treatment as is_dev_class below:
-                // this SELECT feeds has_receipt-style lookups only, never a
-                // commitment re-verify.
-                oods_flag: None,
-                // Dev-class isolation flag — no storage column yet either;
-                // current schema only persists Receipts inside this Lambda's
-                // own write path (which always sets the field), and the
-                // SELECT here is used only for has_receipt-style lookups
-                // that don't re-verify receipt_commitment. Default `false`
-                // is safe for non-dev TXs and the dev-class soak suite
-                // will surface any column-add need.
-                is_dev_class: false,
-            })
-        })
-        .optional()
-        .map_err(|e| LambdaError::StorageError(e.to_string()))
+        stmt.query_row(params![txid.as_ref()], Self::row_to_receipt)
+            .optional()
+            .map_err(|e| LambdaError::StorageError(e.to_string()))
+    }
+
+    /// Q2-b producer — find ONE stored receipt this validator co-signed during
+    /// its current cert's term, to present as the VBC-renewal proof-of-validation
+    /// (`VBCProofBundle.renewal_work_receipt`). Returns the first stored receipt
+    /// (most recent first) that PASSES the Core gate `verify_renewal_work_receipt`
+    /// for `my_ed25519_pk` / `min_tick` — i.e. it (a) carries a fresh OODS reading
+    /// (`oods_flag.tick > min_tick`), (b) is ≥3-quorum, and (c) is genuinely
+    /// co-signed by `my_ed25519_pk` (a valid receipt_commitment_sig, not merely
+    /// listed). We REUSE the Core verifier verbatim (RULE 1) so a receipt this
+    /// returns is exactly one the CL8 gate will accept.
+    ///
+    /// `None` means this validator has no PROVABLE witnessing work since
+    /// `min_tick` — the renewal is then correctly refused by Core; the operator
+    /// must witness a live round first. Off the hot path (renewal is rare), so a
+    /// bounded recent-first scan + in-Rust verify is fine.
+    pub fn find_cosigned_work_receipt(
+        &self,
+        my_ed25519_pk: &[u8],
+        min_tick: u64,
+    ) -> Result<Option<Receipt>, LambdaError> {
+        // Cheap pre-filter in SQL (fresh OODS reading present), full verify in
+        // Rust. `oods_flag IS NOT NULL` skips heal/genesis/offline receipts that
+        // can never qualify. rowid DESC = most recent first.
+        let conn = self.db()?;
+        let sql = format!(
+            "SELECT {} FROM receipts WHERE oods_flag IS NOT NULL ORDER BY rowid DESC LIMIT 512",
+            Self::RECEIPT_SELECT_COLS
+        );
+        let mut stmt = conn
+            .prepare_cached(&sql)
+            .map_err(|e| LambdaError::StorageError(e.to_string()))?;
+        let rows = stmt
+            .query_map([], Self::row_to_receipt)
+            .map_err(|e| LambdaError::StorageError(e.to_string()))?;
+        for r in rows {
+            let receipt = r.map_err(|e| LambdaError::StorageError(e.to_string()))?;
+            if axiom_core_logic::vbc::verify_renewal_work_receipt(
+                &receipt,
+                my_ed25519_pk,
+                min_tick,
+            )
+            .is_ok()
+            {
+                return Ok(Some(receipt));
+            }
+        }
+        Ok(None)
     }
 
     /// Check if transaction was already processed
@@ -1709,6 +1724,7 @@ impl Storage {
         k: u8,
         proof_type: u8,
     ) -> Result<(), LambdaError> {
+        let (k, proof_type) = Self::state_class_key(k, proof_type); // §16.14.12 (KI#149)
         let conn = self.db()?;
         let tx = conn.unchecked_transaction()
             .map_err(|e| LambdaError::StorageError(format!("begin txn: {}", e)))?;
@@ -1751,10 +1767,19 @@ impl Storage {
         let last_tx_id = state.last_tx_id.map(|id| id.to_vec());
         let auth_hash_bytes = state.auth_hash.map(|h| h.to_vec());
         let now = unix_now();
+        // ⚠ WRONG, and it shipped (found 2026-10-01 building ValidatorJoin
+        // §6b.13, RULE 0 §4): this INSERT OR REPLACE listed neither
+        // `wall_clock_lock` nor `emission_claimed_epoch`, so every sender row
+        // written by the witness path REPLACED them with the column DEFAULT 0 —
+        // the silent zero `set_wallet_state` warns about. CL5 reads both from
+        // THIS row (the stored, enforcing copy), so a stored lock/epoch did not
+        // survive the wallet's next send. CORRECT: every §15 field of the row is
+        // written here, exactly as `set_wallet_state` writes it; the §6b.13
+        // columns carry no default, so an omission now fails loudly.
         tx.execute(
             "INSERT OR REPLACE INTO wallets
-             (public_key, k, proof_type, balance, wallet_seq, state_id, last_tx_id, status, group_members, auth_hash, wallet_id, hibernation_until, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             (public_key, k, proof_type, balance, wallet_seq, state_id, last_tx_id, status, group_members, auth_hash, wallet_id, hibernation_until, updated_at, wall_clock_lock, emission_claimed_epoch, stake_floor_until, wallet_format)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 state.public_key,
                 k as i64,
@@ -1769,6 +1794,10 @@ impl Storage {
                 state.wallet_id,
                 to_db_int(state.hibernation_until)?, // YPX-020 — persist hibernation (?10)
                 now as i64,
+                to_db_int(state.wall_clock_lock)?,          // §5.2.2c
+                to_db_int(state.emission_claimed_epoch)?,   // §4.2a
+                to_db_int(state.stake_floor_until)?,        // §6b.13
+                cbor_encode(&state.wallet_format, "wallets.wallet_format")?, // §6b.13
             ],
         ).map_err(|e| LambdaError::StorageError(e.to_string()))?;
 
@@ -1880,7 +1909,7 @@ impl Storage {
                 wallet_seq_after: row.get::<_, i64>(4)? as u64,
                 group_members_after: cbor_decode_opt_in_row(gm_bytes, "transaction_records.group_members_after")?,
                 status: status_from_str(&row.get::<_, String>(6)?),
-                required_k: row.get::<_, i64>(7).unwrap_or(3) as u8,
+                required_k: row.get::<_, i64>(7).unwrap_or(0) as u8, // KI#150: absent = 0, never 3
                 proof_type: row.get::<_, i64>(8).unwrap_or(1) as u8,
                 amount: row.get::<_, i64>(9).unwrap_or(0) as u64,
                 sender_balance: row.get::<_, i64>(10).unwrap_or(0) as u64,
@@ -1916,12 +1945,52 @@ impl Storage {
                 wallet_seq_after: row.get::<_, i64>(4)? as u64,
                 group_members_after: cbor_decode_opt_in_row(gm_bytes, "transaction_records.group_members_after")?,
                 status: status_from_str(&row.get::<_, String>(6)?),
-                required_k: row.get::<_, i64>(7).unwrap_or(3) as u8,
+                required_k: row.get::<_, i64>(7).unwrap_or(0) as u8, // KI#150: absent = 0, never 3
                 proof_type: row.get::<_, i64>(8).unwrap_or(1) as u8,
                 amount: row.get::<_, i64>(9).unwrap_or(0) as u64,
                 sender_balance: row.get::<_, i64>(10).unwrap_or(0) as u64,
                 is_genesis_claim: None, // TODO: add DB column
             })
+        })
+        .optional()
+        .map_err(|e| LambdaError::StorageError(e.to_string()))
+    }
+
+    // =========================================================================
+    // §23.14.6 witness digests — what a CL2 witness holds for a peer audit
+    // =========================================================================
+
+    /// Record the audit digest of a tx this validator WITNESSED at CL2 (KI#213).
+    /// Idempotent per txid (a retried hop rewrites the same values).
+    pub fn store_witness_digest(
+        &self,
+        txid: &[u8; 32],
+        sender_balance: u64,
+        state_id: &[u8; 32],
+        amount: u64,
+    ) -> Result<(), LambdaError> {
+        let conn = self.db()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO witness_digests (txid, sender_balance, state_id, amount, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![txid.as_ref(), sender_balance as i64, state_id.as_ref(), amount as i64, unix_now() as i64],
+        ).map_err(|e| LambdaError::StorageError(e.to_string()))?;
+        Ok(())
+    }
+
+    /// The digest fields this validator stored for a witnessed tx, if any:
+    /// `(sender_balance, state_id, amount)`.
+    pub fn get_witness_digest(&self, txid: &[u8; 32]) -> Result<Option<(u64, [u8; 32], u64)>, LambdaError> {
+        let conn = self.db()?;
+        let mut stmt = conn
+            .prepare_cached("SELECT sender_balance, state_id, amount FROM witness_digests WHERE txid = ?1")
+            .map_err(|e| LambdaError::StorageError(e.to_string()))?;
+        stmt.query_row(params![txid.as_ref()], |row| {
+            Ok((
+                row.get::<_, i64>(0)? as u64,
+                blob_to_32(row.get::<_, Vec<u8>>(1)?),
+                row.get::<_, i64>(2)? as u64,
+            ))
         })
         .optional()
         .map_err(|e| LambdaError::StorageError(e.to_string()))
@@ -1993,6 +2062,39 @@ impl Storage {
     }
 
     /// Check if a state_id has been consumed (ACK'd in a prior transaction).
+    /// YP §26.17.6.5 B4 — keep a VERIFIED certificate bundle (the caller verified
+    /// it; only verified bundles may enter, so presenting from the store can
+    /// never poison an execution). Returns true when newly stored.
+    pub fn store_fact_certificate(&self, reference: &[u8; 32], bundle_cbor: &[u8]) -> Result<bool, LambdaError> {
+        let conn = self.db()?;
+        let n = conn
+            .execute(
+                "INSERT OR IGNORE INTO fact_certificates (reference, bundle, stored_at) VALUES (?1, ?2, ?3)",
+                params![reference.as_ref(), bundle_cbor, unix_now() as i64],
+            )
+            .map_err(|e| LambdaError::StorageError(e.to_string()))?;
+        Ok(n > 0)
+    }
+
+    /// YP §26.17.6.5 B4 — the stored certificate for a witness reference, if any.
+    pub fn get_fact_certificate(
+        &self,
+        reference: &[u8; 32],
+    ) -> Result<Option<axiom_core_logic::types::VBCProofBundle>, LambdaError> {
+        let conn = self.db()?;
+        let mut stmt = conn
+            .prepare_cached("SELECT bundle FROM fact_certificates WHERE reference = ?1")
+            .map_err(|e| LambdaError::StorageError(e.to_string()))?;
+        let bytes: Option<Vec<u8>> = stmt
+            .query_row(params![reference.as_ref()], |row| row.get(0))
+            .optional()
+            .map_err(|e| LambdaError::StorageError(e.to_string()))?;
+        match bytes {
+            Some(b) => Ok(Some(cbor_decode(&b, "fact_certificates.bundle")?)),
+            None => Ok(None),
+        }
+    }
+
     pub fn is_state_consumed(&self, state_id: &[u8; 32]) -> Result<bool, LambdaError> {
         let conn = self.db()?;
         let mut stmt = conn
@@ -2105,7 +2207,7 @@ impl Storage {
     /// existing entry was UPDATED with fresher carriers / last_seen.
     /// (The boolean used to mean "added or skipped" — the
     /// "already known → drop" branch was the propagation bug that
-    /// kept validator carrier lists frozen at their seed-hints.json
+    /// kept validator carrier lists frozen at their first (bootstrap)
     /// values forever. Now incoming hints with newer info actually
     /// overwrite the stored copy.)
     ///
@@ -2380,96 +2482,8 @@ impl Storage {
         Ok((sum as u64, count as u64))
     }
 
-    /// Step 9B.7 — record a completed validator-withdrawal mint receipt.
-    ///
-    /// Idempotent via PRIMARY KEY `(validator_id, claimed_through_tick)`.
-    /// Returns `true` on first insert, `false` if a receipt for the
-    /// same (vid, tick) pair already exists. Callers use the bool to
-    /// distinguish "I just minted" from "retry — already minted, here's
-    /// the prior receipt" and avoid double-sending Nabla's MarkClaimed.
-    ///
-    /// `signatures_cbor` is the CBOR-encoded `Vec<WitnessSignature>`
-    /// the orchestrator returned. Stored as opaque bytes — callers
-    /// decode when they need the per-witness detail.
-    pub fn record_validator_mint(
-        &self,
-        validator_id: &[u8; 32],
-        claimed_through_tick: u64,
-        linked_wallet_id: &[u8; 32],
-        net_amount: u64,
-        signatures_cbor: &[u8],
-    ) -> Result<bool, LambdaError> {
-        let conn = self.db()?;
-        let now = unix_now() as i64;
-        let inserted = conn.execute(
-            "INSERT OR IGNORE INTO validator_withdrawal_mints
-             (validator_id, claimed_through_tick, linked_wallet_id,
-              net_amount, minted_at, signatures)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                validator_id.as_ref(),
-                claimed_through_tick as i64,
-                linked_wallet_id.as_ref(),
-                net_amount as i64,
-                now,
-                signatures_cbor,
-            ],
-        ).map_err(|e| LambdaError::StorageError(e.to_string()))?;
-        Ok(inserted > 0)
-    }
 
-    /// Look up a stored mint receipt by (validator_id, claimed_through_tick).
-    /// Returns `(linked_wallet_id, net_amount, minted_at, signatures_cbor)`
-    /// or `None` if no row matches.
-    #[allow(clippy::type_complexity)]
-    pub fn get_validator_mint(
-        &self,
-        validator_id: &[u8; 32],
-        claimed_through_tick: u64,
-    ) -> Result<Option<([u8; 32], u64, u64, Vec<u8>)>, LambdaError> {
-        let conn = self.db()?;
-        let row = conn.query_row(
-            "SELECT linked_wallet_id, net_amount, minted_at, signatures
-             FROM validator_withdrawal_mints
-             WHERE validator_id = ?1 AND claimed_through_tick = ?2",
-            params![validator_id.as_ref(), claimed_through_tick as i64],
-            |row| {
-                let lw: Vec<u8> = row.get(0)?;
-                let net: i64 = row.get(1)?;
-                let at: i64 = row.get(2)?;
-                let sigs: Vec<u8> = row.get(3)?;
-                Ok((lw, net, at, sigs))
-            },
-        );
-        match row {
-            Ok((lw, net, at, sigs)) => {
-                let lw_arr: [u8; 32] = lw.try_into()
-                    .map_err(|_| LambdaError::StorageError(
-                        "linked_wallet_id wrong length".into(),
-                    ))?;
-                Ok(Some((lw_arr, net as u64, at as u64, sigs)))
-            }
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(LambdaError::StorageError(e.to_string())),
-        }
-    }
 
-    /// Sum of `net_amount` across all mints credited to a linked wallet.
-    /// Used by future wallet-side credit logic and by audit reporting.
-    pub fn lifetime_minted_to(
-        &self,
-        linked_wallet_id: &[u8; 32],
-    ) -> Result<u64, LambdaError> {
-        let conn = self.db()?;
-        let sum: i64 = conn.query_row(
-            "SELECT COALESCE(SUM(net_amount), 0)
-             FROM validator_withdrawal_mints
-             WHERE linked_wallet_id = ?1",
-            params![linked_wallet_id.as_ref()],
-            |row| row.get(0),
-        ).map_err(|e| LambdaError::StorageError(e.to_string()))?;
-        Ok(sum as u64)
-    }
 
     /// Count receipts in storage (for admin API)
     pub fn receipts_count(&self) -> Result<usize, LambdaError> {
@@ -2546,6 +2560,57 @@ impl Storage {
         Ok(new_remaining)
     }
 
+    /// Has this validator ALREADY cost us a signing-budget unit? Keyed on the
+    /// validator_id in the `meta` kv (`vbc_budget_spent:<id>`), separate from
+    /// `approved_validators` because a PROVISIONAL certificate is recorded there
+    /// too (it is the retry/idempotency record) but must NOT spend budget — the
+    /// budget is spent once, on the first FULL certificate (2026-09-08).
+    pub fn is_vbc_budget_spent(&self, validator_id: &str) -> Result<bool, LambdaError> {
+        let conn = self.db()?;
+        let n: i64 = conn
+            .prepare_cached("SELECT COUNT(*) FROM meta WHERE key = ?1")
+            .and_then(|mut st| st.query_row(params![format!("vbc_budget_spent:{validator_id}")], |r| r.get(0)))
+            .map_err(|e| LambdaError::StorageError(format!("budget-spent lookup: {}", e)))?;
+        Ok(n > 0)
+    }
+
+    pub fn mark_vbc_budget_spent(&self, validator_id: &str) -> Result<(), LambdaError> {
+        let conn = self.db()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, '1')",
+            params![format!("vbc_budget_spent:{validator_id}")],
+        )
+        .map_err(|e| LambdaError::StorageError(format!("budget-spent write: {}", e)))?;
+        Ok(())
+    }
+
+    /// §5.2.2e — the latest SIGNED Pulse proof (CBOR, hex) in the meta kv.
+    pub fn set_last_pulse_proof(&self, proof: &axiom_core_logic::wire_client::PulseProofRequest) -> Result<(), LambdaError> {
+        let mut cbor = Vec::new();
+        ciborium::into_writer(proof, &mut cbor)
+            .map_err(|e| LambdaError::StorageError(format!("pulse proof encode: {}", e)))?;
+        let conn = self.db()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('last_pulse_proof', ?1)",
+            params![hex::encode(cbor)],
+        )
+        .map_err(|e| LambdaError::StorageError(format!("pulse proof write: {}", e)))?;
+        Ok(())
+    }
+
+    pub fn get_last_pulse_proof(&self) -> Result<Option<axiom_core_logic::wire_client::PulseProofRequest>, LambdaError> {
+        let conn = self.db()?;
+        let raw: Option<String> = conn
+            .prepare_cached("SELECT value FROM meta WHERE key = 'last_pulse_proof'")
+            .and_then(|mut st| st.query_row([], |r| r.get(0)).optional())
+            .map_err(|e| LambdaError::StorageError(format!("pulse proof read: {}", e)))?;
+        let Some(h) = raw else { return Ok(None) };
+        let cbor = hex::decode(h).map_err(|e| LambdaError::StorageError(format!("pulse proof hex: {}", e)))?;
+        ciborium::from_reader(cbor.as_slice())
+            .map(Some)
+            .map_err(|e| LambdaError::StorageError(format!("pulse proof decode: {}", e)))
+    }
+
     // =========================================================================
     // Approved Validators (Phase 3C onboarding tracking)
     // =========================================================================
@@ -2569,6 +2634,26 @@ impl Storage {
         )
         .map_err(|e| LambdaError::StorageError(format!("Failed to record approval: {}", e)))?;
         Ok(())
+    }
+
+    /// Has this validator already been signed by us?
+    ///
+    /// The idempotency key for VBC commit (`AXIOM_DESIGN_ValidatorJoin.md`
+    /// §6a.2). `validator_id` is the PRIMARY KEY of `approved_validators`, and
+    /// it is something the candidate still holds after a crash — unlike a
+    /// request id or a session, which is why the retry keys on it.
+    ///
+    /// Used ONLY to decide whether to decrement the signing budget. Signing
+    /// itself must still proceed for a known validator: refusing to re-sign
+    /// would strand a candidate whose stake was granted but whose VBC round
+    /// failed (§6.1).
+    pub fn is_validator_approved(&self, validator_id: &str) -> Result<bool, LambdaError> {
+        let conn = self.db()?;
+        let n: i64 = conn
+            .prepare_cached("SELECT COUNT(*) FROM approved_validators WHERE validator_id = ?1")
+            .and_then(|mut st| st.query_row(params![validator_id], |r| r.get(0)))
+            .map_err(|e| LambdaError::StorageError(format!("approved lookup: {}", e)))?;
+        Ok(n > 0)
     }
 
     /// YP §10: Record MVIB binding — this validator approved a new validator.
@@ -2974,6 +3059,11 @@ fn status_from_str(s: &str) -> WalletStateStatus {
     }
 }
 
+/// §5.2.2c — the wall-clock reading Lambda enforces the stake lock against.
+/// Public because the gate lives in `consensus.rs` while the clock helper lives
+/// here; Lambda is the first layer in the path with a REAL clock (Core has none).
+pub fn unix_now_pub() -> u64 { unix_now() }
+
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3007,7 +3097,7 @@ mod tests {
             last_tx_id: Some([0xCD; 32]),
             status: WalletStateStatus::Confirmed,
             group_members: None,
-            auth_hash: None, hibernation_until: 0,
+            auth_hash: None, hibernation_until: 0, wall_clock_lock: 0, emission_claimed_epoch: 0, stake_floor_until: 0, wallet_format: axiom_core_logic::types::WalletFormat::CURRENT,
             wallet_id: None,
         };
 
@@ -3023,6 +3113,43 @@ mod tests {
         assert_eq!(loaded.last_tx_id, Some([0xCD; 32]));
     }
 
+    /// ValidatorJoin §6b.13 — BOTH wallet-row writers persist every §15 field:
+    /// `set_wallet_state` and the witness path's atomic
+    /// `store_tx_record_and_wallet_state` (which, until 2026-10-01, omitted the
+    /// lock and the emission mark and so reset them to the column default 0).
+    /// MUTATION: drop `wall_clock_lock` / `emission_claimed_epoch` /
+    /// `stake_floor_until` from the atomic INSERT ⇒ RED.
+    #[test]
+    fn both_wallet_row_writers_persist_every_state_hash_field() {
+        let storage = Storage::open_test().unwrap();
+        let mut fmt = axiom_core_logic::types::WalletFormat::CURRENT;
+        fmt.ext_u64_3 = 7; // a distinct block, so a defaulted column cannot pass
+        let state = StoredWalletState {
+            public_key: vec![9u8; 32], balance: 1_000, wallet_seq: 5, state_id: [0xAB; 32],
+            last_tx_id: None, status: WalletStateStatus::Pending, group_members: None,
+            auth_hash: None, hibernation_until: 11, wall_clock_lock: 22, emission_claimed_epoch: 33,
+            stake_floor_until: 44, wallet_format: fmt, wallet_id: None,
+        };
+        let check = |loaded: StoredWalletState, how: &str| {
+            assert_eq!(
+                (loaded.hibernation_until, loaded.wall_clock_lock, loaded.emission_claimed_epoch,
+                 loaded.stake_floor_until, loaded.wallet_format),
+                (11, 22, 33, 44, fmt), "{how} must persist every §15 field");
+        };
+        storage.set_wallet_state(&state, 3, 1).unwrap();
+        check(storage.get_wallet_state(&state.public_key, 3, 1).unwrap().unwrap(), "set_wallet_state");
+        let record = TransactionRecord {
+            tx_id: [1u8; 32], produced_state_id: [0xAB; 32], wallet_pk: state.public_key.clone(),
+            balance_after: 1_000, wallet_seq_after: 5, group_members_after: None,
+            is_genesis_claim: None, status: WalletStateStatus::Pending, required_k: 3,
+            proof_type: 1, amount: 0, sender_balance: 0,
+        };
+        let mut other = state.clone();
+        other.public_key = vec![8u8; 32];
+        storage.store_tx_record_and_wallet_state(&TransactionRecord { wallet_pk: other.public_key.clone(), ..record }, &other, 3, 1).unwrap();
+        check(storage.get_wallet_state(&other.public_key, 3, 1).unwrap().unwrap(), "store_tx_record_and_wallet_state");
+    }
+
     #[test]
     fn test_genesis_state_roundtrip() {
         let storage = Storage::open_test().unwrap();
@@ -3036,7 +3163,7 @@ mod tests {
             last_tx_id: None,
             status: WalletStateStatus::Confirmed,
             group_members: None,
-            auth_hash: None, hibernation_until: 0,
+            auth_hash: None, hibernation_until: 0, wall_clock_lock: 0, emission_claimed_epoch: 0, stake_floor_until: 0, wallet_format: axiom_core_logic::types::WalletFormat::CURRENT,
             wallet_id: None,
         };
 
@@ -3061,7 +3188,7 @@ mod tests {
             last_tx_id: None,
             status: WalletStateStatus::Confirmed,
             group_members: None,
-            auth_hash: None, hibernation_until: 0,
+            auth_hash: None, hibernation_until: 0, wall_clock_lock: 0, emission_claimed_epoch: 0, stake_floor_until: 0, wallet_format: axiom_core_logic::types::WalletFormat::CURRENT,
             wallet_id: None,
         };
 
@@ -3323,59 +3450,6 @@ mod tests {
             "dev earnings must be visible via the dev accessor");
     }
 
-    #[test]
-    fn validator_withdrawal_mint_idempotent_and_lookup() {
-        let storage = Storage::open_test().unwrap();
-        let vid = [0xAA; 32];
-        let linked = [0xBB; 32];
-        let tick = 42u64;
-        let sigs_cbor = vec![0xDE, 0xAD, 0xBE, 0xEF];
-
-        // Initial: no mint for this (vid, tick).
-        assert!(storage.get_validator_mint(&vid, tick).unwrap().is_none());
-        assert_eq!(storage.lifetime_minted_to(&linked).unwrap(), 0);
-
-        // First persist: inserts a row, returns true.
-        let inserted = storage
-            .record_validator_mint(&vid, tick, &linked, 90, &sigs_cbor)
-            .unwrap();
-        assert!(inserted, "first persist must be a new insert");
-        assert_eq!(storage.lifetime_minted_to(&linked).unwrap(), 90);
-
-        // Lookup returns the stored fields.
-        let (got_linked, got_net, _minted_at, got_sigs) =
-            storage.get_validator_mint(&vid, tick).unwrap().unwrap();
-        assert_eq!(got_linked, linked);
-        assert_eq!(got_net, 90);
-        assert_eq!(got_sigs, sigs_cbor);
-
-        // Idempotency: re-inserting the same (vid, tick) returns false
-        // and does NOT bump the credited amount. Defends against a
-        // double admin POST or a retried witness round.
-        let again = storage
-            .record_validator_mint(&vid, tick, &linked, 90, &sigs_cbor)
-            .unwrap();
-        assert!(!again, "duplicate (vid, tick) must be ignored");
-        assert_eq!(storage.lifetime_minted_to(&linked).unwrap(), 90,
-            "lifetime_minted_to must NOT double-count");
-
-        // Distinct tick on the same vid is a new mint.
-        let inserted2 = storage
-            .record_validator_mint(&vid, tick + 100, &linked, 50, &sigs_cbor)
-            .unwrap();
-        assert!(inserted2);
-        assert_eq!(storage.lifetime_minted_to(&linked).unwrap(), 140);
-
-        // Different linked wallet on the same vid → separate accumulator.
-        let other_linked = [0xCC; 32];
-        let inserted3 = storage
-            .record_validator_mint(&vid, tick + 200, &other_linked, 25, &sigs_cbor)
-            .unwrap();
-        assert!(inserted3);
-        assert_eq!(storage.lifetime_minted_to(&other_linked).unwrap(), 25);
-        assert_eq!(storage.lifetime_minted_to(&linked).unwrap(), 140,
-            "second linked_wallet must not affect the first's total");
-    }
 
     #[test]
     fn test_hint_add_and_eviction() {
@@ -3420,14 +3494,14 @@ mod tests {
     /// list and the new hint propagates through the network),
     /// `add_hint` must UPDATE the stored carriers — not silently
     /// drop the new hint. Pre-fix the SQL table stayed frozen at
-    /// the seed-hints.json bootstrap values forever; that broke
+    /// the first bootstrap values forever; that broke
     /// discovery hint propagation entirely once any new carrier
     /// scheme was introduced.
     #[test]
     fn test_hint_add_updates_carriers_on_re_add() {
         let storage = Storage::open_test().unwrap();
 
-        // Initial hint — email only (simulates seed-hints.json).
+        // Initial hint — email only (simulates a first-seen bootstrap hint).
         let v1 = ValidatorHint {
             validator_id: [0xAAu8; 32],
             name: "alpha".to_string(),
@@ -3487,8 +3561,8 @@ mod tests {
     fn test_meta_approval_propagates_new_validator_hint() {
         let storage = Storage::open_test().unwrap();
 
-        // Seed: meta validator already knows 4 existing peers from
-        // its seed-hints.json bootstrap (the normal startup state).
+        // Seed: meta validator already knows 4 existing peers
+        // (relayed earlier — the normal running state).
         for v in &["alpha", "beta", "gamma", "delta"] {
             let hint = ValidatorHint {
                 validator_id: { let mut a = [0u8; 32]; a[0] = v.as_bytes()[0]; a },
@@ -3715,19 +3789,101 @@ mod tests {
     }
 
     #[test]
+    /// `dev-mode` MUST keep implying `dev-tuning` (KI#136).
+    ///
+    /// The twins were split off `dev-mode` so a dev fleet can have short timers
+    /// WITHOUT the security relaxations (min_stake 500→0, the 3/3 issuer rule
+    /// downgraded to a warning, the startup VBC-chain check skipped). The split
+    /// must take nothing away: anything that asked for `dev-mode` before still
+    /// gets the dev VALUES it always got. Drop `"dev-tuning"` from `dev-mode`'s
+    /// feature list in Cargo.toml and this goes red on a dev-mode build.
+    ///
+    /// ⚠ The other direction is structural, not testable here: `dev-tuning = []`
+    /// forwards to nothing, so it cannot pull in `dev-mode`. If anyone ever adds
+    /// something to that list, this test will NOT catch it — read the Cargo.toml
+    /// comment instead.
+    #[test]
+    fn dev_mode_still_implies_dev_tuning() {
+        if cfg!(feature = "dev-mode") {
+            assert!(cfg!(feature = "dev-tuning"),
+                "dev-mode no longer implies dev-tuning: a dev-mode build would get \
+                 PRODUCTION timers and budget, silently reverting what it asked for");
+        }
+    }
+
     fn test_vbc_signs_budget() {
+        // ⚠ This test used to hardcode 6/5/4. When the register moved 6 → 100
+        // (KI#135) it went red — correctly, because it was pinning the LITERAL
+        // rather than the BEHAVIOUR. It now reads the register, so the property
+        // it protects (a fresh DB is seeded from the register; each decrement
+        // subtracts exactly one and persists) survives the next value change.
+        // RULE 1: a test that re-derives its own expectation cannot fail, but
+        // one that hardcodes a tuning value fails for the wrong reason.
+        let budget = crate::tuning_gen::VBC_SIGNS_BUDGET as u8;
         let storage = Storage::open_test().unwrap();
 
-        // Default is 6
-        assert_eq!(storage.get_vbc_signs_remaining().unwrap(), 6);
+        // A fresh database is seeded FROM THE REGISTER.
+        assert_eq!(storage.get_vbc_signs_remaining().unwrap(), budget,
+            "a fresh DB must seed vbc_signs_remaining from `vbc_signs_budget`");
 
-        // Decrement
-        assert_eq!(storage.decrement_vbc_signs_remaining().unwrap(), 5);
-        assert_eq!(storage.decrement_vbc_signs_remaining().unwrap(), 4);
-        assert_eq!(storage.get_vbc_signs_remaining().unwrap(), 4);
+        // Each decrement subtracts exactly one, and the value persists.
+        assert_eq!(storage.decrement_vbc_signs_remaining().unwrap(), budget - 1);
+        assert_eq!(storage.decrement_vbc_signs_remaining().unwrap(), budget - 2);
+        assert_eq!(storage.get_vbc_signs_remaining().unwrap(), budget - 2,
+            "the decremented budget must survive the write — it is the whole \
+             point of a lifetime counter");
     }
 
     #[test]
+    /// The retry contract (AXIOM_DESIGN_ValidatorJoin.md §6a.2).
+    ///
+    /// A candidate whose VBC round fails re-submits. That MUST NOT consume a
+    /// second sign from the issuer's budget of six, or a handful of retries
+    /// would exhaust an issuer who has certified almost nobody.
+    ///
+    /// The key is `validator_id` — something the candidate still holds after a
+    /// crash, unlike a request id or a session. Note the SECOND call carries a
+    /// different request_id, exactly as a real retry would: idempotency must
+    /// key on identity, not on the caller reproducing a token it lost.
+    #[test]
+    fn vbc_retry_is_idempotent_on_validator_id_not_request_id() {
+        let storage = Storage::open_test().unwrap();
+        let vid = "deadbeefcafe";
+
+        // First commit: unknown validator -> budget is spent.
+        assert!(!storage.is_validator_approved(vid).unwrap(),
+            "unknown validator must not read as approved");
+        let before = storage.get_vbc_signs_remaining().unwrap();
+        storage.decrement_vbc_signs_remaining().unwrap();
+        storage.record_validator_approval(
+            vid, "sphincs_hex", "ed25519_hex", "dmap", "node-x", "req-FIRST",
+        ).unwrap();
+        let after_first = storage.get_vbc_signs_remaining().unwrap();
+        assert_eq!(after_first, before - 1, "first commit must spend one sign");
+
+        // Retry: same validator, DIFFERENT request id (the old one is lost).
+        assert!(storage.is_validator_approved(vid).unwrap(),
+            "a recorded validator must read as approved so the retry skips the decrement");
+        storage.record_validator_approval(
+            vid, "sphincs_hex", "ed25519_hex", "dmap", "node-x", "req-RETRY",
+        ).unwrap();
+        assert_eq!(
+            storage.get_vbc_signs_remaining().unwrap(), after_first,
+            "a retry must NOT spend a second sign",
+        );
+        assert_eq!(
+            storage.get_approved_validator_count().unwrap(), 1,
+            "a retry must not create a duplicate approval row",
+        );
+
+        // A DIFFERENT validator is still chargeable — the guard must not have
+        // frozen the budget for everyone.
+        assert!(!storage.is_validator_approved("0000ffff").unwrap());
+        storage.decrement_vbc_signs_remaining().unwrap();
+        assert_eq!(storage.get_vbc_signs_remaining().unwrap(), after_first - 1,
+            "a different validator must still consume a sign");
+    }
+
     fn test_approved_validators_crud() {
         let storage = Storage::open_test().unwrap();
 
@@ -3766,6 +3922,25 @@ mod tests {
     }
 
     #[test]
+    /// §23.14.6 (KI#213): a witness keeps the audit digest of a tx it only
+    /// witnessed, readable by txid, and the daily prune removes it by age.
+    #[test]
+    fn witness_digest_roundtrip_and_prune() {
+        let storage = Storage::open_test().unwrap();
+        let txid = [0x77; 32];
+        assert!(storage.get_witness_digest(&txid).unwrap().is_none(), "unknown before the witness wrote it");
+        storage.store_witness_digest(&txid, 9_970_000_000, &[0x42; 32], 1_000_000).unwrap();
+        assert_eq!(storage.get_witness_digest(&txid).unwrap(), Some((9_970_000_000, [0x42; 32], 1_000_000)));
+        // A retried hop rewrites the same row, never a second one.
+        storage.store_witness_digest(&txid, 9_970_000_000, &[0x42; 32], 1_000_000).unwrap();
+        assert_eq!(storage.get_witness_digest(&txid).unwrap(), Some((9_970_000_000, [0x42; 32], 1_000_000)));
+        // Age-pruned with the other stale data. The cutoff is `created_at < now − max_age`
+        // (strict, like every other prune here), so let one second pass first.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        storage.prune_stale_data(0).unwrap();
+        assert!(storage.get_witness_digest(&txid).unwrap().is_none(), "pruned by age");
+    }
+
     fn test_scar_passcode_roundtrip() {
         let storage = Storage::open_test().unwrap();
         let txid = [0x99; 32];
@@ -4046,7 +4221,9 @@ mod tests {
         // for the end-to-end consistency tests.
         let receipt_commitment: [u8; 32] = [0x9F; 32];
         let receipt = Receipt {
+            sender_state: None,
             oods_flag: None,
+            confidence_index: None,
             txid: [0x12; 32],
             state_hash: [0x34; 32],
             produced_state_id: [0x56; 32],
@@ -4076,6 +4253,171 @@ mod tests {
             "receipt_commitment must round-trip through SQLite storage");
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    // "Step 7" (Q2-b) — full-receipt persistence + find_cosigned_work_receipt
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Build a receipt with a REAL receipt_commitment + `n` valid witness
+    /// `receipt_commitment_sig`s (the renewer is witness #0 when `include_renewer`),
+    /// mirroring `vbc.rs::mk_work_receipt`. Returns (receipt, renewer_ed25519_pk).
+    fn mk_signed_receipt(
+        txid_seed: u8,
+        renewer_seed: u8,
+        tick: u64,
+        oods: bool,
+        include_renewer: bool,
+        n: usize,
+        is_dev_class: bool,
+    ) -> (Receipt, Vec<u8>) {
+        use ed25519_dalek::{Signer, SigningKey};
+        let txid = [txid_seed; 32];
+        let state_hash = [0xBB; 32];
+        let commitment_hash = [0xCC; 32];
+        let new_wallet_seq: u64 = 1;
+        let epoch: u64 = 1;
+        let oods_flag = if oods {
+            Some(axiom_core_logic::types::OodsFlag { tick, oods_size: 10, healthy: true })
+        } else {
+            None
+        };
+        // The REAL commitment the witnesses sign — so verify_receipt_witness_quorum
+        // passes. Binds is_dev_class + oods_flag, exactly what Step 7 must persist.
+        let receipt_commitment = axiom_core_logic::compute::compute_receipt_commitment(
+            &txid, &state_hash, new_wallet_seq, &commitment_hash, epoch,
+            is_dev_class, oods_flag.as_ref(), None, None,
+        );
+        let mut seeds: Vec<u8> = Vec::new();
+        if include_renewer { seeds.push(renewer_seed); }
+        let mut other = 0x50u8;
+        while seeds.len() < n {
+            if other != renewer_seed { seeds.push(other); }
+            other = other.wrapping_add(1);
+        }
+        let mk = |seed: u8| -> axiom_core_logic::types::WitnessSig {
+            let sk = SigningKey::from_bytes(&[seed; 32]);
+            let pk = sk.verifying_key().to_bytes().to_vec();
+            axiom_core_logic::types::WitnessSig {
+                validator_id: *blake3::hash(&pk).as_bytes(),
+                validator_pk: pk,
+                vbc_bundle: None,
+                carrier_type: String::new(),
+                carrier_address: String::new(),
+                signature: sk.sign(&commitment_hash).to_bytes().to_vec(),
+                execution_proof: Vec::new(),
+                proof_type: 1,
+                availability_attestation: None,
+                validator_hints: Vec::new(),
+                fact_signature: None,
+                checkpoint_sig: None,
+                receipt_signature: None,
+                receipt_commitment_sig: Some(sk.sign(&receipt_commitment).to_bytes().to_vec()),
+                rate_bps: 0,
+                slot_amount: 0,
+            }
+        };
+        let witness_sigs: Vec<_> = seeds.iter().map(|s| mk(*s)).collect();
+        let receipt = Receipt {
+            oods_flag,
+            confidence_index: None,
+            sender_state: None,
+            txid, state_hash, produced_state_id: [0xDD; 32], new_wallet_seq,
+            commitment_hash, sdid: [0u8; 32], lineage_hash: [0u8; 32],
+            witness_sigs,
+            core_version: String::new(), core_id: [0u8; 32], epoch,
+            fact_proof: None, required_k: 3, receipt_commitment,
+            fee_breakdown: Vec::new(), is_dev_class,
+        };
+        let renewer_pk = SigningKey::from_bytes(&[renewer_seed; 32])
+            .verifying_key().to_bytes().to_vec();
+        (receipt, renewer_pk)
+    }
+
+    /// Step 7, the load-bearing test: a receipt with a fresh oods_flag +
+    /// dev-class flag round-trips through SQLite so the READ-BACK receipt still
+    /// passes verify_receipt_witness_quorum. Before Step 7, store dropped
+    /// oods_flag/is_dev_class → the read-back commitment recompute diverged and
+    /// the quorum FAILED; the second assertion pins exactly that failure so the
+    /// persistence cannot silently regress.
+    #[test]
+    fn step7_full_receipt_roundtrips_and_reverifies_quorum() {
+        let storage = Storage::open_test().unwrap();
+        // is_dev_class = true to prove BOTH oods_flag and is_dev_class persist.
+        let (receipt, _pk) = mk_signed_receipt(0x21, 0x01, 5000, true, true, 3, true);
+        storage.store_receipt(&receipt).unwrap();
+        let loaded = storage.get_receipt(&receipt.txid).unwrap().unwrap();
+
+        // The commitment-bound fields survived.
+        assert_eq!(loaded.oods_flag.as_ref().map(|f| f.tick), Some(5000));
+        assert!(loaded.is_dev_class, "is_dev_class must persist");
+        assert_eq!(loaded.sender_state, receipt.sender_state);
+
+        // Load-bearing: the read-back receipt re-verifies its quorum.
+        let quorum = |r: &Receipt| axiom_core_logic::compute::verify_receipt_witness_quorum(
+            &r.txid, &r.state_hash, r.new_wallet_seq, &r.commitment_hash, r.epoch,
+            r.is_dev_class, r.oods_flag.as_ref(), r.confidence_index.as_ref(),
+            r.sender_state.as_ref(),
+            r.witness_sigs.iter().filter_map(|w| w.receipt_commitment_sig.as_ref()
+                .map(|s| (w.validator_pk.as_slice(), s.as_slice()))),
+            3,
+        );
+        assert!(quorum(&loaded), "read-back receipt must re-verify its quorum");
+
+        // Companion: simulate the pre-Step-7 drop (oods_flag None, is_dev_class
+        // false) and confirm the SAME sigs then FAIL — so the test genuinely
+        // guards the persistence, not a coincidence.
+        let mut dropped = loaded.clone();
+        dropped.oods_flag = None;
+        dropped.is_dev_class = false;
+        assert!(!quorum(&dropped),
+            "dropping the commitment-bound fields MUST break the quorum (guards Step 7)");
+    }
+
+    /// find_cosigned_work_receipt returns a receipt that passes the Core gate,
+    /// and None when the only candidates are stale or not co-signed by us.
+    #[test]
+    fn find_cosigned_work_receipt_selects_only_qualifying() {
+        let storage = Storage::open_test().unwrap();
+        let renewer = 0x01u8;
+        let (fresh, renewer_pk) = mk_signed_receipt(0x30, renewer, 9000, true, true, 3, false);
+        let (stale, _)   = mk_signed_receipt(0x31, renewer, 100,  true, true, 3, false);
+        let (other, _)   = mk_signed_receipt(0x32, 0x02,    9000, true, true, 3, false); // not co-signed by renewer
+        let (nooods, _)  = mk_signed_receipt(0x33, renewer, 9000, false, true, 3, false); // heal-style, no reading
+        for r in [&fresh, &stale, &other, &nooods] { storage.store_receipt(r).unwrap(); }
+
+        // min_tick 4000: only `fresh` qualifies (co-signed by renewer + tick 9000 > 4000).
+        let got = storage.find_cosigned_work_receipt(&renewer_pk, 4000).unwrap();
+        assert_eq!(got.map(|r| r.txid), Some([0x30; 32]));
+
+        // A different validator's key: nothing is co-signed by it.
+        let stranger = ed25519_dalek::SigningKey::from_bytes(&[0x77; 32])
+            .verifying_key().to_bytes().to_vec();
+        assert!(storage.find_cosigned_work_receipt(&stranger, 4000).unwrap().is_none());
+
+        // min_tick above every reading: all stale.
+        assert!(storage.find_cosigned_work_receipt(&renewer_pk, 100_000).unwrap().is_none());
+    }
+
+    /// End-to-end: store a receipt this validator co-signed this term →
+    /// find_cosigned_work_receipt retrieves it → it PASSES the Core CL8 gate
+    /// verify_renewal_work_receipt. This is the whole producer→gate path.
+    #[test]
+    fn step7_end_to_end_store_find_gate_accepts() {
+        let storage = Storage::open_test().unwrap();
+        let (r, renewer_pk) = mk_signed_receipt(0x40, 0x03, 7777, true, true, 3, false);
+        storage.store_receipt(&r).unwrap();
+
+        let found = storage
+            .find_cosigned_work_receipt(&renewer_pk, 1000)
+            .unwrap()
+            .expect("a co-signed fresh receipt must be found");
+
+        // The exact gate CL8 runs (min_tick = the current cert's baseline_tick).
+        assert!(
+            axiom_core_logic::vbc::verify_renewal_work_receipt(&found, &renewer_pk, 1000).is_ok(),
+            "the retrieved receipt must pass the Core renewal gate end-to-end"
+        );
+    }
+
     #[test]
     fn test_encryption_wrong_key_fails() {
         let dir = tempfile::tempdir().unwrap();
@@ -4093,7 +4435,7 @@ mod tests {
                 last_tx_id: None,
                 status: WalletStateStatus::Confirmed,
                 group_members: None,
-                auth_hash: None, hibernation_until: 0,
+                auth_hash: None, hibernation_until: 0, wall_clock_lock: 0, emission_claimed_epoch: 0, stake_floor_until: 0, wallet_format: axiom_core_logic::types::WalletFormat::CURRENT,
                 wallet_id: None,
             };
             storage.set_wallet_state(&state, 3, 1).unwrap();
@@ -4391,7 +4733,8 @@ mod tests {
     }
 
     // ════════════════════════════════════════════════════════════════════
-    // YPX-018 — CLARA roll-forward storage tests (Phase 5a)
+    // Stored-state helpers (the YPX-018 CLARA roll-forward tests that used to
+    // live here were deleted with `clara_roll_forward`, 2026-10-02 — KI#256)
     // ════════════════════════════════════════════════════════════════════
 
     fn make_stored(pk: &[u8], state_id: [u8; 32], seq: u64, balance: u64) -> StoredWalletState {
@@ -4403,21 +4746,20 @@ mod tests {
             last_tx_id: None,
             status: WalletStateStatus::Confirmed,
             group_members: None,
-            auth_hash: None, hibernation_until: 0,
+            auth_hash: None, hibernation_until: 0, wall_clock_lock: 0, emission_claimed_epoch: 0, stake_floor_until: 0, wallet_format: axiom_core_logic::types::WalletFormat::CURRENT,
             wallet_id: None,
         }
     }
 
-    /// SINGLE-KEYPAIR CONVERGENCE PROOF (YPX-010 §10.5). One keypair backs both a
-    /// normal (k=3) and an Ark (k=0) wallet. Because the state row is keyed by
-    /// (public_key, k, proof_type), the two tiers COEXIST in storage — neither
-    /// overwrites the other. Before the re-key, both mapped to one pk-keyed row
-    /// and the second write clobbered the first. This is the whole point of the
-    /// re-key; the tier-distinct genesis state_ids from step 1 would otherwise
-    /// land in the same row.
+    /// TWO LEDGERS PER KEY (YPX-010 §10.5 + YP §16.14.12 v2.19.0, KI#149). One
+    /// keypair backs an online wallet and an Ark (k=0) wallet: those two rows
+    /// COEXIST (the Ark write never clobbers the online reserve). But every
+    /// ONLINE tier of the key — k=3/4/5, DMAP or ZKP — is ONE row: a k=5
+    /// receive and a k=3 send address the same ledger (the pre-amendment
+    /// per-tier rows made a wallet that received at k=5 unable to send).
     #[test]
     fn wallet_state_tiers_coexist_under_one_pk() {
-        use axiom_core_logic::wallet_id::{K_ARK, PROOF_TYPE_ARK, PROOF_TYPE_DMAP};
+        use axiom_core_logic::wallet_id::{K_ARK, PROOF_TYPE_ARK, PROOF_TYPE_DMAP, PROOF_TYPE_ZKP};
         let storage = Storage::open_test().unwrap();
         let pk = [0x7fu8; 32];
 
@@ -4436,142 +4778,20 @@ mod tests {
         assert_eq!(g_normal.state_id, [0x11u8; 32]);
         assert_eq!(g_ark.state_id, [0x22u8; 32]);
 
-        // A tier that was never written for this pk is absent (not a stray match).
-        assert!(storage.get_wallet_state(&pk, 4, PROOF_TYPE_DMAP).unwrap().is_none());
-    }
-
-    /// Phase 5f Finding 4: stored balance is poisoned to 100 (the partial TX
-    /// debited 900 from a real 1000), and CLARA roll-forward refreshes it to
-    /// the canonical 1000 declared by the heal cheque's state_hash binding.
-    #[test]
-    fn test_clara_roll_forward_advances_from_garbage_to_healed() {
-        let storage = Storage::open_test().unwrap();
-        let pk = vec![0xAA; 32];
-        let garbage = [0x11; 32];
-        let healed_to = [0x22; 32];
-        // Validator was poisoned: stored balance is 100 (canonical was 1000).
-        storage.set_wallet_state(&make_stored(&pk, garbage, 5, 100), 3, 1).unwrap();
-
-        let applied = storage.clara_roll_forward(
-            &pk, 3, 1, &garbage, &healed_to, 9, 1000, &[garbage],
-        ).unwrap();
-        assert!(applied);
-
-        let after = storage.get_wallet_state(&pk, 3, 1).unwrap().unwrap();
-        assert_eq!(after.state_id, healed_to);
-        assert_eq!(after.wallet_seq, 9);
-        assert_eq!(after.balance, 1000,
-            "Phase 5f Finding 4: stored balance must be refreshed to the \
-             cryptographically attested healed_balance, not stay at the \
-             pre-heal poisoned value");
-    }
-
-    #[test]
-    fn test_clara_roll_forward_rejects_when_stored_not_in_garbage() {
-        let storage = Storage::open_test().unwrap();
-        let pk = vec![0xBB; 32];
-        let unrelated = [0xEE; 32];
-        let healed_to = [0x22; 32];
-        storage.set_wallet_state(&make_stored(&pk, unrelated, 5, 100_000), 3, 1).unwrap();
-
-        let applied = storage.clara_roll_forward(
-            &pk, 3, 1, &[0x11; 32], &healed_to, 9, 999_999, &[[0x11; 32], [0x12; 32]],
-        ).unwrap();
-        assert!(!applied, "must refuse when stored state isn't in garbage");
-
-        let after = storage.get_wallet_state(&pk, 3, 1).unwrap().unwrap();
-        assert_eq!(after.state_id, unrelated, "state must NOT be changed on refusal");
-        assert_eq!(after.balance, 100_000,
-            "balance must NOT be changed when roll-forward is refused");
-    }
-
-    #[test]
-    fn test_clara_roll_forward_idempotent_when_already_at_healed() {
-        let storage = Storage::open_test().unwrap();
-        let pk = vec![0xCC; 32];
-        let healed_to = [0x22; 32];
-        storage.set_wallet_state(&make_stored(&pk, healed_to, 9, 100_000), 3, 1).unwrap();
-
-        let applied = storage.clara_roll_forward(
-            &pk, 3, 1, &[0x11; 32], &healed_to, 9, 100_000, &[[0x11; 32]],
-        ).unwrap();
-        assert!(applied, "second application of same heal must succeed (idempotent)");
-
-        let after = storage.get_wallet_state(&pk, 3, 1).unwrap().unwrap();
-        assert_eq!(after.state_id, healed_to);
-        assert_eq!(after.wallet_seq, 9);
-    }
-
-    #[test]
-    fn test_clara_roll_forward_no_stored_state_succeeds() {
-        // A wallet that's never been observed by this validator can't be
-        // "poisoned", so CLARA roll-forward is a no-op (success).
-        let storage = Storage::open_test().unwrap();
-        let pk = vec![0xDD; 32];
-        let applied = storage.clara_roll_forward(
-            &pk, 3, 1, &[0x11; 32], &[0x22; 32], 9, 1000, &[[0x11; 32]],
-        ).unwrap();
-        assert!(applied);
-    }
-
-    #[test]
-    fn test_clara_roll_forward_accepts_from_state_directly() {
-        // Edge case: stored state == healed_from_state_id (not in garbage list).
-        // This is the legitimate case where the validator is exactly at the
-        // pre-broken state and the heal is jumping past it.
-        let storage = Storage::open_test().unwrap();
-        let pk = vec![0xEE; 32];
-        let from = [0x33; 32];
-        let healed_to = [0x44; 32];
-        storage.set_wallet_state(&make_stored(&pk, from, 5, 100_000), 3, 1).unwrap();
-
-        let applied = storage.clara_roll_forward(
-            &pk, 3, 1, &from, &healed_to, 9, 100_000, &[],  // empty garbage; matches via from
-        ).unwrap();
-        assert!(applied);
-        assert_eq!(storage.get_wallet_state(&pk, 3, 1).unwrap().unwrap().state_id, healed_to);
-    }
-
-    #[test]
-    fn test_clara_roll_forward_advances_through_one_of_many_garbage() {
-        let storage = Storage::open_test().unwrap();
-        let pk = vec![0xFF; 32];
-        let stored = [0x77; 32]; // matches garbage[1]
-        let healed_to = [0x99; 32];
-        storage.set_wallet_state(&make_stored(&pk, stored, 5, 100_000), 3, 1).unwrap();
-
-        let applied = storage.clara_roll_forward(
-            &pk, 3, 1, &[0x33; 32], &healed_to, 9, 100_000,
-            &[[0x66; 32], [0x77; 32], [0x88; 32]],
-        ).unwrap();
-        assert!(applied);
-        assert_eq!(storage.get_wallet_state(&pk, 3, 1).unwrap().unwrap().state_id, healed_to);
-    }
-
-    /// Phase 5f Finding 4 regression: balance must be refreshed to the
-    /// cryptographically attested value, even when the stored balance was
-    /// arbitrarily poisoned by a partial witness.
-    #[test]
-    fn test_clara_roll_forward_refreshes_poisoned_balance() {
-        let storage = Storage::open_test().unwrap();
-        let pk = vec![0x42; 32];
-        let garbage = [0x55; 32];
-        let healed_to = [0x66; 32];
-        // Worst case: stored balance was debited to 0 by a partial TX that
-        // tried to send the wallet's entire 1 trillion atom holding.
-        storage.set_wallet_state(&make_stored(&pk, garbage, 7, 0), 3, 1).unwrap();
-
-        let canonical = 1_000_000_000_000u64;
-        let applied = storage.clara_roll_forward(
-            &pk, 3, 1, &[0x99; 32], &healed_to, 11, canonical, &[garbage],
-        ).unwrap();
-        assert!(applied);
-
-        let after = storage.get_wallet_state(&pk, 3, 1).unwrap().unwrap();
-        assert_eq!(after.balance, canonical,
-            "balance must be restored to the cryptographically attested \
-             canonical value after CLARA roll-forward");
-        assert_eq!(after.state_id, healed_to);
-        assert_eq!(after.wallet_seq, 11);
+        // KI#149: every online tier reads the SAME row as the Standard address.
+        for (k, pt) in [(4, PROOF_TYPE_DMAP), (5, PROOF_TYPE_DMAP), (3, PROOF_TYPE_ZKP), (5, PROOF_TYPE_ZKP)] {
+            let g = storage.get_wallet_state(&pk, k, pt).unwrap()
+                .unwrap_or_else(|| panic!("k={} pt={} must read the online ledger", k, pt));
+            assert_eq!(g.state_id, [0x11u8; 32], "k={} pt={} is the online row", k, pt);
+        }
+        // ...and a write through a k=5 address advances the row the k=3 read sees.
+        let after_k5 = make_stored(&pk, [0x33u8; 32], 6, 150_000);
+        storage.set_wallet_state(&after_k5, 5, PROOF_TYPE_DMAP).unwrap();
+        let g3 = storage.get_wallet_state(&pk, 3, PROOF_TYPE_DMAP).unwrap().unwrap();
+        assert_eq!(g3.state_id, [0x33u8; 32], "k=5 write lands in the k=3 row");
+        assert_eq!(g3.balance, 150_000);
+        // The Ark row is untouched by any of it.
+        let g_ark2 = storage.get_wallet_state(&pk, K_ARK, PROOF_TYPE_ARK).unwrap().unwrap();
+        assert_eq!(g_ark2.state_id, [0x22u8; 32], "Ark ledger is its own");
     }
 }

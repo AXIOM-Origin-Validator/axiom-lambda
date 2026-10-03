@@ -7,3 +7,13 @@
 # so one config sanitizes on either build host — the non-matching prefix is a no-op.
 [build]
 rustflags = ["--remap-path-prefix=/home/builder=/build", "--remap-path-prefix=/Users/builder=/build"]
+
+# KI#186: the risc0 recursion circuit artifact (~60 MB) comes from a LOCAL, hash-verified
+# cache instead of a fresh S3 download on every clean `prove` build (a truncated download
+# once broke every `cargo check --workspace`). `scripts/ensure_risc0_artifacts.sh`
+# (preflight) provisions it verify-then-rename. The crate's build.rs copies this file ONLY
+# if its sha256 equals the hash PINNED in the crate, and otherwise falls through to its own
+# download — so a missing or wrong file can never change what is built, and the crate's
+# pinned hash stays the ONLY authority. `relative = true` = relative to the workspace root.
+[env]
+RECURSION_SRC_PATH = { value = ".cache/risc0/recursion_zkr.zip", relative = true }

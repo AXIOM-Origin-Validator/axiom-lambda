@@ -41,6 +41,8 @@ pub mod malloc_trim;
 pub mod storage;
 pub mod management_db;
 pub mod consensus;
+/// Dev-only §23.14 audit chaos (feature `audit-chaos`) — docs/AXIOM_DESIGN_AuditChaos.md.
+pub mod audit_chaos;
 pub mod types;
 pub mod error;
 /// `From<LambdaError> for axiom_errors::ErrorResponse` — Phase 2b.1.
@@ -53,19 +55,6 @@ pub mod jfp_engine;
 pub mod console_engine;
 pub mod oracle_zktls;
 
-/// YP §19.6 + §20.10 — validator-withdrawal verification.
-/// Operator-side (per-validator dashboard at :7700-7709) endpoint
-/// that verifies a `ValidatorWithdrawalRequest`: SPHINCS+ + Nabla
-/// earnings attestation + pool linkage + §20.10 conflict-of-interest.
-/// Does NOT actually mint atoms — that requires a new protocol primitive
-/// (Step 9+). Returns a structured verification result so the dashboard
-/// can display "withdrawal is ready" + the net amount and destination.
-pub mod validator_withdrawal;
-
-/// Step 9B.4 — operator-side fan-out: send WithdrawalMintWitnessRequest
-/// to each chosen_witness's Lambda gateway over TCP CBOR, collect k=3
-/// signatures, verify, assemble the mint receipt.
-pub mod withdrawal_mint_orchestrator;
 
 /// YPX-002 P6 — simulated network-delay injection (async).
 /// See `sim_delay.rs` for the contract.

@@ -11,7 +11,7 @@ members = [
 exclude = []
 
 [workspace.package]
-version = "3.3.0"
+version = "3.7.1"
 edition = "2021"
 license = "GPL-3.0"
 authors = ["AXIOM-Origin-Validator"]
@@ -57,8 +57,17 @@ thiserror = { version = "1.0", default-features = false }
 # `default-features = false` — core-logic compiles no_std for the AVM guest
 # and must not pull in std. Host code (lambda, nabla, antie, sdk) enables
 # the `std` feature explicitly at its own dep declaration.
-axiom-errors = { git = "https://github.com/AXIOM-Origin-Validator/axiom-lib", tag = "lib-v3.3.0", default-features = false }
+axiom-errors = { git = "https://github.com/AXIOM-Origin-Validator/axiom-lib", tag = "lib-v3.7.1", default-features = false }
 
 [profile.release]
 opt-level = 3
 lto = true
+
+# Post-quantum signing crates at full optimisation in DEV/TEST builds too:
+# the FACT fixtures (YP §26.17.6.5 B2) sign real SPHINCS+ certificates once
+# per test binary, and at opt-level 0 those 15 signatures alone took ~10 min.
+# Performance only — nothing consensus-critical is compiled differently.
+[profile.dev.package.fips205]
+opt-level = 3
+[profile.dev.package.fips204]
+opt-level = 3

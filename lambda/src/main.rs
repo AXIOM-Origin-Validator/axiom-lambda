@@ -41,6 +41,11 @@
 //! ./build-zkvm.sh
 //! ```
 
+// KI#86: jemalloc (see nabla) — glibc arena retention under sustained load.
+// Host-side, CoreID-neutral.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use axiom_lambda::LambdaConfig;
 use axiom_lambda::server::LambdaServer;
 use clap::Parser;
@@ -122,6 +127,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // for platform safety — since Lambda executes core-logic directly
     // via AVM (no core-bin subprocess), the check must run here.
     axiom_core_logic::verify_time_safety();
+    // KI#240: name the register twin set this binary was compiled with. The print is
+    // also what keeps the marker bytes in the binary, which verify_deploy.sh greps
+    // and compares against the ELF's profile — do not remove it.
+    eprintln!("core/logic tuning profile: {}", axiom_core_logic::version::TUNING_PROFILE_MARKER);
 
     // KI#23 mitigation — periodic glibc malloc_trim + SIGUSR1 handler.
     // See axiom_lambda::malloc_trim for the why. Combined with the
@@ -186,6 +195,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .init();
     }
     
+    // Dev-only §23.14 audit chaos: the switch file lives beside this Lambda's config.
+    #[cfg(feature = "audit-chaos")]
+    if let Some(config_path) = &args.config {
+        let dir = config_path.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+        axiom_lambda::audit_chaos::set_switch_path(dir.join("audit-chaos"));
+        tracing::warn!("§23.14 AUDIT-CHAOS build: switch file {:?} (dev-only; see docs/AXIOM_DESIGN_AuditChaos.md)",
+                       dir.join("audit-chaos"));
+    }
+
     // Load or create config
     let mut config = if let Some(config_path) = &args.config {
         LambdaConfig::from_file(config_path.to_str()

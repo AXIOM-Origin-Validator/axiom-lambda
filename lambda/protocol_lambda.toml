@@ -15,12 +15,140 @@
 
 # ── Console engine (YPX-013) — validator-operator governance timing (ticks) ─
 console_cooldown_ticks          = 1_555_200   # ~90 days between proposals
-console_voting_window_ticks     = 17_280      # ~24h voting window
+console_cooldown_ticks_dev = 24   # dev ~2m — a test can make 2+ proposals
+# Overall deliberation window for a proposal. YPX-013 §spec: 518_400 = 30 days.
+# (Was 17_280 here — a 30x-wrong value that conflated this with the per-member
+#  vote deadline below. Corrected 2026-07-31 against the spec.)
+console_voting_window_ticks     = 518_400    # 30 days (YPX-013)
+console_voting_window_ticks_dev = 60         # dev ~5m
+# Per-member deadline to CAST a vote. Absence -> one automatic retry of the same
+# length -> a second miss DISSOLVES the Console (YPX-013 §7.8 cases 3/4).
+console_member_vote_ticks       = 17_280     # 24h
+console_member_vote_ticks_dev   = 24         # dev ~2m
 console_liveness_interval_ticks = 1_555_200   # ~90 days liveness cadence
+console_liveness_interval_ticks_dev = 60   # dev ~5m — fires during a soak
 console_liveness_response_ticks = 51_840      # ~72h to respond to a liveness ping
+console_liveness_response_ticks_dev = 24   # dev ~2m — answerable, and timeout-testable
 
 # ── DWP (Decentralized Wallet Protection) ──────────────────────────────────
 dwp_expiry_secs = 31_536_000   # 1 year (365 * 86400)
 
 # ── JFP (Judicial Freeze Protocol) ─────────────────────────────────────────
 jfp_freeze_duration_secs = 31_536_000   # 1 year (365 * 24 * 60 * 60)
+
+# ── FACT chain — operator soft limit on total links ────────────────────────
+#  Lambda rejects a chain longer than this BEFORE AVM execution (saves CPU).
+#  It is an OPERATOR PERFORMANCE GUARD, not a consensus rule — Core owns the
+#  protocol ceilings (MAX_TOTAL_LINKS = 64, FACT_HARD_CEILING = 32 resolved).
+#
+#  ⚠ WHY IT LIVES HERE AND NOT AS A DEFAULT IN config.rs: it used to be
+#  `fn default_max_fact_links() -> usize { 16 }` behind a `#[serde(default)]`,
+#  so a lambda.toml with no value silently got 16 and nothing said so. On
+#  2026-08-18 that silently wedged a low-activity soak wallet: its chain grew
+#  to 23 links — legitimate, because SEC-07 checkpoints RETAIN covered links
+#  while accumulating distinct co-signs, and Core's own comment expects
+#  "~11-12 before it has 5 sigs and finalizes" — and Lambda refused it at 16
+#  with "FACT chain depth exceeds MAX_FACT_DEPTH", naming a constant that is
+#  NOT on the live path. A hardcoded number nobody can see is worse than a
+#  wrong one. Delete this key and Lambda FAILS TO COMPILE (build.rs emits no
+#  const, config.rs references it) — which is the point.
+#
+#  VALUE = 16, deliberately NOT raised.
+#  ⚠ Do not raise this to make a depth rejection go away. SEC-07 expects a chain
+#  to reach ~11-12 links while its checkpoint accumulates distinct co-signs; 16
+#  is headroom over that. A wallet that reaches 23 (soak s2r87028021_000,
+#  2026-08-18) is telling you its checkpoint STOPPED FINALIZING — raising the
+#  ceiling would hide that signal and let the chain grow further before the same
+#  wedge. That is RULE 2 ("never adjust a check so a failure stops appearing").
+#  I proposed 32 for exactly that wrong reason and it was rejected in review.
+#  An operator may still override per-box in lambda.toml.
+max_fact_links = 16
+
+# ── VBC SIGNING BUDGET (AXIOM_DESIGN_VBC.md Appendix E.3) ────────────────────
+#
+#  How many NEW validator VBCs one validator may ever co-sign. Seeded into the
+#  `meta` table at schema init and DECREMENTED on each signing; it does NOT
+#  refill, and it survives VBC renewal (it lives in Lambda's state DB, not in
+#  the certificate). Genesis validators are NOT exempt — E.1 "No Special
+#  Validators": they merely happened to be first, and their budget depletes
+#  like everyone else's.
+#
+#  WHY A LIMIT AT ALL (E.1, and this is the part to preserve): the budget is
+#  what "forces trust to SPREAD". Without it a single validator could mint an
+#  unbounded entourage and hold permanent onboarding power over the mesh —
+#  E.1's "No validator can hoard onboarding power". The cap is an anti-cartel
+#  device, NOT a limit on how large the network can grow: every validator it
+#  admits arrives with its own budget, so capacity multiplies each generation
+#  (E.3's arithmetic: 10 → 60 → 360 → 2,160).
+#
+#  PRODUCTION STAYS 6 (the owner, 2026-09-06) — the design value, calibrated to
+#  reach ~2,000 validators over three generations (E.3), and the value that
+#  keeps the spreading property intact. The DEV twin is 100 so a test fleet can
+#  run many claim gates without spending a scarce, unrefillable resource; a dev
+#  box onboarding 100 validators costs nothing, a mainnet one would concentrate
+#  onboarding power by the same factor.
+#
+#  ⚠⚠ EVERY TWIN IN THIS FILE IS CURRENTLY INERT — KI#136. `axiom-lambda` DOES
+#  declare a `dev-mode` feature (Cargo.toml:132), but `axiom-env.py` never
+#  PASSES it, so build.rs's `#[cfg(feature = "dev-mode")]` is false on the dev
+#  fleet and every twin here compiles to its PRODUCTION value. MEASURED
+#  2026-09-06 with a probe test: CONSOLE_COOLDOWN_TICKS = 1_555_200 (~90 days),
+#  not the 24 its twin promises, while the comment beside it claims "dev ~2m".
+#  So today a dev fleet gets 6, not 100.
+#
+#  ⚠ AND THE OBVIOUS FIX IS NOT FREE. Lambda's `dev-mode` is NOT a tuning
+#  switch: it also sets VBC-approval `min_stake` 500 → 0 (consensus.rs:1744),
+#  downgrades the "exactly 3/3 issuers/sigs" requirement from error to warning
+#  (:1950), and SKIPS the startup VBC-chain verification against
+#  ROOT_AUTHORITY_PKS (:1970) — the checks `scripts/check-no-dev-mode.sh` exists
+#  to keep out of production. Turning it on to get these timers also switches
+#  those off, which is why it is a ruling and not a flag flip.
+#
+#  ⚠ THIS SEEDS NEW DATABASES ONLY. `storage.rs` uses INSERT OR IGNORE, so a
+#  validator that already has a `vbc_signs_remaining` row KEEPS it — including
+#  one already at 0. Raising this number does NOT refill an existing validator,
+#  and it deliberately must not: a budget that refills on restart is not a
+#  budget. See KI#135.
+vbc_signs_budget     = 6     # PRODUCTION — AXIOM_DESIGN_VBC.md E.3
+vbc_signs_budget_dev = 100   # dev fleet — LIVE under --features dev-tuning (measured 2026-09-08: alpha reports 90 remaining); provisionals do not decrement
+
+# ── §5.2.2e part iii (KI#142, 2026-09-10) — ISSUER-SIDE policy on a PROVISIONAL
+#  request's candidacy Pulse. Core binds WHICH work was claimed; the issuer
+#  replays a Fiat-Shamir sample of it natively (≈31 ms per 32 MB Argon2id here)
+#  before spending its ~70 s SPHINCS+ signature. Two floors around that cost:
+pulse_candidacy_max_entries                = 1024  # refuse a proof that would make the issuer replay more than this many entries' worth of sample
+pulse_candidacy_min_request_interval_ticks = 720   # PRODUCTION — one provisional request per candidate key per Pulse epoch (ticks ≈ seconds)
+pulse_candidacy_min_request_interval_ticks_dev = 30 # dev fleet — the gates issue for fresh keys; a re-run of the same key waits 30 s
+
+# ── Idempotency caches — per-cache BYTE budget (KI#89, 2026-10-02) ──────────
+#  `witness_idempotency_cache` and `redeem_idempotency_cache` (consensus.rs) each
+#  hold at most WITNESS_IDEMPOTENCY_CACHE_CAP = 1024 entries AND at most this many
+#  bytes (Σ request_id + CBOR value). Eviction is oldest-first and never refuses:
+#  a single entry larger than the budget is cached alone.
+#
+#  WHY: a final witness response measured 450–870 KB on the fleet (7 certificate
+#  bundles + the sender FACT chain, carried twice), so 1024 entries could reach
+#  ~0.66–1.1 GB per cache — the KI#89 RSS climb. A miss is SAFE for economic
+#  integrity (Nabla `cheque_claims` + Lambda `try_mark_cheque_redeemed` are
+#  consume-once by txid); it costs LIVENESS only (YP-SDK §4.6a). 64 MiB is a
+#  JUDGMENT (Fable review 2026-10-01), not a measurement: ~110–220 final witness
+#  entries after the duplicated chain is stripped. `/stats` `idempotency`
+#  {hits, misses} is the measurement that says whether the window is long enough —
+#  if not, the next step is the disk-backed route, not a bigger RAM budget.
+idempotency_cache_bytes = 67_108_864   # 64 MiB per cache
+
+# ── F-3 — validator forward bound on a CARRIED OODS attestation tick ─────────
+#  (Fable review 2026-10-01 F-3; owner ruling 2026-10-02.) `check_attested_tick_not_future`
+#  (consensus.rs) refuses a client-carried Nabla OODS attestation whose tick is
+#  more than this many seconds ahead of THIS validator's wall clock. Forward-only:
+#  NO past-side bound.
+#
+#  WHY 300 s AND NOT TICK_INTERVAL_SECS (= 5, the TARDIS gossip bound, unchanged):
+#  mail delay only makes a carried tick OLDER, so it never trips this check; the
+#  only thing that can is the validator's own clock running behind Nabla's. A 5 s
+#  bound would refuse honest rounds on ordinary validator clock skew. 300 s still
+#  blocks a far-future tick (a bought clock), and 5 minutes is negligible against
+#  what a future tick could buy early (~6-month stake floor, 1-year lock).
+#  With NO carried tick F-3 does not apply: rounds that need an attested tick fail
+#  closed (retryable) in Core / the SDK.
+attested_tick_future_skew_secs = 300   # owner ruling 2026-10-02

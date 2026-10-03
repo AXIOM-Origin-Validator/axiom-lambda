@@ -36,6 +36,32 @@ pub const DWP_ADDRESS_PREFIX: &str = "DWP/";
 pub fn dwp_wallet_address(pk: &[u8; 32]) -> String {
     format!("{}{}", DWP_ADDRESS_PREFIX, &hex::encode(pk)[..8])
 }
+/// JFP vote commitment: `BLAKE3("AXIOM_JFP_VOTE" ‖ vote_value ‖ secret)`
+/// (vote_value 0x01 = YES, 0x00 = NO). THE one builder (Pattern 1, KI#55
+/// 2026-10-02): `compute_jfp_result` (both arms) and `compute_random_votes` call
+/// it, and so must any future external voter tool (YP: the PWV member submits
+/// this hash). Lambda-local — no Core verifier exists (decision D3).
+pub fn jfp_vote_hash(vote_value: u8, secret: &[u8; 32]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"AXIOM_JFP_VOTE");
+    h.update(&[vote_value]);
+    h.update(secret);
+    *h.finalize().as_bytes()
+}
+
+/// JFP group-wallet signing-key seed:
+/// `BLAKE3("AXIOM_JFP_WALLET_KEY" ‖ txid ‖ requester_pk)` — derivable from
+/// public data BY DESIGN (docs/AXIOM_SECURITY_JFP_ThreatModel.md §2). THE one
+/// builder (Pattern 1, KI#55 2026-10-02): `create_dwp_wallet` and
+/// `get_group_wallet_key` both call it.
+pub fn jfp_group_wallet_seed(txid: &[u8; 32], requester_pk: &[u8; 32]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"AXIOM_JFP_WALLET_KEY");
+    h.update(txid);
+    h.update(requester_pk);
+    *h.finalize().as_bytes()
+}
+
 /// Group wallet expiry after resolution (365 days in seconds)
 pub const DWP_EXPIRY_SECS: u64 = crate::tuning_gen::DWP_EXPIRY_SECS;
 
@@ -204,13 +230,7 @@ impl DwpEngine {
             // Generate deterministic keypair for group wallet.
             // SECURITY: This key is derivable from public data (txid + requester_pk).
             // This is an accepted design choice — see docs/AXIOM_SECURITY_JFP_ThreatModel.md §2.
-            let seed = {
-                let mut h = blake3::Hasher::new();
-                h.update(b"AXIOM_JFP_WALLET_KEY");
-                h.update(txid);
-                h.update(requester_pk);
-                *h.finalize().as_bytes()
-            };
+            let seed = jfp_group_wallet_seed(txid, requester_pk);
             let group_signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
             let group_pk = ed25519_dalek::VerifyingKey::from(&group_signing_key);
             let group_pk_bytes = group_pk.to_bytes();
@@ -238,14 +258,19 @@ impl DwpEngine {
                 });
             }
 
-            // Store as real wallet state (balance = 1 AXC from payment)
-            let genesis_state_id = {
-                let mut h = blake3::Hasher::new();
-                h.update(b"AXIOM_GENESIS");
-                h.update(&group_pk_bytes);
-                h.update(&DQF_ATOMS.to_le_bytes());
-                *h.finalize().as_bytes()
-            };
+            // Store as real wallet state (balance = 1 AXC from payment).
+            // KI#246 (fixed 2026-10-02, owner D5(a)): the opening state id comes
+            // from CORE's ONE builder (`genesis::compute_genesis_state_id`,
+            // SHA3-256 over tag ‖ pk ‖ balance ‖ k ‖ proof_type) with the SAME
+            // tier constants `set_wallet_state` is given below. Was a private
+            // BLAKE3("AXIOM_GENESIS" ‖ pk ‖ balance) copy — same tag, different
+            // hash and fields, a state id no Core path reproduces (Pattern 1).
+            let genesis_state_id = axiom_core_logic::genesis::compute_genesis_state_id(
+                &group_pk_bytes,
+                DQF_ATOMS,
+                axiom_core_logic::wallet_id::K_DEFAULT,
+                axiom_core_logic::wallet_id::PROOF_TYPE_DMAP,
+            );
             let wallet_state = crate::types::StoredWalletState {
                 public_key: group_pk_bytes.to_vec(),
                 balance: DQF_ATOMS,
@@ -255,6 +280,10 @@ impl DwpEngine {
                 status: crate::types::WalletStateStatus::Confirmed,
                 group_members: Some(members),
                 auth_hash: None, hibernation_until: 0,
+                // §5.2.2c — a synthetic DWP group wallet never claimed a subsidy.
+                wall_clock_lock: 0,
+                emission_claimed_epoch: 0,
+                stake_floor_until: 0, wallet_format: axiom_core_logic::types::WalletFormat::CURRENT,
                 wallet_id: None,
             };
             // AUDIT-FIX v2.11.14: Propagate write errors (was silently dropped).
@@ -287,13 +316,7 @@ impl DwpEngine {
         txid: &[u8; 32],
         requester_pk: &[u8; 32],
     ) -> (String, [u8; 32]) {
-        let seed = {
-            let mut h = blake3::Hasher::new();
-            h.update(b"AXIOM_JFP_WALLET_KEY");
-            h.update(txid);
-            h.update(requester_pk);
-            *h.finalize().as_bytes()
-        };
+        let seed = jfp_group_wallet_seed(txid, requester_pk);
         let group_pk = ed25519_dalek::VerifyingKey::from(
             &ed25519_dalek::SigningKey::from_bytes(&seed)
         ).to_bytes();
@@ -450,20 +473,8 @@ impl DwpEngine {
         let mut remaining_hashes: Vec<[u8; 32]> = vote_hashes.clone();
 
         for secret in secrets {
-            let hash_yes = {
-                let mut h = blake3::Hasher::new();
-                h.update(b"AXIOM_JFP_VOTE");
-                h.update(&[0x01]); // YES
-                h.update(secret);
-                *h.finalize().as_bytes()
-            };
-            let hash_no = {
-                let mut h = blake3::Hasher::new();
-                h.update(b"AXIOM_JFP_VOTE");
-                h.update(&[0x00]); // NO
-                h.update(secret);
-                *h.finalize().as_bytes()
-            };
+            let hash_yes = jfp_vote_hash(0x01, secret); // YES
+            let hash_no = jfp_vote_hash(0x00, secret); // NO
 
             if let Some(pos) = remaining_hashes.iter().position(|h| *h == hash_yes) {
                 remaining_hashes.remove(pos);
@@ -556,13 +567,7 @@ impl DwpEngine {
                     h.update(&voting_end_tick.to_le_bytes());
                     *h.finalize().as_bytes()
                 };
-                let hash = {
-                    let mut h = blake3::Hasher::new();
-                    h.update(b"AXIOM_JFP_VOTE");
-                    h.update(&[vote_value]);
-                    h.update(&secret);
-                    *h.finalize().as_bytes()
-                };
+                let hash = jfp_vote_hash(vote_value, &secret);
 
                 random_secrets.push(secret);
                 random_hashes.push(hash);
@@ -853,6 +858,110 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    // ── KI#55 (2026-10-02) — Pattern 1 known-answer anchors ──────────────────
+    // Constants computed INDEPENDENTLY in Python (`blake3`, PyNaCl) from the YP
+    // preimage layouts — YP §JFP: vote_hash = BLAKE3("AXIOM_JFP_VOTE" ‖ vote_u8 ‖
+    // secret[32]); group seed = BLAKE3("AXIOM_JFP_WALLET_KEY" ‖ txid ‖ requester_pk);
+    // RANDOM secret / seed as in `compute_random_votes`'s doc. These ran GREEN
+    // against the pre-consolidation inline code (step-0 anchor) and stay as the
+    // byte-identity proof of the one builder.
+    const KAT_JFP_VOTE_YES: &str = "9b69b056033629e2bba67ed4025c22405219f1c655721d2ce6916f249dc3f257";
+    const KAT_JFP_VOTE_NO: &str = "d6faa1c628878f99608246203fee627cbab9f1ff7bc8d784a93301bd5d60573e";
+    const KAT_JFP_WALLET_SEED: &str = "0149360885caf6490b9af5a49f5133f024dd18d085779111d3cd4345d22330e1";
+    const KAT_JFP_GROUP_PK: &str = "779f876893500a0564898c294bd81a9195a46b6e8a28a64ecb66daf44e41387c";
+    /// txid CC×32, requester 02×32, PWV of two, voting_end_tick 1000:
+    /// voter 0 → RANDOM NO, voter 1 → RANDOM YES.
+    const KAT_JFP_RANDOM_SECRETS: [&str; 2] = [
+        "1bda06eeb6ce584de4ca0d83aa0412f5b7ddf8f98f06783c45810ccfee5a4966",
+        "eb5df730303558c385a49c22d93548c16fa437e4245d6acb31aaa374c0f26771",
+    ];
+    const KAT_JFP_RANDOM_HASHES: [&str; 2] = [
+        "f43cd0ce86a22f7ff47a493ae80e1b284d046634dde3bfc34fc97c1ff10d547e",
+        "7e1fce28d4e8551a902513ccd918acd6774518bd361a34bb7311376411e63ade",
+    ];
+
+    fn kat32(h: &str) -> [u8; 32] {
+        hex::decode(h).unwrap().try_into().unwrap()
+    }
+
+    /// KAT on THE builders (Python constants above).
+    #[test]
+    fn kat_jfp_builders() {
+        assert_eq!(jfp_vote_hash(0x01, &[0x50; 32]), kat32(KAT_JFP_VOTE_YES));
+        assert_eq!(jfp_vote_hash(0x00, &[0x50; 32]), kat32(KAT_JFP_VOTE_NO));
+        assert_eq!(jfp_group_wallet_seed(&[0xCC; 32], &[0x02; 32]), kat32(KAT_JFP_WALLET_SEED));
+    }
+
+    /// Step-0 anchor (vote, both values): a recorded vote hash equal to the
+    /// Python constant is matched by `compute_jfp_result`'s YES / NO arms.
+    #[test]
+    fn kat_jfp_vote_hash_anchors_compute_jfp_result() {
+        for (vote_hash, want, yes, no) in [(KAT_JFP_VOTE_YES, "approved", 1, 0), (KAT_JFP_VOTE_NO, "rejected", 0, 1)] {
+            let db = Arc::new(ManagementDb::open_test().unwrap());
+            let engine = DwpEngine::new(db, [0x01; 32]);
+            let pwv = vec![[0x10; 32]];
+            let wallet_id = engine.create_dwp_wallet(&[0xCC; 32], &[0x02; 32], &[0x03; 32], &pwv, "", 0).unwrap();
+            engine.record_vote_tx(&wallet_id, &pwv[0], &kat32(vote_hash), None).unwrap();
+            let got = engine.compute_jfp_result(&wallet_id, &[[0x50; 32]]).unwrap();
+            assert_eq!(got, (want.to_string(), yes, no), "vote hash {vote_hash}");
+        }
+    }
+
+    /// Step-0 anchor: `compute_random_votes` emits the Python secrets/hashes
+    /// (one NO, one YES — both vote bytes covered).
+    #[test]
+    fn kat_jfp_random_votes_anchor() {
+        let db = Arc::new(ManagementDb::open_test().unwrap());
+        let engine = DwpEngine::new(db, [0x01; 32]);
+        let wallet_id = engine.create_dwp_wallet(&[0xCC; 32], &[0x02; 32], &[0x03; 32],
+            &[[0x10; 32], [0x11; 32]], "", 0).unwrap();
+        let (secrets, hashes) = engine.compute_random_votes(&wallet_id, 1000).unwrap();
+        assert_eq!(secrets, KAT_JFP_RANDOM_SECRETS.map(kat32).to_vec());
+        assert_eq!(hashes, KAT_JFP_RANDOM_HASHES.map(kat32).to_vec());
+    }
+
+    /// Step-0 anchor (both key sites): `get_group_wallet_key` returns the Python
+    /// seed, and `create_dwp_wallet` stores the group wallet under the pk that
+    /// seed derives — the two former inline sites agree.
+    #[test]
+    fn kat_jfp_group_wallet_key_anchor() {
+        let (addr, seed) = DwpEngine::get_group_wallet_key(&[0xCC; 32], &[0x02; 32]);
+        assert_eq!(seed, kat32(KAT_JFP_WALLET_SEED));
+        assert_eq!(addr, dwp_wallet_address(&kat32(KAT_JFP_GROUP_PK)));
+
+        let storage = Arc::new(Storage::open_test().unwrap());
+        let db = Arc::new(ManagementDb::open_test().unwrap());
+        let engine = DwpEngine::new_with_storage(db, storage.clone(), [0x01; 32]);
+        engine.create_dwp_wallet(&[0xCC; 32], &[0x02; 32], &[0x03; 32], &[[0x10; 32]], "", 0).unwrap();
+        let stored = storage.get_wallet_state(&kat32(KAT_JFP_GROUP_PK),
+            axiom_core_logic::wallet_id::K_DEFAULT, axiom_core_logic::wallet_id::PROOF_TYPE_DMAP).unwrap();
+        assert!(stored.is_some(), "create_dwp_wallet must store the group wallet under the KAT pk");
+    }
+
+    /// KI#246 — the group wallet's stored opening `state_id` is CORE's
+    /// `compute_genesis_state_id(group_pk, DQF_ATOMS, K_DEFAULT, PROOF_TYPE_DMAP)`
+    /// (SHA3-256), not the retired BLAKE3 copy. KAT computed INDEPENDENTLY in
+    /// Python: `hashlib.sha3_256(b"AXIOM_GENESIS" + group_pk + (10**10).to_bytes(8,
+    /// "little") + bytes([3, 1]))` with the KAT group pk above (1 AXC = 10^10 atoms).
+    /// MUTATION: restore the BLAKE3 copy ⇒ both asserts RED.
+    const KAT_JFP_GROUP_GENESIS_STATE: &str = "80d5d05a45e445d92b004aa90b72db4166d5b9691db8f2cf14237ecde08c42af";
+
+    #[test]
+    fn ki246_dwp_group_wallet_state_id_is_cores_genesis_builder() {
+        let storage = Arc::new(Storage::open_test().unwrap());
+        let db = Arc::new(ManagementDb::open_test().unwrap());
+        let engine = DwpEngine::new_with_storage(db, storage.clone(), [0x01; 32]);
+        engine.create_dwp_wallet(&[0xCC; 32], &[0x02; 32], &[0x03; 32], &[[0x10; 32]], "", 0).unwrap();
+        let stored = storage.get_wallet_state(&kat32(KAT_JFP_GROUP_PK),
+            axiom_core_logic::wallet_id::K_DEFAULT, axiom_core_logic::wallet_id::PROOF_TYPE_DMAP)
+            .unwrap().expect("group wallet stored");
+        assert_eq!(stored.state_id, axiom_core_logic::genesis::compute_genesis_state_id(
+            &kat32(KAT_JFP_GROUP_PK), DQF_ATOMS,
+            axiom_core_logic::wallet_id::K_DEFAULT, axiom_core_logic::wallet_id::PROOF_TYPE_DMAP),
+            "the stored state id is Core's builder output");
+        assert_eq!(stored.state_id, kat32(KAT_JFP_GROUP_GENESIS_STATE), "Python KAT");
+    }
+
     #[test]
     fn test_jfp_vote_and_result_computation() {
         let db = Arc::new(ManagementDb::open_test().unwrap());
@@ -874,13 +983,7 @@ mod tests {
         for (i, voter_pk) in pwv.iter().enumerate() {
             let secret = [0x50 + i as u8; 32];
             let vote_value = 0x01u8; // YES
-            let hash = {
-                let mut h = blake3::Hasher::new();
-                h.update(b"AXIOM_JFP_VOTE");
-                h.update(&[vote_value]);
-                h.update(&secret);
-                *h.finalize().as_bytes()
-            };
+            let hash = jfp_vote_hash(vote_value, &secret);
             secrets.push(secret);
             vote_hashes.push(hash);
 
@@ -944,13 +1047,7 @@ mod tests {
         for (i, voter_pk) in pwv.iter().enumerate() {
             let secret = [0x60 + i as u8; 32];
             let vote_value = if i < 2 { 0x01u8 } else { 0x00u8 }; // YES, YES, NO
-            let hash = {
-                let mut h = blake3::Hasher::new();
-                h.update(b"AXIOM_JFP_VOTE");
-                h.update(&[vote_value]);
-                h.update(&secret);
-                *h.finalize().as_bytes()
-            };
+            let hash = jfp_vote_hash(vote_value, &secret);
             secrets.push(secret);
             engine.record_vote_tx(&wallet_id, voter_pk, &hash, None).unwrap();
         }
@@ -978,13 +1075,7 @@ mod tests {
         let mut secrets = Vec::new();
         for (i, voter_pk) in pwv.iter().enumerate() {
             let secret = [0x70 + i as u8; 32];
-            let hash = {
-                let mut h = blake3::Hasher::new();
-                h.update(b"AXIOM_JFP_VOTE");
-                h.update(&[0x01]); // YES
-                h.update(&secret);
-                *h.finalize().as_bytes()
-            };
+            let hash = jfp_vote_hash(0x01, &secret); // YES
             secrets.push(secret);
             engine.record_vote_tx(&wallet_id, voter_pk, &hash, None).unwrap();
         }

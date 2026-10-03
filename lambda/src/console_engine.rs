@@ -19,6 +19,8 @@
 //! - Proposals carry a voting window (30 days); if no sustained objection → Approved
 //! - Max ±2 digit magnitude per proposal
 //! - Compensation: 1 AXC per full service year per member (conditional on full term)
+//!   ⚠ NOT YET IMPLEMENTED — spec only, no payout code exists (KI#88). Do not
+//!   assume the stipend is paid.
 //! - 3 failed elections → permanent dissolution
 
 use crate::error::LambdaError;
@@ -39,14 +41,23 @@ pub use axiom_core_logic::types::{
 // ── Console-specific constants (Lambda layer) ────────────────────────────────
 
 /// Cooldown between digit migration proposals: 3 months at 5s/tick.
-pub const CONSOLE_COOLDOWN_TICKS: u64 = crate::tuning_gen::CONSOLE_COOLDOWN_TICKS;
+pub const CONSOLE_COOLDOWN_TICKS: axiom_core_logic::types::TickCount =
+    axiom_core_logic::types::TickCount(crate::tuning_gen::CONSOLE_COOLDOWN_TICKS);
 
 /// Maximum proposals per calendar year (White Paper G.2).
 pub const CONSOLE_MAX_PROPOSALS_PER_YEAR: usize = 2;
 
 /// Deliberation window: 24 hours at 5s/tick = 17,280 ticks (White Paper §7.8).
 /// "Set to 24 hours to ensure operators across all time zones have opportunity to respond."
-pub const CONSOLE_VOTING_WINDOW_TICKS: u64 = crate::tuning_gen::CONSOLE_VOTING_WINDOW_TICKS;
+/// Per-member deadline to CAST a vote (YPX-013 §7.8). Distinct from
+/// `CONSOLE_VOTING_WINDOW_TICKS`, which is the proposal's overall 30-day
+/// deliberation window. Absence at this deadline triggers ONE automatic retry
+/// of the same length; a second miss DISSOLVES the Console.
+pub const CONSOLE_MEMBER_VOTE_TICKS: axiom_core_logic::types::TickCount =
+    axiom_core_logic::types::TickCount(crate::tuning_gen::CONSOLE_MEMBER_VOTE_TICKS);
+
+pub const CONSOLE_VOTING_WINDOW_TICKS: axiom_core_logic::types::TickCount =
+    axiom_core_logic::types::TickCount(crate::tuning_gen::CONSOLE_VOTING_WINDOW_TICKS);
 
 /// Maximum digit magnitude shift per proposal (White Paper §7.7: ±2 decimal places).
 pub const CONSOLE_MAX_MAGNITUDE: u8 = 2;
@@ -54,11 +65,13 @@ pub const CONSOLE_MAX_MAGNITUDE: u8 = 2;
 /// Liveness check interval: 3 months at 5s/tick = 1,555,200 ticks (YP §21.12.3).
 /// Console members MUST respond to a heartbeat within this window.
 /// Failure by ANY member = entire Console dissolved. No partial continuation.
-pub const CONSOLE_LIVENESS_INTERVAL_TICKS: u64 = crate::tuning_gen::CONSOLE_LIVENESS_INTERVAL_TICKS;
+pub const CONSOLE_LIVENESS_INTERVAL_TICKS: axiom_core_logic::types::TickCount =
+    axiom_core_logic::types::TickCount(crate::tuning_gen::CONSOLE_LIVENESS_INTERVAL_TICKS);
 
 /// Liveness response window: 72 hours at 5s/tick = 51,840 ticks.
 /// After a liveness check is broadcast, members have 72h to respond.
-pub const CONSOLE_LIVENESS_RESPONSE_TICKS: u64 = crate::tuning_gen::CONSOLE_LIVENESS_RESPONSE_TICKS;
+pub const CONSOLE_LIVENESS_RESPONSE_TICKS: axiom_core_logic::types::TickCount =
+    axiom_core_logic::types::TickCount(crate::tuning_gen::CONSOLE_LIVENESS_RESPONSE_TICKS);
 
 /// Console group wallet address prefix.
 pub const CONSOLE_WALLET_PREFIX: &str = "DWP/CONSOLE/";
@@ -682,9 +695,11 @@ impl ConsoleEngine {
 
             if let Some(last) = last_proposed {
                 let elapsed = current_tick.saturating_sub(last as u64);
-                if elapsed < CONSOLE_COOLDOWN_TICKS {
+                // KI#47: `elapsed` is a tick-VALUE span (seconds); the constant is a tick
+                // COUNT — project it. Pre-fix the cooldown was 18 days, not 90.
+                if elapsed < CONSOLE_COOLDOWN_TICKS.to_secs() {
                     return Err(LambdaError::InvalidRequest(format!(
-                        "Cooldown: {} ticks since last proposal, need {}", elapsed, CONSOLE_COOLDOWN_TICKS
+                        "Cooldown: {}s since last proposal, need {}s", elapsed, CONSOLE_COOLDOWN_TICKS.to_secs()
                     )));
                 }
             }
@@ -712,7 +727,8 @@ impl ConsoleEngine {
             &blake3::hash(format!("{}{}{}", proposer_id, proposal_type.as_str(), current_tick).as_bytes())
                 .to_hex()[..8]
         );
-        let expires_at = current_tick + CONSOLE_VOTING_WINDOW_TICKS; // 24 hours
+        // KI#47: project the tick COUNT onto the tick-VALUE scale (was 4.8h, not 24h).
+        let expires_at = current_tick + CONSOLE_VOTING_WINDOW_TICKS.to_secs(); // 24 hours
 
         let conn = self.db.db()?;
         conn.execute(
@@ -924,7 +940,9 @@ impl ConsoleEngine {
                 // Missing votes — some members didn't vote within 24h
                 if *retry_count == 0 {
                     // First miss → automatic retry (§7.8 case 3)
-                    let new_expires = current_tick + CONSOLE_VOTING_WINDOW_TICKS;
+                    // The retry is a fresh MEMBER-vote window (24h), not another full
+                    // 30-day deliberation — see YPX-013 §7.8 case 3.
+                    let new_expires = current_tick + CONSOLE_MEMBER_VOTE_TICKS.to_secs();
                     let conn = self.db.db()?;
                     conn.execute(
                         "UPDATE console_proposals SET status = 'Retry', retry_count = 1, expires_at = ?1 WHERE proposal_id = ?2",
@@ -977,7 +995,8 @@ impl ConsoleEngine {
             .map_err(|e| LambdaError::StorageError(e.to_string()))?;
 
         match last_check {
-            Some(last) => Ok(current_tick.saturating_sub(last as u64) >= CONSOLE_LIVENESS_INTERVAL_TICKS),
+            // KI#47: value-span vs tick COUNT — project. Pre-fix cadence was 18d, not 90d.
+            Some(last) => Ok(current_tick.saturating_sub(last as u64) >= CONSOLE_LIVENESS_INTERVAL_TICKS.to_secs()),
             None => Ok(true), // No check ever done
         }
     }
@@ -985,7 +1004,8 @@ impl ConsoleEngine {
     /// Initiate a liveness check. Broadcasts a heartbeat request via CL10 Fan-Out.
     /// Each Console member must respond within CONSOLE_LIVENESS_RESPONSE_TICKS (72h).
     pub fn initiate_liveness_check(&self, current_tick: u64) -> Result<i64, LambdaError> {
-        let deadline = current_tick + CONSOLE_LIVENESS_RESPONSE_TICKS;
+        // KI#47: project the tick COUNT (was a 14.4h response window, not 72h).
+        let deadline = current_tick + CONSOLE_LIVENESS_RESPONSE_TICKS.to_secs();
         let conn = self.db.db()?;
         conn.execute(
             "INSERT INTO console_liveness (initiated_at, deadline, status) VALUES (?1, ?2, 'Pending')",
@@ -1447,10 +1467,23 @@ mod tests {
         let engine = setup();
         store_genesis_cert(&engine);
 
-        engine.submit_proposal(&member_hex(0), DigitDirection::Dedigitize, 1, 10_000_000).unwrap();
+        // ⚠ The second tick is DERIVED from the register, not hardcoded. It used
+        // to be `10_001_000` — a 1,000-tick gap, which is only "inside the
+        // cooldown" for the PRODUCTION value (1_555_200). The moment the dev
+        // twin became reachable (24 ticks, KI#136) that gap fell OUTSIDE the
+        // cooldown, the proposal was correctly allowed, and this test failed —
+        // not because cooldown broke, but because it pinned a literal instead of
+        // the property. `- 1` is the last tick still within the window for ANY
+        // cooldown >= 1, so it tests the rule rather than a number.
+        let t0: u64 = 10_000_000;
+        let still_inside = t0 + crate::tuning_gen::CONSOLE_COOLDOWN_TICKS - 1;
 
-        let result = engine.submit_proposal(&member_hex(1), DigitDirection::Redigitize, 1, 10_001_000);
-        assert!(result.is_err());
+        engine.submit_proposal(&member_hex(0), DigitDirection::Dedigitize, 1, t0).unwrap();
+
+        let result = engine.submit_proposal(&member_hex(1), DigitDirection::Redigitize, 1, still_inside);
+        assert!(result.is_err(),
+            "a proposal at {still_inside} is inside the {} -tick cooldown that opened at {t0} \
+             and must be refused", crate::tuning_gen::CONSOLE_COOLDOWN_TICKS);
         assert!(result.unwrap_err().to_string().contains("Cooldown"));
     }
 

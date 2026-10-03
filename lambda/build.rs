@@ -1,5 +1,20 @@
 // AXIOM Lambda — Build Script
 //
+// ⚠ THE TWIN CFG IS `dev-tuning`, NOT `dev-mode` (changed 2026-09-06, KI#136).
+//
+// It emitted `#[cfg(feature = "dev-mode")]` until then. That was the wrong flag
+// to hang timers on: lambda's `dev-mode` is a SECURITY relaxation — it sets
+// VBC-approval min_stake 500 -> 0 (consensus.rs:1744), downgrades the "exactly
+// 3/3 issuers/sigs" rule from error to warning (:1950), and skips the startup
+// VBC-chain verification against ROOT_AUTHORITY_PKS (:1970). So the only way to
+// get a 2-minute console cooldown on a dev fleet was to also stop enforcing the
+// checks that fleet exists to prove, and `scripts/check-no-dev-mode.sh` exists
+// precisely to keep that combination out of production.
+//
+// `dev-tuning` selects VALUES ONLY and relaxes nothing. `dev-mode` still
+// implies it (Cargo.toml), so anything that asked for dev-mode keeps the dev
+// values it always expected.
+//
 // Reads protocol_lambda.toml and generates src/tuning_gen.rs with compile-time
 // constants. Mirrors core/logic/build.rs: a `foo` + `foo_dev` PAIR emits ONE
 // constant under the base name, selected by the `dev-mode` feature. A standalone
@@ -38,7 +53,7 @@ fn main() {
         if let Some(base) = key.strip_suffix("_dev") {
             if has(base) {
                 out.push_str(&format!(
-                    "#[cfg(feature = \"dev-mode\")]\npub const {}: u64 = {};\n",
+                    "#[cfg(feature = \"dev-tuning\")]\npub const {}: u64 = {};\n",
                     base.to_uppercase(),
                     value
                 ));
@@ -47,7 +62,7 @@ fn main() {
         }
         if has(&format!("{key}_dev")) {
             out.push_str(&format!(
-                "#[cfg(not(feature = \"dev-mode\"))]\npub const {}: u64 = {};\n",
+                "#[cfg(not(feature = \"dev-tuning\"))]\npub const {}: u64 = {};\n",
                 key.to_uppercase(),
                 value
             ));

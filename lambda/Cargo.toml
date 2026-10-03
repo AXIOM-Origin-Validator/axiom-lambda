@@ -7,22 +7,34 @@ authors = ["AXIOM Project"]
 description = "AXIOM Lambda - k=3 consensus engine"
 
 [dependencies]
+# KI#86: jemalloc (see nabla) — glibc arena retention under sustained load.
+# Always-on in src/main.rs. Host-side, CoreID-neutral.
+tikv-jemallocator = "0.6"
+# KI#89 (2026-10-01): read-only jemalloc counters for the loopback admin
+# `/stats` (allocated / resident / active / mapped / retained) — the number
+# that decides leak (allocated ≈ resident, growing) vs retention (allocated ≪
+# resident). Same jemalloc-sys 0.6 line as tikv-jemallocator above (ONE
+# jemalloc). `stats` turns on jemalloc's --enable-stats: without it the
+# allocator is built --disable-stats and every counter (and the zero-code
+# `_RJEM_MALLOC_CONF=stats_print:true` dump) reads nothing. Supply-chain
+# surface only (tikv/jemallocator workspace crate); no network surface.
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 # Core validation logic (for types).
 # `ceremony` feature gates sign_sphincs / sign_dilithium — needed for
 # validator_withdrawal test fixtures (operator SPHINCS+ signature).
-axiom-core-logic = { git = "https://github.com/AXIOM-Origin-Validator/axiom-core", tag = "core-b77fd28a", features = ["ceremony"] }
+axiom-core-logic = { git = "https://github.com/AXIOM-Origin-Validator/axiom-core", tag = "core-d1e5cb67", features = ["ceremony"] }
 # Structured error responses (AXIOM_YellowPaper_Errors.md Phase 2b).
 axiom-errors = { workspace = true, features = ["std"] }
 # AXC/L$/atom conversion for display and API
-axiom-denomination = { git = "https://github.com/AXIOM-Origin-Validator/axiom-lib", tag = "lib-v3.3.0" }
+axiom-denomination = { git = "https://github.com/AXIOM-Origin-Validator/axiom-lib", tag = "lib-v3.7.1" }
 # Shared per-IP TCP rate limiter (single source, also used by ANTIE)
-axiom-rate-limit = { git = "https://github.com/AXIOM-Origin-Validator/axiom-lib", tag = "lib-v3.3.0" }
+axiom-rate-limit = { git = "https://github.com/AXIOM-Origin-Validator/axiom-lib", tag = "lib-v3.7.1" }
 
 # zkVM host for proof generation/verification
-axiom-zk-vm = { git = "https://github.com/AXIOM-Origin-Validator/axiom-core", tag = "core-b77fd28a" }
+axiom-zk-vm = { git = "https://github.com/AXIOM-Origin-Validator/axiom-core", tag = "core-d1e5cb67" }
 
 # AVM — interpreter + DMAP attestation (riscv-interpreter enables real RV32IM execution)
-axiom-dmap-vm = { git = "https://github.com/AXIOM-Origin-Validator/axiom-core", tag = "core-b77fd28a", default-features = true, features = ["riscv-interpreter"] }
+axiom-dmap-vm = { git = "https://github.com/AXIOM-Origin-Validator/axiom-core", tag = "core-d1e5cb67", default-features = true, features = ["riscv-interpreter"] }
 
 # Async runtime
 tokio = { version = "1.0", features = ["full"] }
@@ -96,21 +108,17 @@ tempfile = { version = "3.0", optional = true }
 name = "lambda"
 path = "src/main.rs"
 
-[[bin]]
-name = "validator-setup"
-path = "src/bin/validator_setup.rs"
+# validator-setup moved to tools/validator-setup (2026-09-10): it links the SDK
+# and ANTIE's carriers for design §5.5 steps 5–6, which lambda must not.
 
 [[bin]]
 name = "genesis-ceremony"
 path = "src/bin/genesis_ceremony.rs"
 
 # This integration test uses `consensus::tests::create_test_engine`, exposed only
-# under the `test-helpers` feature (which `dev-mode` enables). Mark it so a plain
-# `cargo test -p axiom-lambda` (feature off) gracefully SKIPS it instead of failing
-# to compile with E0432 — run it via `--features test-helpers` (or dev-mode).
-[[test]]
-name = "withdrawal_mint_e2e"
-required-features = ["test-helpers"]
+# (withdrawal_mint_e2e [[test]] block removed 2026-08-10 with the KI#83
+# retirement — the TCP withdrawal-mint round is gone; the fee claim is the
+# §10.0 standard-flow tx.)
 
 [features]
 default = ["zkp"]
@@ -129,15 +137,35 @@ disable-audit = ["axiom-dmap-vm/disable-audit"]
 cranelift-jit = ["axiom-dmap-vm/cranelift-jit-backend"]
 # Reduce Argon2id from 32MB to 512KB. Full chain logic, fast execution. For testing.
 light-audit = ["axiom-dmap-vm/light-audit"]
-dev-mode = ["axiom-dmap-vm/dev-mode", "test-helpers"]  # Relaxed VBC requirements + test-helpers visibility. NOT FOR PRODUCTION.
+# Select the DEV twin of every tuning register in protocol_lambda.toml
+# (console governance timers, vbc_signs_budget). VALUES ONLY — this relaxes NO
+# security check, which is the entire reason it exists separately from
+# `dev-mode` below. Added 2026-09-06 (KI#136): the twins had been gated on
+# `dev-mode`, so the only way to get dev timers was to also disable the VBC
+# stake floor, the 3/3 issuer rule and the startup VBC-chain check. A dev fleet
+# needs short timers AND real checks — that is what it is for.
+dev-tuning = []
+# Dev-only §23.14 AUDIT CHAOS (docs/AXIOM_DESIGN_AuditChaos.md): a per-node switch file makes this
+# validator answer peer audits dishonestly (lie / silent / forget) so a soak can prove the auditors
+# catch it. NOT implied by dev-mode or dev-tuning; the dev build passes it explicitly and preflight
+# refuses any production recipe that does. NEVER FOR PRODUCTION.
+audit-chaos = []
+# Relaxed VBC requirements + test-helpers visibility. NOT FOR PRODUCTION.
+# ⚠ This is a SECURITY relaxation, not a convenience: min_stake 500 -> 0
+# (consensus.rs:1744), "exactly 3/3 issuers/sigs" error -> warning (:1950), and
+# the startup VBC-chain verification against ROOT_AUTHORITY_PKS SKIPPED (:1970).
+# `scripts/check-no-dev-mode.sh` exists to keep it out of production.
+# It implies `dev-tuning` so anything that asked for dev-mode keeps the dev
+# VALUES it has always expected — the split takes nothing away.
+dev-mode = ["axiom-dmap-vm/dev-mode", "test-helpers", "dev-tuning"]
 
 [dev-dependencies]
 tempfile = "3.0"
-axiom-test-utils = { git = "https://github.com/AXIOM-Origin-Validator/axiom-core", tag = "core-b77fd28a" }
+axiom-test-utils = { git = "https://github.com/AXIOM-Origin-Validator/axiom-core", tag = "core-d1e5cb67" }
 # YP §19.6 fee ledger end-to-end integration test (Step 8.5): exercises
 # CL5 redeem → Nabla /register → DEED pool credit → earnings query →
 # Lambda withdrawal verify. Spans both crates in one cohesive test.
-axiom-nabla = { git = "https://github.com/AXIOM-Origin-Validator/axiom-nabla", tag = "nabla-v3.3.0", features = ["dev-mode"] }
+axiom-nabla = { git = "https://github.com/AXIOM-Origin-Validator/axiom-nabla", tag = "nabla-v3.7.1", features = ["dev-mode"] }
 ed25519-dalek = "2.1"
 fips205 = "0.4"
 blake3 = "1.5"

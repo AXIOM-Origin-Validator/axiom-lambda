@@ -109,46 +109,14 @@ use crate::core_client::CoreClient;
 use crate::error::LambdaError;
 use crate::storage::Storage;
 use crate::types::*;
-use axiom_core_logic::types::{VBCProofBundle, VBC};
+use axiom_core_logic::types::VBCProofBundle;
 use ed25519_dalek::{SigningKey, Signer, VerifyingKey};
-use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-/// VBC file format v0.9 (JSON from install_genesis.sh, hex-encoded keys)
-/// Same format as ANTIE's VBCFile — both load the same vbc.json.
-#[derive(Debug, Deserialize)]
-struct VBCFile {
-    #[serde(default)]
-    version: Option<u8>,
-    #[serde(default)]
-    subject_pubkey_sphincs_hex: String,
-    #[serde(default)]
-    subject_pubkey_dilithium_hex: String,
-    #[serde(default)]
-    subject_pubkey_ed25519_hex: String,
-    #[serde(default)]
-    pgp_fingerprint_hex: Option<String>,
-    #[serde(default)]
-    issuer_set: Vec<String>,
-    #[serde(default)]
-    signatures: Vec<String>,
-    #[serde(default)]
-    issued_at: u64,
-    #[serde(default = "default_vbc_expires")]
-    expires_at: u64,
-    #[serde(default)]
-    chain_depth: Option<u8>,
-    #[serde(default)]
-    founding_vbc_hash: Option<String>,
-    #[serde(default)]
-    node_name: Option<String>,
-}
-
-fn default_vbc_expires() -> u64 { u64::MAX }
-
-/// Minimum witnesses required for consensus (floor — used when required_k is unset)
+/// The protocol FLOOR: every tier check is `max(artifact k, 3)`
+/// (YP §17.3.1.4 v2.19.0, KI#150). Never a default where a tier is CHECKED.
 pub const MIN_WITNESSES: usize = 3;
 
 /// YPX-001 §1.5.1 hardening (2026-07-12): stored scar passcodes expire —
@@ -160,31 +128,237 @@ const SCAR_PASSCODE_TTL_SECS: i64 = 7 * 24 * 60 * 60;
 /// per notification cycle, with each cycle visible to the receiver.
 const MAX_SCAR_PASSCODE_ATTEMPTS: u32 = 5;
 
-/// Bound for the per-engine request_id → WitnessResponse idempotency cache.
-/// A WitnessResponse with a typical cheque + receipt + fact link runs
-/// 20-50 KB; 1024 entries ≈ 50 MB worst case. Eviction is FIFO at the
-/// front of the deque — the cache only needs to cover the few-second
-/// window during which the same request_id can plausibly be re-delivered
-/// by the SDK fan-out + §27.5 / S-ABR relay path. Cold restart drops
-/// the cache (acceptable — see field doc on ConsensusEngine).
+/// COUNT bound for each per-engine request_id idempotency cache (witness AND
+/// redeem). It is one of TWO bounds — see `IDEMPOTENCY_CACHE_BYTES`.
+///
+/// ⚠ KI#89 (2026-10-02) — the old note here read "a WitnessResponse … runs
+/// 20-50 KB; 1024 entries ≈ 50 MB worst case". WRONG by 10–17×: a final
+/// witness response MEASURED 450–870 KB on the fleet (cheque with 6–7
+/// certificate bundles + the sender FACT chain, the chain carried a second time
+/// at response level), so 1024 entries could hold ~0.66–1.1 GB per cache — the
+/// cause of the KI#89 Lambda RSS climb (Lambda's caches, not Core). The cache is
+/// now ALSO byte-bounded (`IdemCache`). The old note also called the window "a
+/// few seconds" (SDK fan-out + §27.5 relay); since KI#26 Bug F / KI#112 the SDK
+/// re-uses persisted request_ids on resume and sweep retries (minutes–hours),
+/// so the window is whatever the two bounds leave — best-effort (YP-SDK §4.6a).
+/// Cold restart drops the cache (see the field doc on ConsensusEngine).
 pub const WITNESS_IDEMPOTENCY_CACHE_CAP: usize = 1024;
 
-/// Get effective k from a transaction's required_k field (Core-filled from receiver address).
-/// Extract required k from the receiver's wallet_id (YPX-007 tier).
-/// This is the SERVER-AUTHORITATIVE source — never trust tx.required_k
-/// (client-supplied, can be 0 or forged). Lambda must independently
-/// derive k from receiver_wallet_id, same as Core does in validate_transaction.
-/// Falls back to MIN_WITNESSES for protocol TXs or unparseable wallet_ids.
-fn effective_k(tx: &axiom_core_logic::types::Transaction) -> usize {
-    use axiom_core_logic::wallet_id::extract_security_level;
-    match extract_security_level(&tx.receiver_wallet_id) {
-        Ok((k, _)) => (k as usize).max(MIN_WITNESSES),
-        Err(_) => MIN_WITNESSES,
+/// BYTE bound for each idempotency cache: Σ (request_id + stored CBOR) ≤ this.
+/// Register `idempotency_cache_bytes` in `protocol_lambda.toml` (64 MiB) — edit
+/// it there, never here. KI#89.
+pub const IDEMPOTENCY_CACHE_BYTES: usize = crate::tuning_gen::IDEMPOTENCY_CACHE_BYTES as usize;
+
+/// One cached idempotency entry: the response as CBOR bytes, so its size is
+/// exact (`key.len() + bytes.len()`) and a hit clones an `Arc`, not a ~1 MB
+/// struct, under the lock. KI#89.
+pub(crate) struct IdemEntry {
+    key: String,
+    bytes: Arc<[u8]>,
+}
+
+/// A request_id → response-bytes cache bounded by COUNT and BYTES (KI#89).
+///
+/// Eviction (`insert`): oldest-first (FIFO) while `len >= cap` OR
+/// `bytes + cost > budget`; it NEVER refuses — an entry larger than the whole
+/// budget is cached alone. No time-based eviction (no wall-clock in protocol
+/// paths). A miss is safe for integrity (consume-once by txid at Nabla
+/// `cheque_claims` and Lambda `try_mark_cheque_redeemed`); it costs liveness
+/// only — YP-SDK §4.6a, YPX-016 trap (a).
+pub(crate) struct IdemCache {
+    q: std::collections::VecDeque<IdemEntry>,
+    /// Σ (key.len() + bytes.len()) over `q` — the number `/stats` reports.
+    bytes: usize,
+    cap: usize,
+    budget: usize,
+}
+
+impl IdemCache {
+    pub(crate) fn new(cap: usize, budget: usize) -> Self {
+        Self { q: std::collections::VecDeque::with_capacity(cap.min(1024)), bytes: 0, cap, budget }
+    }
+
+    /// Store `bytes` under `key` (empty key: not stored — collision risk across
+    /// unrelated requests). Evicts oldest-first until both bounds hold.
+    pub(crate) fn insert(&mut self, key: String, bytes: Arc<[u8]>) {
+        if key.is_empty() {
+            return;
+        }
+        let cost = key.len() + bytes.len();
+        while !self.q.is_empty() && (self.q.len() >= self.cap || self.bytes + cost > self.budget) {
+            if let Some(old) = self.q.pop_front() {
+                self.bytes -= old.key.len() + old.bytes.len();
+            }
+        }
+        self.q.push_back(IdemEntry { key, bytes });
+        self.bytes += cost;
+    }
+
+    /// The stored bytes for `key` (an `Arc` clone — decode OUTSIDE the lock).
+    pub(crate) fn get(&self, key: &str) -> Option<Arc<[u8]>> {
+        self.q.iter().find(|e| e.key == key).map(|e| Arc::clone(&e.bytes))
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.q.len()
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+/// The witness idempotency cache's stored value (KI#89). The final witness
+/// response carries the sender FACT chain TWICE — `cheque_for_receiver
+/// .sender_fact_chain` and the top-level `sender_fact_chain`, a `clone()` of it.
+/// At store time the top-level copy is dropped when its CBOR is byte-identical
+/// to the cheque's (`chain_dup = true`) and re-attached from the cheque at
+/// replay, so the replay is VERBATIM (proven by CBOR byte equality in
+/// `witness_idempotency_replay_is_verbatim_after_compaction`). Any other shape
+/// is stored as-is. `cheque.fact_certificates` are NOT re-derived: the store
+/// changes over time, so a re-derivation would not be verbatim.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CachedWitness {
+    chain_dup: bool,
+    response: WitnessResponse,
+}
+
+/// What the startup task does once the ignition ended (YPX-009 §6.1a).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum IgnitionEnd {
+    /// Core is serving (ignition completed, or no `pulse-gate`).
+    Serving,
+    /// `pulse-gate` Core still blocked: exit non-zero — never a silent hang.
+    ExitRequired,
+}
+
+/// The one exit rule after the ignition task ends: `pulse_ready` is the
+/// measured fact (false only under `pulse-gate`, until `complete_ignition`).
+pub(crate) fn ignition_end_action(pulse_ready: bool) -> IgnitionEnd {
+    if pulse_ready { IgnitionEnd::Serving } else { IgnitionEnd::ExitRequired }
+}
+
+fn cbor_encode<T: serde::Serialize>(value: &T) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    ciborium::ser::into_writer(value, &mut out).ok()?;
+    Some(out)
+}
+
+/// Encode a witness response for the idempotency cache (outside any lock).
+fn encode_cached_witness(response: &WitnessResponse) -> Option<Vec<u8>> {
+    // FactChain has no PartialEq — compare the encodings (the replay must be
+    // byte-identical, so byte equality is the right test anyway).
+    let chain_dup = match (
+        response.sender_fact_chain.as_ref(),
+        response.cheque_for_receiver.as_ref().and_then(|c| c.sender_fact_chain.as_ref()),
+    ) {
+        (Some(top), Some(in_cheque)) => cbor_encode(top)? == cbor_encode(in_cheque)?,
+        _ => false,
+    };
+    let mut stored = response.clone();
+    if chain_dup {
+        stored.sender_fact_chain = None;
+    }
+    cbor_encode(&CachedWitness { chain_dup, response: stored })
+}
+
+/// Decode a cached witness response, re-attaching the stripped duplicate chain.
+fn decode_cached_witness(bytes: &[u8]) -> Option<WitnessResponse> {
+    let cached: CachedWitness = ciborium::de::from_reader(bytes).ok()?;
+    let mut response = cached.response;
+    if cached.chain_dup {
+        response.sender_fact_chain =
+            response.cheque_for_receiver.as_ref().and_then(|c| c.sender_fact_chain.clone());
+    }
+    Some(response)
+}
+
+/// The §15 anchor view of the sender's PRIOR state — the one object Lambda
+/// hands Core on the witness path, built ONCE for both the CL2 pre-sign pass
+/// and the CL3 finalize pass.
+///
+/// **Why one builder (RULE 1).** The two sites were independent struct
+/// literals. They agreed about `hibernation_until` (client-declared) and both
+/// hardcoded `wall_clock_lock: 0` — so for a stake-locked wallet, Core
+/// recomputed `compute_state_hash(pk, balance, seq, hibernation, 0, 0)`, which
+/// cannot equal the k-signed `prev_receipt.state_hash` that bound the real
+/// `L`. Every send from a claimed stake wallet therefore died
+/// `E_STATE_NOT_ANCHORED` the moment its lock released, and the release leg
+/// of §5.2.2c could never complete (measured 2026-09-06; the wallet, Lambda's
+/// stored row and the witnessing validator were all provably correct — only
+/// this view was wrong). Two literals, one field, one release path.
+///
+/// **Why the deadlines are CLIENT-DECLARED and that is safe.** Both come off
+/// the request, exactly like `claimed_balance_for_sabr`, because a FRESH
+/// validator in the round has no stored row and could only pass 0. Nothing is
+/// trusted: Core's `verify_state_anchored` rejects unless the pair re-derives
+/// the k-signed hash, so a holder cannot declare `0` to shed a lock. The lock's
+/// ENFORCEMENT is elsewhere and stays there — Lambda's STAKE-LOCKED gate reads
+/// its OWN stored row, and Core judges release on the ATTESTED TICK (RULE 5:
+/// never let a client-sent number become the control).
+#[allow(clippy::too_many_arguments)]
+fn witness_anchor_state_view(
+    request: &axiom_core_logic::types::WitnessRequest,
+    balance: u64,
+    prior_wallet_seq: u64,
+    state_id: [u8; 32],
+    auth_hash: Option<[u8; 32]>,
+    wallet_id: Option<String>,
+    group_members: Option<Vec<axiom_core_logic::GroupMember>>,
+) -> WalletState {
+    WalletState {
+        public_key: request.transaction.client_pk.clone(),
+        balance,
+        wallet_seq: prior_wallet_seq,
+        state_id,
+        auth_hash,
+        hibernation_until: request.claimed_hibernation_until,
+        wall_clock_lock: request.claimed_wall_clock_lock,
+        emission_claimed_epoch: request.claimed_emission_claimed_epoch,
+        // ValidatorJoin §6b.13 — declared like the lock, for the same reason
+        // (re-derive the k-signed anchor); Core's floor gate reads the value
+        // `verify_state_anchored` has just proven.
+        stake_floor_until: request.claimed_stake_floor_until,
+        wallet_format: request.claimed_wallet_format,
+        wallet_id,
+        group_members,
+    }
+}
+
+/// YPX-016 witness-cache value: the cached `WitnessResponse` plus the
+/// `required_k` of the Core CL3 run that produced its `fact_signature`.
+///
+/// Fork Settlement R4 (2026-09-28, wave 2b-ii) binds `required_k` into the FACT
+/// commitment, so the cache-hit verify (`verify_cached_fact_signature`) needs the
+/// k Core SIGNED with — Core's own returned value (`Receipt.required_k` on the
+/// k-reached path, `PublicOutputs.required_k` on the partial path), never a
+/// Lambda re-derivation (the KI#54 lesson: the k=0 receiver split depends on
+/// inputs Lambda would have to guess). `WitnessResponse.receipt` alone was NOT
+/// enough — the partial path (where the cache matters most) stores `receipt:
+/// None`. A value that does not decode as this shape is a cache MISS.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WitnessCacheEntry {
+    pub(crate) required_k: u8,
+    pub(crate) response: WitnessResponse,
+}
+
+impl WitnessCacheEntry {
+    pub(crate) fn encode(required_k: u8, response: &WitnessResponse) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        ciborium::ser::into_writer(
+            &WitnessCacheEntry { required_k, response: response.clone() }, &mut out,
+        ).ok()?;
+        Some(out)
+    }
+    pub(crate) fn decode(bytes: &[u8]) -> Option<Self> {
+        ciborium::de::from_reader::<WitnessCacheEntry, _>(bytes).ok()
     }
 }
 
 /// Result of S-ABR validation
-/// 
+///
 /// S-ABR doesn't reject directly based on balance - it returns values
 /// for Core to use in hash computation. Core compares Hash_A vs Hash_B.
 #[derive(Debug, Clone)]
@@ -230,6 +404,10 @@ impl SABRResult {
 }
 
 /// Consensus Engine
+/// §23.14.1 — see `ConsensusEngine::audit_mirror_action`.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum MirrorAction { Keep, Adopt, Clear }
+
 pub struct ConsensusEngine {
     /// Core client for CL3 (witness production)
     /// Wrapped in Mutex for interior mutability (production mode needs &mut)
@@ -300,7 +478,7 @@ pub struct ConsensusEngine {
     /// pattern in this struct.
     carriers: parking_lot::RwLock<Vec<String>>,
     
-    /// VBC for this validator — loaded from vbc.json at startup.
+    /// VBC for this validator — loaded from config/vbc-bundle.cbor at startup (§6b.12).
     /// Real SPHINCS+ chain with 3 issuers. Lambda refuses to start without it.
     vbc: VBCProofBundle,
     
@@ -330,9 +508,10 @@ pub struct ConsensusEngine {
     /// for ZKP-tier sends.
     proof_mode: String,
 
-    /// YPX-007: ZKP qualification state — resets on startup, TTL 24h.
-    /// Core-enforced: Lambda triggers benchmark, Core verifies STARK + measures time.
-    zkp_qualification: parking_lot::Mutex<axiom_core_logic::types::QualificationState>,
+    /// YPX-007 §9 (KI#125): the Core-signed record from this process's startup
+    /// benchmark. `None` = not qualified. The ONE source of `zkp_qualified` (VSP,
+    /// admin) — derived, never set independently. Never a gate (§9.6).
+    pub(crate) zkp_qualification: parking_lot::Mutex<Option<axiom_core_logic::types::ZkpQualificationRecord>>,
 
     /// Idempotency cache for witness requests, keyed by `request.request_id`.
     /// SDK fan-out (k=3) + §27.5 / S-ABR relay can deliver the same request_id
@@ -342,14 +521,16 @@ pub struct ConsensusEngine {
     /// `created_at` → different Dilithium sig), leaving the receiver with
     /// orphan duplicate cheques after redeem. Mac handoff 2026-06-05.
     ///
-    /// Cache is bounded — FIFO eviction at WITNESS_IDEMPOTENCY_CACHE_CAP.
-    /// Cold restart drops the cache; a duplicate that lands across a restart
-    /// will produce a fresh cheque. Acceptable trade-off — restart is rare,
-    /// the SDK guard at WalletState.redeemed_txids catches the post-redeem
-    /// residue regardless.
-    witness_idempotency_cache: parking_lot::Mutex<
-        std::collections::VecDeque<(String, WitnessResponse)>,
-    >,
+    /// Cache is bounded by COUNT (`WITNESS_IDEMPOTENCY_CACHE_CAP`) AND BYTES
+    /// (`IDEMPOTENCY_CACHE_BYTES`), oldest-first eviction; values are stored as
+    /// CBOR with the duplicated sender chain stripped (`CachedWitness`) — KI#89.
+    /// Read ONLY through `lookup_witness_response`.
+    /// Cold restart (or eviction) drops an entry; a duplicate that lands after
+    /// that re-executes CL2/CL3 and produces a fresh cheque for the SAME txid.
+    /// Safe — consume-once by txid at Nabla and at Lambda redeem; the SDK dedups
+    /// witness sigs by validator_id and the guard at WalletState.redeemed_txids
+    /// catches the post-redeem residue. A liveness cost only (YP-SDK §4.6a).
+    witness_idempotency_cache: parking_lot::Mutex<IdemCache>,
 
     /// Idempotency cache for REDEEM requests, keyed by `request.request_id` —
     /// the redeem-side mirror of `witness_idempotency_cache` (Mac handoff
@@ -362,9 +543,13 @@ pub struct ConsensusEngine {
     /// (FIFO-bounded, dropped on cold restart) — same trade-off as the witness
     /// cache; the SDK "prefer success over a duplicate's reject" guard covers the
     /// concurrent-arrival race the cache can miss.
-    redeem_idempotency_cache: parking_lot::Mutex<
-        std::collections::VecDeque<(String, RedeemResponse)>,
-    >,
+    /// KI#89: count AND byte bounded like the witness cache (`IdemCache`, CBOR
+    /// values; no duplicate to strip — `receiver_fact_chain` is Core's output and
+    /// not re-derivable). A miss on a RESUMED redeem whose first success reply is
+    /// no longer in the inbox lands in E_CHEQUE_ALREADY_REDEEMED → salvage → may
+    /// quarantine until heal: the sharp edge YP-SDK §4.6a records. Read ONLY
+    /// through `lookup_redeem_response`.
+    redeem_idempotency_cache: parking_lot::Mutex<IdemCache>,
 
     /// §23.14: Pending audit demand from Core.
     /// Stored after Core generates AuditDemand in PublicOutputs.
@@ -379,12 +564,49 @@ pub struct ConsensusEngine {
     /// §23.14.6: Whether a peer-audit request has been sent (prevents resending).
     /// Reset when audit clears or times out.
     peer_audit_sent: std::sync::atomic::AtomicBool,
+    /// §23.14.1 — times the mirror ADOPTED the AVM's demand over a stale copy (KI#215).
+    pub peer_audit_mirror_drift: std::sync::atomic::AtomicU64,
+
+    /// §23.14.6: how many times `pending_peer_audit_outbound` could not resolve
+    /// the demanded target to an email carrier (RULE 3 shape 2 — this used to be
+    /// a `debug!`, so "0 sent" and "never looked" read identically for a month).
+    /// On admin `/audit` as `peer_audit_target_unresolved`. Non-zero and growing
+    /// while a peer audit is pending means the request is NOT going out and the
+    /// AVM will expire it as OUR non-compliance (`AuditTimeout`), not as a ban.
+    peer_audit_target_unresolved: std::sync::atomic::AtomicU64,
+
+    /// §23.14.6 (KI#213): NotHeld replies that CLEARED an audit (target not
+    /// provably a co-witness) / that BANNED (target's own signature on our
+    /// receipt). On admin `/audit`.
+    peer_audit_not_held_cleared: std::sync::atomic::AtomicU64,
+    peer_audit_not_held_banned: std::sync::atomic::AtomicU64,
+    /// Operator counters for the dashboard (2026-09-26): peer audits WE sent
+    /// whose answer Core verified (PASSED), and peer-audit requests from OTHER
+    /// validators that we answered (Held or NotHeld; a dropped forgery is not
+    /// counted). On admin `/audit`; reset on restart.
+    peer_audits_passed: std::sync::atomic::AtomicU64,
+    peer_audit_requests_answered: std::sync::atomic::AtomicU64,
+    /// §23.14.6 / KI#229: answers we BUILT for a requester we hold no hint
+    /// for. `peer_audit_requests_answered` counts at build time, before the
+    /// address lookup; since KI#229 ANTIE mails these to the request's
+    /// envelope `From:` instead of dropping them, and this counts how many
+    /// took that path (non-zero right after a wipe is expected — hints are
+    /// organic). On admin `/audit` as `peer_audit_reply_hint_unresolved`.
+    peer_audit_reply_hint_unresolved: std::sync::atomic::AtomicU64,
+    /// §23.14.3: our carrier failed to send a peer-audit request after hand-off
+    /// (ANTIE relayed it; dispatch un-marked, send retried). On admin `/audit`.
+    peer_audit_dispatch_failed: std::sync::atomic::AtomicU64,
+    /// §23.14.6: a peer-audit reply / NotHeld arrived with NO pending audit —
+    /// late, duplicate, or unsolicited. Dropped, counted (was a `debug!`).
+    peer_audit_reply_unexpected: std::sync::atomic::AtomicU64,
 
     /// YPX-009 §4: Pending Pulse audit request from Core.
     /// When Core emits a PulseAuditRequest, Lambda stores it here.
     /// On next TX, Lambda looks up state_ids from DB, builds raw TxDigests,
     /// and passes PulseAuditResponse to Core for Argon2id→BLAKE3 chain replay.
-    pending_pulse_audit: parking_lot::Mutex<Option<axiom_core_logic::types::PulseAuditRequest>>,
+    /// (2026-09-08) The request is CAPTURED at the AVM exit in `CoreClient`
+    /// (`PulseSink`) for EVERY execution, not just the witness path.
+    pulse: std::sync::Arc<crate::core_client::PulseSink>,
 
     /// Expected Core ID (BLAKE3 hash of axiom-core.elf).
     /// Stored at construction time for DMAP attestation verification.
@@ -405,6 +627,11 @@ pub struct ConsensusEngine {
     oracle_pool: parking_lot::Mutex<axiom_core_logic::oracle::DailyPoolState>,
     /// GAP-O3: Oracle reserve counter — total AXC distributed from 88M reserve.
     oracle_reserve: parking_lot::Mutex<axiom_core_logic::oracle::ReserveCounter>,
+    /// §5.2.2e part iii — per candidate key, the attested tick of its last
+    /// provisional request at THIS issuer (the zero-cost floor beneath the
+    /// Argon2id cost: one request per key per window). In-memory by design:
+    /// a restart forgets it, and the window is a policy, not a ledger.
+    candidacy_requests: parking_lot::Mutex<std::collections::HashMap<[u8; 32], u64>>,
 }
 
 /// Runtime statistics for a validator
@@ -447,6 +674,26 @@ pub struct ValidatorStats {
     pub redeem_errors: std::sync::atomic::AtomicU64,
     /// Double-spend attempts detected (consumed_state_id already ACK'd)
     pub double_spend_count: std::sync::atomic::AtomicU64,
+    /// Fable review 2026-10-01 F-1(a/b): redeems refused EARLY at Step 1b because
+    /// this validator neither holds a row for the receiver nor stores the
+    /// TransactionRecord of its declared state, the declared state is not the
+    /// wallet's OPENING state, and fewer prior-hop overlap sigs were carried than
+    /// the receipt's `sabr_overlap(prev_k)` (`fresh_validator_redeem_refusal`).
+    /// Hygiene; Core CL5 is the enforcement.
+    pub redeem_unanchored_state_refused: std::sync::atomic::AtomicU64,
+    /// Fable review 2026-10-01 F-3: requests refused because their carried OODS
+    /// attestation's tick is more than `ATTESTED_TICK_FUTURE_SKEW_SECS` (300 s)
+    /// ahead of this validator's wall clock (`check_attested_tick_not_future`).
+    pub attested_tick_future_refused: std::sync::atomic::AtomicU64,
+    /// KI#89: idempotency-cache lookups by a NON-empty request_id at the witness
+    /// gate — a hit replays the cached response, a miss proceeds to execute.
+    /// Misses include every first arrival; a retry that MISSES is the window
+    /// running short. `/stats` `idempotency`.
+    pub idempotency_witness_hits: std::sync::atomic::AtomicU64,
+    pub idempotency_witness_misses: std::sync::atomic::AtomicU64,
+    /// KI#89: the same two counters at the redeem gate.
+    pub idempotency_redeem_hits: std::sync::atomic::AtomicU64,
+    pub idempotency_redeem_misses: std::sync::atomic::AtomicU64,
     /// Last error message
     pub last_error: parking_lot::Mutex<String>,
     /// Unix timestamp of last successful TX
@@ -457,8 +704,10 @@ pub struct ValidatorStats {
     pub stats_path: parking_lot::Mutex<Option<std::path::PathBuf>>,
     /// YPX-007: Current proof mode ("dmap" or "zkp")
     pub proof_mode_str: parking_lot::Mutex<String>,
-    /// YPX-007: Whether this validator is ZKP-qualified
-    pub zkp_qualified: std::sync::atomic::AtomicBool,
+    /// YPX-007 §9.3: operator text for the startup qualification run
+    /// (`qualified (gap N)`, `no prover`, `nabla unavailable (T0)`, …). Set with
+    /// the record by `ConsensusEngine::set_zkp_qualification` only.
+    pub zkp_qual_status: parking_lot::Mutex<String>,
     /// Cumulative uptime seconds across all restarts (persisted in stats.json)
     pub cumulative_uptime_secs: std::sync::atomic::AtomicU64,
     /// Cumulative witness count across all restarts
@@ -493,6 +742,12 @@ impl ValidatorStats {
             witness_errors: AtomicU64::new(0),
             redeem_errors: AtomicU64::new(0),
             double_spend_count: AtomicU64::new(0),
+            redeem_unanchored_state_refused: AtomicU64::new(0),
+            attested_tick_future_refused: AtomicU64::new(0),
+            idempotency_witness_hits: AtomicU64::new(0),
+            idempotency_witness_misses: AtomicU64::new(0),
+            idempotency_redeem_hits: AtomicU64::new(0),
+            idempotency_redeem_misses: AtomicU64::new(0),
             last_error: parking_lot::Mutex::new(String::new()),
             last_tx_at: AtomicU64::new(0),
             started_at,
@@ -502,7 +757,7 @@ impl ValidatorStats {
             cumulative_witness_count: AtomicU64::new(0),
             cumulative_redeem_count: AtomicU64::new(0),
             restart_count: AtomicU64::new(0),
-            zkp_qualified: std::sync::atomic::AtomicBool::new(false),
+            zkp_qual_status: parking_lot::Mutex::new("not run".to_string()),
         }
     }
     
@@ -579,7 +834,7 @@ impl ValidatorStats {
         let escaped_err = last_err.replace('\\', "\\\\").replace('"', "\\\"");
         
         let pm = self.proof_mode_str.lock().clone();
-        let zq = self.zkp_qualified.load(std::sync::atomic::Ordering::Relaxed);
+        let zq = self.zkp_qual_status.lock().replace('\\', "\\\\").replace('"', "\\\"");
 
         // Cumulative stats (persist across restarts)
         let session_uptime = now.saturating_sub(self.started_at);
@@ -587,14 +842,17 @@ impl ValidatorStats {
         let cum_witness = self.cumulative_witness_count.load(Relaxed) + wc;
         let cum_redeem = self.cumulative_redeem_count.load(Relaxed) + rc;
         let restarts = self.restart_count.load(Relaxed);
+        let unanchored_refused = self.redeem_unanchored_state_refused.load(Relaxed);
+        let tick_future_refused = self.attested_tick_future_refused.load(Relaxed);
 
         let json = format!(
-            r#"{{"witness":{{"total":{},"success":{},"errors":{},"atoms":{},"avg_ms":{:.1}}},"redeem":{{"total":{},"success":{},"errors":{},"atoms":{},"avg_ms":{:.1}}},"genesis_inits":{},"hints":{},"vbc_verified_at":{},"last_tx_at":{},"last_error":"{}","proof_mode":"{}","zkp_qualified":{},"started_at":{},"updated":{},"cumulative_uptime_secs":{},"cumulative_witness_count":{},"cumulative_redeem_count":{},"restart_count":{}}}"#,
+            r#"{{"witness":{{"total":{},"success":{},"errors":{},"atoms":{},"avg_ms":{:.1}}},"redeem":{{"total":{},"success":{},"errors":{},"atoms":{},"avg_ms":{:.1}}},"genesis_inits":{},"hints":{},"vbc_verified_at":{},"last_tx_at":{},"last_error":"{}","proof_mode":"{}","zkp_qual_status":"{}","started_at":{},"updated":{},"cumulative_uptime_secs":{},"cumulative_witness_count":{},"cumulative_redeem_count":{},"restart_count":{},"refusals":{{"redeem_unanchored_state":{},"attested_tick_future":{}}}}}"#,
             wc, ws, we, aw, avg_witness_ms,
             rc, rs, re, ar, avg_redeem_ms,
             gi, hc, vbc_at, last_tx, escaped_err, pm, zq,
             self.started_at, now,
             cum_uptime, cum_witness, cum_redeem, restarts,
+            unanchored_refused, tick_future_refused,
         );
         // Atomic write: write to temp then rename
         let tmp = path.with_extension("json.tmp");
@@ -626,6 +884,17 @@ impl ValidatorStats {
             std::sync::atomic::Ordering::Relaxed,
         );
     }
+}
+
+/// §23.14.6: what B says back to A's peer-audit request (KI#213).
+#[derive(Debug, Clone)]
+pub enum PeerAuditAnswer {
+    /// B holds the tx: the signed raw fields (KI#207).
+    Held(axiom_core_logic::types::PeerAuditResponse),
+    /// B holds nothing for the txid: a SIGNED statement, never silence.
+    NotHeld(axiom_core_logic::types::PeerAuditNotHeld),
+    /// The request failed authentication (KI#175): not answered at all.
+    Dropped,
 }
 
 impl ConsensusEngine {
@@ -741,8 +1010,11 @@ impl ConsensusEngine {
         let dilithium_pk = ephemeral_dilithium_pk
             .unwrap_or_else(|| vbc.target_vbc.subject_pubkey_dilithium.clone());
 
+        let core_client = CoreClient::new(avm_config)?;
+        let pulse = core_client.pulse_sink();
         let engine = Self {
-            core: RwLock::new(CoreClient::new(avm_config)?),
+            core: RwLock::new(core_client),
+            pulse,
             storage,
             signing_key,
             public_key,
@@ -763,13 +1035,21 @@ impl ConsensusEngine {
             max_fact_links: 16, // dev default
             stats: ValidatorStats::new(),
             proof_mode: "dmap".to_string(),
-            zkp_qualification: parking_lot::Mutex::new(axiom_core_logic::types::QualificationState::default()),
-            witness_idempotency_cache: parking_lot::Mutex::new(std::collections::VecDeque::with_capacity(WITNESS_IDEMPOTENCY_CACHE_CAP)),
-            redeem_idempotency_cache: parking_lot::Mutex::new(std::collections::VecDeque::with_capacity(WITNESS_IDEMPOTENCY_CACHE_CAP)),
+            zkp_qualification: parking_lot::Mutex::new(None),
+            witness_idempotency_cache: parking_lot::Mutex::new(IdemCache::new(WITNESS_IDEMPOTENCY_CACHE_CAP, IDEMPOTENCY_CACHE_BYTES)),
+            redeem_idempotency_cache: parking_lot::Mutex::new(IdemCache::new(WITNESS_IDEMPOTENCY_CACHE_CAP, IDEMPOTENCY_CACHE_BYTES)),
             pending_audit: parking_lot::Mutex::new(None),
             audit_txs_since_demand: std::sync::atomic::AtomicU64::new(0),
             peer_audit_sent: std::sync::atomic::AtomicBool::new(false),
-            pending_pulse_audit: parking_lot::Mutex::new(None),
+            peer_audit_mirror_drift: std::sync::atomic::AtomicU64::new(0),
+            peer_audit_target_unresolved: std::sync::atomic::AtomicU64::new(0),
+            peer_audit_not_held_cleared: std::sync::atomic::AtomicU64::new(0),
+            peer_audit_not_held_banned: std::sync::atomic::AtomicU64::new(0),
+            peer_audits_passed: std::sync::atomic::AtomicU64::new(0),
+            peer_audit_requests_answered: std::sync::atomic::AtomicU64::new(0),
+            peer_audit_reply_hint_unresolved: std::sync::atomic::AtomicU64::new(0),
+            peer_audit_dispatch_failed: std::sync::atomic::AtomicU64::new(0),
+            peer_audit_reply_unexpected: std::sync::atomic::AtomicU64::new(0),
             expected_core_id,
             management_db: None,
             dwp_engine: None,
@@ -777,6 +1057,7 @@ impl ConsensusEngine {
             oracle_bindings: parking_lot::Mutex::new(axiom_core_logic::oracle::BindingTable::new()),
             oracle_pool: parking_lot::Mutex::new(axiom_core_logic::oracle::DailyPoolState::new("1970-01-01", axiom_core_logic::oracle::TOTAL_RESERVE, 0)),
             oracle_reserve: parking_lot::Mutex::new(axiom_core_logic::oracle::ReserveCounter::new()),
+            candidacy_requests: parking_lot::Mutex::new(std::collections::HashMap::new()),
         };
         // Record VBC verification timestamp (verified in load_vbc_from_file)
         engine.stats.vbc_verified_at.store(
@@ -817,8 +1098,11 @@ impl ConsensusEngine {
         let dilithium_pk = ephemeral_dilithium_pk
             .unwrap_or_else(|| vbc.target_vbc.subject_pubkey_dilithium.clone());
 
+        let core_client = CoreClient::new(avm_config)?;
+        let pulse = core_client.pulse_sink();
         let engine = Self {
-            core: RwLock::new(CoreClient::new(avm_config)?),
+            core: RwLock::new(core_client),
+            pulse,
             storage,
             signing_key,
             public_key,
@@ -839,13 +1123,21 @@ impl ConsensusEngine {
             max_fact_links: 16,
             stats: ValidatorStats::new(),
             proof_mode: "dmap".to_string(),
-            zkp_qualification: parking_lot::Mutex::new(axiom_core_logic::types::QualificationState::default()),
-            witness_idempotency_cache: parking_lot::Mutex::new(std::collections::VecDeque::with_capacity(WITNESS_IDEMPOTENCY_CACHE_CAP)),
-            redeem_idempotency_cache: parking_lot::Mutex::new(std::collections::VecDeque::with_capacity(WITNESS_IDEMPOTENCY_CACHE_CAP)),
+            zkp_qualification: parking_lot::Mutex::new(None),
+            witness_idempotency_cache: parking_lot::Mutex::new(IdemCache::new(WITNESS_IDEMPOTENCY_CACHE_CAP, IDEMPOTENCY_CACHE_BYTES)),
+            redeem_idempotency_cache: parking_lot::Mutex::new(IdemCache::new(WITNESS_IDEMPOTENCY_CACHE_CAP, IDEMPOTENCY_CACHE_BYTES)),
             pending_audit: parking_lot::Mutex::new(None),
             audit_txs_since_demand: std::sync::atomic::AtomicU64::new(0),
             peer_audit_sent: std::sync::atomic::AtomicBool::new(false),
-            pending_pulse_audit: parking_lot::Mutex::new(None),
+            peer_audit_mirror_drift: std::sync::atomic::AtomicU64::new(0),
+            peer_audit_target_unresolved: std::sync::atomic::AtomicU64::new(0),
+            peer_audit_not_held_cleared: std::sync::atomic::AtomicU64::new(0),
+            peer_audit_not_held_banned: std::sync::atomic::AtomicU64::new(0),
+            peer_audits_passed: std::sync::atomic::AtomicU64::new(0),
+            peer_audit_requests_answered: std::sync::atomic::AtomicU64::new(0),
+            peer_audit_reply_hint_unresolved: std::sync::atomic::AtomicU64::new(0),
+            peer_audit_dispatch_failed: std::sync::atomic::AtomicU64::new(0),
+            peer_audit_reply_unexpected: std::sync::atomic::AtomicU64::new(0),
             expected_core_id,
             management_db: None,
             dwp_engine: None,
@@ -853,6 +1145,7 @@ impl ConsensusEngine {
             oracle_bindings: parking_lot::Mutex::new(axiom_core_logic::oracle::BindingTable::new()),
             oracle_pool: parking_lot::Mutex::new(axiom_core_logic::oracle::DailyPoolState::new("1970-01-01", axiom_core_logic::oracle::TOTAL_RESERVE, 0)),
             oracle_reserve: parking_lot::Mutex::new(axiom_core_logic::oracle::ReserveCounter::new()),
+            candidacy_requests: parking_lot::Mutex::new(std::collections::HashMap::new()),
         };
         engine.stats.vbc_verified_at.store(
             std::time::SystemTime::now()
@@ -900,36 +1193,186 @@ impl ConsensusEngine {
         }
     }
 
-    /// Run ignition TX sequence (YPX-009 §8.4).
-    ///
-    /// With `pulse-gate` feature: sends ignition TX through Core → ZKVM → Core,
-    /// measuring round-trip time and determining hardware tier. Core stays blocked
-    /// until this completes.
-    ///
-    /// Without `pulse-gate`: Core auto-calibrated at startup, this is a no-op.
-    ///
-    /// Must be called AFTER `configure_proof_tiering()` (needs ZKVM prover if in ZKP mode).
-    pub async fn ignite(&self) -> Result<(), LambdaError> {
-        // Set validator_pk on the persistent AVM (needed for Fiat-Shamir audit seed)
-        {
-            let core = self.core.write().await;
-            core.avm().set_validator_pk(self.public_key.as_bytes().to_vec());
+    /// The background startup task (`server.rs`): [`Self::ignite`], then the
+    /// fail-loud rule. Under `pulse-gate` an ignition that never completed —
+    /// `process_ignition`/`complete_ignition` `Err`, or a PANIC in the task —
+    /// leaves Core blocked with the listener up; that is a HANG, so the process
+    /// exits non-zero for the supervisor to restart, as startup aborted before
+    /// the KI#125 build (Fable review 2026-10-03, finding 1). A Nabla outage, no
+    /// prover or a failed prover all complete the ignition ⇒ never an exit.
+    pub async fn run_ignition(self: Arc<Self>) {
+        let task = tokio::spawn({
+            let engine = self.clone();
+            async move { engine.ignite().await }
+        }).await;
+        let pulse_ready = self.core.read().await.avm().is_pulse_ready();
+        if ignition_end_action(pulse_ready) == IgnitionEnd::ExitRequired {
+            let how = match task {
+                Ok(()) => format!("status: {}", self.stats.zkp_qual_status.lock()),
+                Err(e) => format!("task: {e}"),
+            };
+            error!("YPX-009: ignition did not complete ({how}) — Core is BLOCKED (pulse-gate); \
+                    exiting(1) so the supervisor restarts it (a refusal, never a hang)");
+            std::process::exit(1);
         }
+    }
 
-        #[cfg(feature = "pulse-gate")]
-        {
-            info!("YPX-009: Ignition TX — Core blocked until ZKVM round-trip completes");
+    /// YPX-009 ignition = YPX-007 §9.3 ZKP qualification run (KI#125), at every
+    /// start, in the background: service never waits on Nabla or the prover —
+    /// every outcome is a status line and, on a Core Accept only, a record. With
+    /// `pulse-gate` the AVM blocks execution until `complete_ignition` (YPX-009
+    /// §6.1a); [`Self::run_ignition`] exits if it never completes. The proof runs
+    /// in `spawn_blocking` with the prover taken out — the Core lock is held only
+    /// to build the job and to hand the prover back (finding 2).
+    pub async fn ignite(&self) {
+        let t0 = self.fetch_oods_reading().await;
+        let (avm, mut prover, inputs) = {
             let mut core = self.core.write().await;
-            core.ignite()?;
-        }
+            let challenge = t0.as_ref().map(|a| axiom_core_logic::compute::compute_zkq_challenge(
+                &self.validator_id, &core.avm_config.core_id, &a.nabla_signature));
+            core.ignition_job(challenge)
+        };
+        let ignition = match tokio::task::spawn_blocking(move || {
+            let result = CoreClient::ignite(&avm, prover.as_mut(), inputs);
+            (result, prover)
+        }).await {
+            Ok((result, prover)) => {
+                self.core.write().await.restore_prover(prover);
+                result
+            }
+            // A panic inside the ignition/prover (the prover is lost with it).
+            Err(e) => Err(LambdaError::CoreExecutionError(format!("ignition task: {e}"))),
+        };
+        let (record, status) = match (ignition, t0) {
+            (Err(e), _) => (None, format!("ignition failed: {e}")),
+            (Ok(None), _) => (None, "no prover".to_string()),
+            (Ok(Some(Err(e))), _) => (None, format!("prover failed: {e}")),
+            (Ok(Some(Ok(_))), None) => (None, "nabla unavailable (T0)".to_string()),
+            (Ok(Some(Ok(receipt))), Some(t0)) => self.qualify(t0, receipt).await,
+        };
+        self.set_zkp_qualification(record, status);
+    }
 
-        #[cfg(not(feature = "pulse-gate"))]
+    /// §9.3 steps 3–5: host-verify the receipt, fetch T1, let Core judge + sign.
+    async fn qualify(
+        &self,
+        t0: axiom_core_logic::types::NablaOodsAttestation,
+        receipt: axiom_zk_vm::ZkvmReceipt,
+    ) -> (Option<axiom_core_logic::types::ZkpQualificationRecord>, String) {
+        let checkpoint = match axiom_zk_vm::ZkvmVerifier::production()
+            .and_then(|v| v.verify_checkpoint(&receipt))
         {
-            // Auto-calibrated at AVM construction — nothing to do
-            debug!("YPX-009: pulse-gate disabled, Core auto-calibrated at startup");
+            Ok(c) => c,
+            Err(e) => return (None, format!("receipt rejected: {e}")),
+        };
+        let Some(journal_nonce_hash) = checkpoint.zkp_nonce_hash else {
+            return (None, "receipt rejected: journal carries no zkp_nonce_hash".to_string());
+        };
+        let Some(t1) = self.fetch_oods_reading().await else {
+            return (None, "nabla unavailable (T1)".to_string());
+        };
+        let ticks = format!("T0 tick {}, T1 tick {}", t0.tick, t1.tick);
+        let request = axiom_core_logic::types::ZkpQualifyRequest {
+            att_after: t1, program_digest: receipt.program_digest, journal_nonce_hash,
+        };
+        let audit = self.resolve_audit_confirmation(&None);
+        let core = self.core.read().await;
+        match core.run_zkp_qualify(t0, request, self.validator_id, self.dilithium_pk.clone(),
+                                   self.dilithium_sk.clone(), audit) {
+            Ok(record) => {
+                let gap = record.att_after.tick - record.att_before.tick; // Core: after ≥ before
+                (Some(record), format!("qualified (gap {gap})"))
+            }
+            Err(LambdaError::CoreRejected(reason)) => (None, format!("{reason} ({ticks})")),
+            Err(e) => (None, format!("ZkpQualify failed: {e} ({ticks})")),
         }
+    }
 
-        Ok(())
+    /// The ONE writer of the qualification record + its status (YPX-007 §9.3).
+    pub fn set_zkp_qualification(
+        &self,
+        record: Option<axiom_core_logic::types::ZkpQualificationRecord>,
+        status: String,
+    ) {
+        if record.is_some() {
+            info!("YPX-007 §9: ZKP qualification — {status}");
+        } else {
+            warn!("YPX-007 §9: no ZKP qualification record — {status} (service unaffected)");
+        }
+        *self.zkp_qualification.lock() = record;
+        *self.stats.zkp_qual_status.lock() = status;
+    }
+
+    /// One Nabla TCP-CBOR exchange (CLAUDE.md §8, Rule 2): 4-byte big-endian
+    /// length prefix, CBOR `WireMessage`, 5 s deadline, 64 KB response cap. The
+    /// response is externally tagged; returns the inner value of variant `expect`.
+    /// Shared by the stake proof, the PulseProof forward and the OODS reading.
+    ///
+    /// TODO: make nabla_addr configurable via lambda-config.toml (multi-host deployment)
+    /// TCP port = HTTP port + 1074 (HTTP 6226 → TCP 7300, node alpha).
+    async fn nabla_tcp_request(
+        request: &axiom_core_logic::nabla_wire::WireMessage,
+        expect: &str,
+    ) -> Result<ciborium::value::Value, String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let nabla_addr = "127.0.0.1:7300";
+        let mut cbor_req = Vec::new();
+        ciborium::ser::into_writer(request, &mut cbor_req).map_err(|e| format!("CBOR encode: {e}"))?;
+        let mut framed = Vec::with_capacity(4 + cbor_req.len());
+        framed.extend_from_slice(&(cbor_req.len() as u32).to_be_bytes());
+        framed.extend_from_slice(&cbor_req);
+
+        let mut stream = tokio::net::TcpStream::connect(nabla_addr).await
+            .map_err(|e| format!("cannot connect to Nabla at {nabla_addr}: {e}"))?;
+        stream.write_all(&framed).await.map_err(|e| format!("Nabla write failed: {e}"))?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut len_buf = [0u8; 4];
+        tokio::time::timeout_at(deadline, stream.read_exact(&mut len_buf)).await
+            .map_err(|_| "Nabla length-prefix read timeout".to_string())?
+            .map_err(|e| format!("Nabla length-prefix read error: {e}"))?;
+        let resp_len = u32::from_be_bytes(len_buf) as usize;
+        // Cap at 64KB to prevent a malicious Nabla from OOM-ing Lambda.
+        const MAX_RESPONSE: usize = 65536;
+        if resp_len > MAX_RESPONSE {
+            return Err(format!("Nabla response {resp_len}B exceeds {MAX_RESPONSE}B limit"));
+        }
+        let mut buf = vec![0u8; resp_len];
+        tokio::time::timeout_at(deadline, stream.read_exact(&mut buf)).await
+            .map_err(|_| "Nabla body read timeout".to_string())?
+            .map_err(|e| format!("Nabla body read error: {e}"))?;
+
+        // Nabla's server enum is externally tagged: `{"<Variant>": {...}}`.
+        let envelope: ciborium::value::Value = ciborium::de::from_reader(buf.as_slice())
+            .map_err(|e| format!("invalid Nabla CBOR response: {e}"))?;
+        match envelope.as_map().and_then(|m| m.first()) {
+            Some((k, v)) if k.as_text() == Some(expect) => Ok(v.clone()),
+            Some((k, _)) => Err(format!("unexpected Nabla response variant: {:?}",
+                                        k.as_text().unwrap_or("<non-text>"))),
+            None => Err("malformed Nabla response (not a tagged map)".to_string()),
+        }
+    }
+
+    /// YPX-007 §9.3 — one Nabla-signed OODS reading (the existing
+    /// `OodsReadingRequest`). `None` = Nabla unreachable / no NBC loaded yet:
+    /// the qualification run then produces no record; service is unaffected.
+    async fn fetch_oods_reading(&self) -> Option<axiom_core_logic::types::NablaOodsAttestation> {
+        let request = axiom_core_logic::nabla_wire::WireMessage::OodsReadingRequest(
+            axiom_core_logic::wire_client::OodsReadingRequest {},
+        );
+        let inner = match Self::nabla_tcp_request(&request, "OodsReadingResponse").await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("YPX-007 §9: OODS reading unavailable: {e}");
+                return None;
+            }
+        };
+        match inner.deserialized::<axiom_core_logic::wire_client::OodsReadingResponse>() {
+            Ok(r) => r.attestation,
+            Err(e) => {
+                warn!("YPX-007 §9: cannot decode OodsReadingResponse: {e}");
+                None
+            }
+        }
     }
 
     /// Synchronous version of configure_proof_tiering for use during startup.
@@ -947,30 +1390,12 @@ impl ConsensusEngine {
         }
     }
 
-    /// Run ignition TX sequence synchronously (YPX-009 §8.4).
-    ///
-    /// Same as `ignite()` but callable from non-async context (before engine
-    /// is wrapped in Arc). Called from `LambdaServer::new()` during startup.
-    pub fn ignite_sync(&mut self) -> Result<(), LambdaError> {
-        // Set validator_pk on the persistent AVM
-        {
-            let core = self.core.get_mut();
-            core.avm().set_validator_pk(self.public_key.as_bytes().to_vec());
-        }
-
-        #[cfg(feature = "pulse-gate")]
-        {
-            info!("YPX-009: Ignition TX — Core blocked until ZKVM round-trip completes");
-            let core = self.core.get_mut();
-            core.ignite()?;
-        }
-
-        #[cfg(not(feature = "pulse-gate"))]
-        {
-            debug!("YPX-009: pulse-gate disabled, Core auto-calibrated at startup");
-        }
-
-        Ok(())
+    /// Bind this validator's Ed25519 pk into the persistent AVM (the Fiat-Shamir
+    /// audit seed) — synchronously at startup, BEFORE any execution. The ignition
+    /// itself runs in the background (`ignite`).
+    pub fn bind_avm_validator_pk(&mut self) {
+        let core = self.core.get_mut();
+        core.avm().set_validator_pk(self.public_key.as_bytes().to_vec());
     }
 
     /// Get current proof mode ("zkp" or "dmap")
@@ -1098,105 +1523,16 @@ impl ConsensusEngine {
     pub async fn fetch_own_nabla_stake_proof(&self) -> Option<axiom_core_logic::types::NablaStakeProof> {
         let wallet_pk: [u8; 32] = self.public_key.to_bytes();
 
-        // 1. Query Nabla for our wallet state.
-        //
-        // TCP CBOR wire (CLAUDE.md §8, Rule 2). Pre-migration this issued a
-        // raw `GET /query?wallet_pk=<hex>` over the Nabla HTTP port; Phase
-        // 3a-B gated `/query` to `410 Gone`. We now send a length-prefixed
-        // CBOR `WireMessage::QueryWalletStateRequest` over the Nabla TCP
-        // port and decode the typed `QueryWalletStateResponse` — no JSON,
-        // no hex round-trip (the typed struct carries native byte fields).
-        //
-        // TODO: make nabla_addr configurable via lambda-config.toml (multi-host deployment)
-        // TCP port = HTTP port + 1074 (HTTP 6226 → TCP 7300, node alpha).
-        let nabla_addr = "127.0.0.1:7300";
-
-        // Build the request envelope and frame it: 4-byte big-endian
-        // length prefix, then the CBOR payload (Nabla TCP framing).
+        // 1. Query Nabla for our wallet state — TCP CBOR wire (CLAUDE.md §8,
+        // Rule 2; `/query` HTTP is 410 Gone): `WireMessage::QueryWalletStateRequest`
+        // → the typed `QueryWalletStateResponse` (native byte fields, no hex).
         let request = axiom_core_logic::nabla_wire::WireMessage::QueryWalletStateRequest(
             axiom_core_logic::wire_client::QueryWalletStateRequest { wallet_pk },
         );
-        let mut cbor_req = Vec::new();
-        if let Err(e) = ciborium::ser::into_writer(&request, &mut cbor_req) {
-            warn!("Oracle stake proof: CBOR encode QueryWalletStateRequest failed: {}", e);
-            return None;
-        }
-        let mut framed = Vec::with_capacity(4 + cbor_req.len());
-        framed.extend_from_slice(&(cbor_req.len() as u32).to_be_bytes());
-        framed.extend_from_slice(&cbor_req);
-
-        let resp_cbor: Vec<u8> = match tokio::net::TcpStream::connect(nabla_addr).await {
-            Ok(mut stream) => {
-                use tokio::io::{AsyncWriteExt, AsyncReadExt};
-                if let Err(e) = stream.write_all(&framed).await {
-                    warn!("Oracle stake proof: Nabla write failed: {}", e);
-                    return None;
-                }
-                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-                // Read the 4-byte length prefix.
-                let mut len_buf = [0u8; 4];
-                match tokio::time::timeout_at(deadline, stream.read_exact(&mut len_buf)).await {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(e)) => {
-                        warn!("Oracle stake proof: Nabla length-prefix read error: {}", e);
-                        return None;
-                    }
-                    Err(_) => {
-                        warn!("Oracle stake proof: Nabla length-prefix read timeout");
-                        return None;
-                    }
-                }
-                let resp_len = u32::from_be_bytes(len_buf) as usize;
-                // Cap at 64KB to prevent a malicious Nabla from OOM-ing Lambda.
-                const MAX_RESPONSE: usize = 65536;
-                if resp_len > MAX_RESPONSE {
-                    warn!("Oracle stake proof: Nabla response {}B exceeds {}B limit",
-                        resp_len, MAX_RESPONSE);
-                    return None;
-                }
-                let mut buf = vec![0u8; resp_len];
-                match tokio::time::timeout_at(deadline, stream.read_exact(&mut buf)).await {
-                    Ok(Ok(_)) => buf,
-                    Ok(Err(e)) => {
-                        warn!("Oracle stake proof: Nabla body read error: {}", e);
-                        return None;
-                    }
-                    Err(_) => {
-                        warn!("Oracle stake proof: Nabla body read timeout");
-                        return None;
-                    }
-                }
-            }
+        let inner = match Self::nabla_tcp_request(&request, "QueryWalletStateResponse").await {
+            Ok(v) => v,
             Err(e) => {
-                warn!("Oracle stake proof: cannot connect to Nabla at {}: {}", nabla_addr, e);
-                return None;
-            }
-        };
-
-        // 2. Decode the Nabla response.
-        //
-        // Nabla's server enum (`axiom_nabla::transport::WireMessage`) is
-        // externally tagged: `{"QueryWalletStateResponse": {...}}`. We
-        // decode the envelope as a `ciborium::Value`, confirm the variant
-        // key, then deserialize the inner value into the shared typed
-        // struct from `axiom_core_logic::wire_client` — no mirror struct.
-        let envelope: ciborium::value::Value =
-            match ciborium::de::from_reader(resp_cbor.as_slice()) {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!("Oracle stake proof: invalid Nabla CBOR response: {}", e);
-                    return None;
-                }
-            };
-        let inner = match envelope.as_map().and_then(|m| m.first()) {
-            Some((k, v)) if k.as_text() == Some("QueryWalletStateResponse") => v.clone(),
-            Some((k, _)) => {
-                warn!("Oracle stake proof: unexpected Nabla response variant: {:?}",
-                    k.as_text().unwrap_or("<non-text>"));
-                return None;
-            }
-            None => {
-                warn!("Oracle stake proof: malformed Nabla response (not a tagged map)");
+                warn!("Oracle stake proof: {}", e);
                 return None;
             }
         };
@@ -1215,7 +1551,6 @@ impl ConsensusEngine {
         }
 
         let nabla_tick = nabla_resp.synced_to_tick;
-        let role_str = nabla_resp.role.as_str();
 
         // `current_state` and `node_id` arrive as native byte fields on
         // the typed response — no hex decoding. Validate the lengths.
@@ -1227,7 +1562,6 @@ impl ConsensusEngine {
                 return None;
             }
         };
-        let nabla_node_pk: [u8; 32] = nabla_resp.node_id;
 
         // 3. Get our wallet state from storage — balance + scar count
         let wallet_state = match self.storage.get_wallet_state(&wallet_pk, axiom_core_logic::wallet_id::K_DEFAULT, axiom_core_logic::wallet_id::PROOF_TYPE_DMAP) {
@@ -1275,28 +1609,33 @@ impl ConsensusEngine {
         let scar_count = 0u32;
 
         // 6. Build NablaStakeProof
-        // Note: Core step 3e for oracle only checks balance + scar_count.
-        // The full 7-step Nabla attestation verification is CL8-only.
-        // We still populate all fields for forward compatibility.
-        let nabla_role = if role_str == "writer" { 1u8 } else { 0u8 };
-        // `role_signature` arrives as a native byte field on the typed
-        // response (post HTTP→TCP migration) — no hex decode step.
-        let nabla_signature = nabla_resp.role_signature.clone();
+        // Core step 3e for oracle reads only balance + scar_count. KI#249
+        // (2026-10-02): the unread "Nabla attestation" fields (node pk, an
+        // always-empty signature since KI#247, attested state, tick, role) were
+        // DELETED from the Core type — nothing ever verified them. The Nabla
+        // query above still gates the proof (REGISTERED + state_id match).
 
         info!("Oracle stake proof: balance={}, scar_count={}, nabla_tick={}",
             wallet_state.balance, scar_count, nabla_tick);
 
+        // YP §17.3.1.4 v2.19.0 (KI#150): `required_k` is the k of the receipt
+        // whose signatures the proof carries — the wallet's last STORED receipt
+        // when one exists. With no receipt there is nothing to judge: empty
+        // sigs, required_k = 0 (never a literal 3).
+        let (receipt_signatures, required_k) = match wallet_state
+            .last_tx_id
+            .and_then(|txid| self.storage.get_receipt(&txid).ok().flatten())
+        {
+            Some(r) => (r.witness_sigs, r.required_k),
+            None => (Vec::new(), 0),
+        };
         Some(axiom_core_logic::types::NablaStakeProof {
-            nabla_node_pk,
-            nabla_signature,
-            attested_state_id: nabla_state_id,
-            nabla_tick,
-            nabla_role,
             wallet_pk,
             balance: wallet_state.balance,
-            receipt_signatures: vec![], // Oracle step 3e doesn't verify receipts
+            receipt_signatures,
             receipt_state_id: nabla_state_id,
             scar_count,
+            required_k,
         })
     }
     
@@ -1378,6 +1717,281 @@ impl ConsensusEngine {
     /// mvib_binding (subject_validator_id → issuer_validator_id). The candidate
     /// must collect 3 independent approvals (enforced by record_mvib_binding).
     /// MV-set members inherit JFP witness role if this validator becomes absent.
+    /// Phase 2 of VBC issuance: sign the candidate's certificate via Core and
+    /// record the approval (`AXIOM_DESIGN_ValidatorJoin.md` §6a).
+    ///
+    /// Ordering is deliberate. The Phase-1 checks are re-run here rather than
+    /// trusted: approve and commit are separate round trips, so a caller could
+    /// go straight to commit, and Lambda owns the signing budget even though
+    /// Core owns validity.
+    ///
+    /// **Retry safety (§6.1).** Signing is deterministic, so a re-submission
+    /// returns byte-identical bytes without storing anything. Only the budget
+    /// decrement is guarded, keyed on `validator_id` — something the candidate
+    /// still holds after a crash. Signing is NOT gated on that key: refusing
+    /// to re-sign for a known validator would permanently strand a candidate
+    /// whose stake was granted but whose VBC round failed, leaving it holding
+    /// a locked stake it can neither spend nor use.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_vbc_sign(
+        &self,
+        sphincs_pk_hex: &str,
+        ed25519_pk_hex: &str,
+        proof_cap: &str,
+        node_name: &str,
+        issued_at: u64,
+        expires_at: u64,
+        chain_depth: u8,
+        issuer_set_hex: &[String],
+        request_id: &str,
+        // RENEWAL (AXIOM_DESIGN_ValidatorJoin.md §5.2): the certificate being
+        // renewed. `None` = initial issuance. Carried by the requester and
+        // verified here — verification is self-contained (§5.3a), so nothing
+        // is looked up or propagated.
+        previous_vbc: Option<axiom_core_logic::types::VBCProofBundle>,
+        // Current time in unix seconds — the same source the surrounding cert
+        // path uses (`approve_vbc_sign_request`). NOT an attested TARDIS tick:
+        // Lambda has no tick source, it does not participate in the cascade.
+        //
+        // ⚠ This means a validator's own clock influences whether its cert is
+        // judged expired or in-window. Bounded by `expires_at` being inside
+        // the issuer-signed cert, and by renewal needing THREE independent
+        // issuers to agree — one skewed clock does not decide it alone.
+        // Sourcing an attested tick is deferred: KI#130.
+        now_secs: u64,
+        // §5.3 — carried from the request; CL8 needs its attested tick.
+        oods_attestation: Option<axiom_core_logic::types::NablaOodsAttestation>,
+        // §5.2.2d — THE CERTIFICATE AS THE CANDIDATE PRESENTED IT.
+        //
+        // `Some` on the VbcRequest transaction path: sign THIS document, do not
+        // rebuild one. `None` on the legacy gateway door, which has only the
+        // scalars above and no issuer certificates.
+        //
+        // ⚠ WHY THIS PARAMETER EXISTS (2026-09-04). The scalar list is not the
+        // whole certificate. Three fields have no parameter here —
+        // `genesis_lineage`, `network_size_baseline`, `baseline_tick` — and the
+        // reconstruction below hardcodes all three to zero, along with an EMPTY
+        // `supporting_vbcs`. So the request path signed a DIFFERENT certificate
+        // than the candidate assembled, and CL8 refused it at the first §5.3
+        // issuer lookup because the issuers' own certs had been dropped on the
+        // way in. Even had it signed, the three signatures would have covered a
+        // document the candidate does not hold — which is exactly what
+        // `validator_join.rs::assemble` predicts and reports.
+        //
+        // This is the ANTIE `build_wallet_state` shape (CLAUDE.md §8): a layer
+        // SYNTHESIZING a structure it was handed. A signing function must not
+        // invent the fields of the thing it signs.
+        requested: Option<&axiom_core_logic::types::VBCProofBundle>,
+        // §5.2.2e — the epoch CL8 judges the candidacy Pulse against: the
+        // request transaction's on the VbcRequest path, the caller's clock on
+        // the gateway door (no transaction there). See `run_cl8`.
+        tx_epoch: u64,
+    ) -> Result<(Vec<u8>, Vec<u8>, [u8; 32]), LambdaError> {
+        // 1. Re-check the Phase-1 preconditions.
+        let approval = self.approve_vbc_sign_request(ed25519_pk_hex, proof_cap)?;
+        if !approval.approved {
+            return Err(LambdaError::InvalidRequest(format!(
+                "VBC commit refused: {}",
+                approval.reason.unwrap_or_else(|| "not approved".into())
+            )));
+        }
+
+        let sphincs_pk = hex::decode(sphincs_pk_hex)
+            .map_err(|e| LambdaError::InvalidRequest(format!("bad sphincs_pk hex: {e}")))?;
+        let ed25519_pk = hex::decode(ed25519_pk_hex)
+            .map_err(|e| LambdaError::InvalidRequest(format!("bad ed25519_pk hex: {e}")))?;
+        let issuer_set = issuer_set_hex.iter()
+            .map(|h| hex::decode(h))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| LambdaError::InvalidRequest(format!("bad issuer_set hex: {e}")))?;
+
+        let validator_id = *blake3::hash(&sphincs_pk).as_bytes();
+        let validator_id_hex = hex::encode(validator_id);
+
+        // ── RENEWAL GATE ──────────────────────────────────────────────────
+        // Three rules, mirroring `cc.rs::renew_nbc`: the cert must verify, it
+        // must not have expired, and it must be inside its renewal window.
+        let founding_vbc_hash = match &previous_vbc {
+            None => [0u8; 32], // initial issuance — no lineage yet
+            Some(prev) => {
+                // (a) It must be a real certificate. Chain-to-root, so this is
+                //     self-contained: no lookup, no propagation (§5.3a).
+                axiom_core_logic::vbc::verify_vbc_bundle(prev, now_secs)
+                    .map_err(|e| LambdaError::InvalidRequest(
+                        format!("previous VBC does not verify: {e:?}")))?;
+
+                // (b) ⚠ SAME VALIDATOR. Without this, ANY holder of a valid
+                //     certificate could present someone else's cert and
+                //     inherit their lineage — heritage theft. The subject key
+                //     is covered by the issuer signature verified in (a), so
+                //     it cannot be swapped after the fact.
+                if prev.target_vbc.subject_pubkey_sphincs != sphincs_pk {
+                    return Err(LambdaError::InvalidRequest(
+                        "previous VBC belongs to a different validator".into()));
+                }
+
+                // (c) Expired certs are NOT renewable. This is what makes
+                //     heritage loss real rather than advisory: let it lapse
+                //     and you return as a stranger with a fresh lineage.
+                //     In-window is checked by the same helper.
+                if !axiom_core_logic::validation::vbc_can_renew(
+                    prev.target_vbc.expires_at, now_secs)
+                {
+                    return Err(LambdaError::InvalidRequest(format!(
+                        "previous VBC not renewable at {now_secs}: expires_at={} \
+                         (expired, or renewal window not yet open)",
+                        prev.target_vbc.expires_at,
+                    )));
+                }
+
+                // Lineage: the founding hash is the FIRST-EVER cert's hash.
+                // A cert still carrying [0;32] IS that first one, so its own
+                // hash becomes the anchor; afterwards it is carried unchanged.
+                if prev.target_vbc.founding_vbc_hash == [0u8; 32] {
+                    axiom_core_logic::compute::compute_vbc_signing_payload(&prev.target_vbc)
+                } else {
+                    prev.target_vbc.founding_vbc_hash
+                }
+            }
+        };
+
+        let bundle = match requested {
+            // ── THE REQUEST PATH: sign the document as presented ──────────
+            //
+            // Verbatim, with ONE exception class: the fields this validator
+            // DERIVES rather than accepts. Those are checked, not overwritten
+            // — silently rewriting them would produce a valid signature over a
+            // certificate the candidate is not holding, which is the failure
+            // this whole change exists to remove.
+            Some(req) => {
+                // The rule lives in a free function so a test can drive it
+                // WITHOUT an engine, a mesh, or a Core round trip — a check
+                // that cannot be driven cannot be shown to fail (RULE 6 §3a).
+                // `signatures` empty and the subject binding are enforced
+                // separately by `check_vbc_request_shape` at the one caller
+                // that passes `Some` here.
+                check_issuer_derived_fields(
+                    &req.target_vbc, validator_id, founding_vbc_hash,
+                    oods_attestation.as_ref(),
+                ).map_err(LambdaError::InvalidRequest)?;
+                req.clone()
+            }
+            // ── THE LEGACY GATEWAY DOOR: only scalars exist ───────────────
+            // ⚠ It can therefore only ever produce a depth-0-shaped cert with
+            // no lineage and no issuer certificates. That is why §5.3 refuses
+            // anything it builds at depth>0, and why this door has no emitter
+            // (handoff §7). Do not build a client for it without a ruling.
+            None => axiom_core_logic::types::VBCProofBundle {
+                target_vbc: axiom_core_logic::types::VBC {
+                    network_size_baseline: 0,
+                    baseline_tick: 0,
+                    version: 0x09,
+                    validator_id,
+                    subject_pubkey_sphincs: sphincs_pk.clone(),
+                    subject_pubkey_dilithium: vec![],
+                    subject_pubkey_ed25519: ed25519_pk,
+                    pgp_fingerprint: vec![],
+                    node_name: node_name.to_string(),
+                    issued_at,
+                    expires_at,
+                    chain_depth,
+                    issuer_set,
+                    signatures: vec![],
+                    proof_cap: proof_cap.to_string(),
+                    max_tx: 0,
+                    founding_vbc_hash,
+                    genesis_lineage: [0u8; 32],
+                    nabla_registration: None,
+                },
+                supporting_vbcs: vec![],
+                candidacy_pulse: None, renewal_work_receipt: None,
+            },
+        };
+
+        // 2. Core signs. A VBC-shaped cert with no stake proof is refused
+        //    inside CL8 (§7.1) — Lambda does not second-guess that here.
+        //    §23.14.6: a CL8 execution counts against a pending self demand like
+        //    any other, so mirror the AVM first and carry the resolved
+        //    confirmation (measured 2026-09-24: an empty tick per issuance).
+        self.sync_audit_mirror().await;
+        let cl8_audit = self.resolve_audit_confirmation(&None);
+        let signature = {
+            let core = self.core.read().await;
+            core.run_cl8(&bundle, &self._sphincs_sk, oods_attestation, tx_epoch, cl8_audit)?
+        };
+
+        // 2a. CORE-VERIFIED, and verified again at this boundary.
+        //
+        // The commitment is computed by CORE's own function, never rebuilt
+        // here — a Lambda-side reimplementation would be a second definition
+        // of what was signed, and the two would drift.
+        //
+        // CL8 already fail-stop verifies its own signature before returning
+        // Accept (`modes.rs` Step 3). Re-verifying here is deliberate defence
+        // in depth: it means Lambda never hands out, records, or spends budget
+        // on a signature it has not itself seen verify against Core's
+        // commitment. A signature that reaches this line and fails is a Core
+        // or transport fault, and must abort BEFORE the budget decrement —
+        // otherwise a bad sign would silently consume one of six.
+        let commitment = axiom_core_logic::compute::compute_vbc_signing_payload(
+            &bundle.target_vbc);
+        if axiom_core_logic::verify::verify_sphincs(
+            &self._sphincs_pk, &commitment, &signature).is_err()
+        {
+            return Err(LambdaError::CoreExecutionError(format!(
+                "CL8 returned a signature that does NOT verify against Core's \
+                 commitment for validator {validator_id_hex} — refusing to \
+                 record or decrement budget"
+            )));
+        }
+
+        // 3. Budget: decrement ONCE per validator, ever — on its first FULL
+        //    certificate. A PROVISIONAL certificate (§5.2.2b: the candidacy
+        //    binding, ≤ 12 h, no service rights) does NOT spend budget (the owner,
+        //    2026-09-08): the budget guards the OFFICE, and with a free
+        //    provisional request six junk candidates would otherwise retire an
+        //    issuer (production budget 6; dev twin 100). The "spent" marker is
+        //    separate from `approved_validators`, which a provisional also
+        //    writes as its retry/idempotency record.
+        let provisional = axiom_core_logic::validation::vbc_is_provisional(
+            bundle.target_vbc.issued_at, bundle.target_vbc.expires_at);
+        if provisional {
+            info!("VBC commit: signed PROVISIONAL for {} (budget NOT decremented)", validator_id_hex);
+        } else if !self.storage.is_vbc_budget_spent(&validator_id_hex)? {
+            let remaining = self.storage.decrement_vbc_signs_remaining()?;
+            self.storage.mark_vbc_budget_spent(&validator_id_hex)?;
+            info!("VBC commit: signed {} ({} signs remaining)", validator_id_hex, remaining);
+        } else {
+            info!("VBC commit: re-signed {} (retry — budget NOT decremented)", validator_id_hex);
+        }
+
+        // 4. Record (INSERT OR REPLACE — safe on retry).
+        self.storage.record_validator_approval(
+            &validator_id_hex, sphincs_pk_hex, ed25519_pk_hex, proof_cap, node_name, request_id,
+        )?;
+
+        Ok((signature, self._sphincs_pk.clone(), commitment))
+    }
+
+/// The VBC signing budget, as a `u8` — the width `vbc_signs_remaining` is stored in.
+///
+/// ONE owner for the register (`protocol_lambda.toml` `vbc_signs_budget`); the
+/// three call sites below used to hardcode `6` independently, which is how a
+/// value nobody could see stayed invisible until it exhausted mid-test.
+///
+/// ⚠ FAILS THE BUILD rather than truncating. The counter is a `u8`, so a
+/// register of 300 would silently become 44 — a SMALLER budget than intended,
+/// arriving as a "raise". A compile error is the only honest response to a
+/// number that cannot be represented.
+const fn vbc_signs_budget_u8() -> u8 {
+    const BUDGET: u64 = crate::tuning_gen::VBC_SIGNS_BUDGET;
+    // const-eval: indexing past the end is a compile-time error, so an
+    // out-of-range register cannot reach a running validator.
+    ["vbc_signs_budget exceeds u8 — the stored counter cannot hold it"]
+        [(BUDGET > u8::MAX as u64) as usize];
+    BUDGET as u8
+}
+
     pub fn approve_vbc_sign_request(
         &self,
         _ed25519_pk_hex: &str,
@@ -1399,7 +2013,8 @@ impl ConsensusEngine {
                     "VBC not mature enough to approve new validators ({} seconds remaining)",
                     remaining
                 )),
-                signs_remaining: self.storage.get_vbc_signs_remaining().unwrap_or(6),
+                signs_remaining: self.storage.get_vbc_signs_remaining()
+                    .unwrap_or(Self::vbc_signs_budget_u8()),
                 our_chain_depth,
                 accepted_proof_cap: String::new(),
             });
@@ -1410,7 +2025,8 @@ impl ConsensusEngine {
             return Ok(VBCSignApproval {
                 approved: false,
                 reason: Some(format!("Invalid proof_cap: {}", proof_cap)),
-                signs_remaining: self.storage.get_vbc_signs_remaining().unwrap_or(6),
+                signs_remaining: self.storage.get_vbc_signs_remaining()
+                    .unwrap_or(Self::vbc_signs_budget_u8()),
                 our_chain_depth,
                 accepted_proof_cap: String::new(),
             });
@@ -1418,7 +2034,9 @@ impl ConsensusEngine {
 
         // Check signing budget
         let signs_remaining = self.storage.get_vbc_signs_remaining()
-            .unwrap_or(6); // Default budget of 6
+            // Tuning register `vbc_signs_budget` (protocol_lambda.toml), not a
+            // literal — the three sites used to hardcode 6 independently.
+            .unwrap_or(Self::vbc_signs_budget_u8());
 
         if signs_remaining == 0 {
             return Ok(VBCSignApproval {
@@ -1434,33 +2052,18 @@ impl ConsensusEngine {
         // validators — a cartel would need near-total control to block all renewal paths.
         // No genesis special authority needed. No forced obligation.
 
-        // Check requester's stake against protocol threshold (White Paper §4.13).
-        // 500 AXC minimum stake for validator participation.
-        // dev-mode: 0 (allows testing without funded wallets).
-        #[cfg(not(feature = "dev-mode"))]
-        let min_stake: u64 = 500;
-        #[cfg(feature = "dev-mode")]
-        let min_stake: u64 = 0;
-        if min_stake > 0 {
-            // SECURITY FIX #11: Fail on invalid hex — unwrap_or_default silently
-            // produces empty bytes, bypassing the stake check entirely.
-            let pk_bytes = hex::decode(_ed25519_pk_hex)
-                .map_err(|e| LambdaError::InvalidRequest(format!("Invalid Ed25519 PK hex: {}", e)))?;
-            let requester_balance = self.storage.get_wallet_state(&pk_bytes, axiom_core_logic::wallet_id::K_DEFAULT, axiom_core_logic::wallet_id::PROOF_TYPE_DMAP)?
-                .map(|ws| ws.balance)
-                .unwrap_or(0);
-            if requester_balance < min_stake {
-                return Ok(VBCSignApproval {
-                    approved: false,
-                    reason: Some(format!(
-                        "Insufficient stake: {} atoms (need {})", requester_balance, min_stake
-                    )),
-                    signs_remaining,
-                    our_chain_depth,
-                    accepted_proof_cap: String::new(),
-                });
-            }
-        }
+        // ⚠ REMOVED 2026-09-08 — a pre-§5.2.2 "500 AXC minimum stake" pre-check
+        // lived here (it was 500 ATOMS in non-dev builds and 0 under dev-mode,
+        // read from THIS Lambda's local S-ABR store — 0 for any wallet it had
+        // never seen). It pre-judged what Core CL8 step 0f decides from the
+        // k-ANCHORED balance: at or above the floor → FULL certificate; below →
+        // PROVISIONAL (≤ 12 h, no service rights). Design §5.2.2: "nobody asks
+        // for a provisional or a full VBC — the issuer answers from the
+        // observed stake", and §5.2.2b: the binding is issued IMMEDIATELY after
+        // the wallet is generated, before any funding. This check refused an
+        // empty wallet's first request as "Insufficient stake: 0 atoms (need
+        // 500)" before Core saw it (measured, `vbc_request_from_empty_wallet_gate`).
+        // RULE 5 / layer roles: Lambda does not own the stake rule.
 
         let accepted = if proof_cap.is_empty() { "dmap" } else { proof_cap };
 
@@ -1576,68 +2179,25 @@ impl ConsensusEngine {
         self.stats.load_cumulative();
     }
     
-    /// Load real VBC from vbc.json file.
+    /// Load the validator's certificate bundle (CBOR `VBCProofBundle`, ValidatorJoin §6b.12).
     /// Same format as ANTIE uses — both load the same file generated by install_genesis.sh.
     /// Fails hard if file is missing, corrupt, or doesn't have 3 issuers/sigs.
     /// "Can crash, must not lie" — a validator without a valid VBC must not start.
     fn load_vbc_from_file(path: &std::path::Path) -> Result<VBCProofBundle, LambdaError> {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| LambdaError::ConfigError(format!("Failed to read VBC file {:?}: {}", path, e)))?;
-        let file_vbc: VBCFile = serde_json::from_str(&content)
-            .map_err(|e| LambdaError::ConfigError(format!("Failed to parse VBC file {:?}: {}", path, e)))?;
-        
-        let sphincs_pk = hex::decode(&file_vbc.subject_pubkey_sphincs_hex)
-            .map_err(|e| LambdaError::ConfigError(format!("Invalid SPHINCS+ PK hex in VBC: {}", e)))?;
-        if sphincs_pk.is_empty() {
+        // ValidatorJoin §6b.12 (KI#171) — the certificate is Core's typed bundle in CBOR
+        // (`config/vbc-bundle.cbor`: target, Nabla stamp, issuer certificates). No
+        // hand-rolled file struct: the one before dropped four SIGNED fields and the
+        // issuer chain, so no non-genesis certificate could load. A file that does not
+        // decode as the bundle (e.g. a legacy vbc.json) is a startup error, never a fallback.
+        let bytes = std::fs::read(path)
+            .map_err(|e| LambdaError::ConfigError(format!("Failed to read VBC bundle {:?}: {}", path, e)))?;
+        let bundle: VBCProofBundle = ciborium::from_reader(bytes.as_slice()).map_err(|e| LambdaError::ConfigError(format!(
+            "VBC bundle {:?} is not a CBOR VBCProofBundle ({}). vbc_path must name config/vbc-bundle.cbor \
+             (ValidatorJoin §6b.12)", path, e)))?;
+        if bundle.target_vbc.subject_pubkey_sphincs.is_empty() {
             return Err(LambdaError::ConfigError("VBC has empty SPHINCS+ public key".into()));
         }
-        let validator_id = axiom_core_logic::compute::compute_validator_id(&sphincs_pk);
-        
-        let bundle = VBCProofBundle {
-            target_vbc: VBC {
-                version: file_vbc.version.unwrap_or(0x09),
-                // YPX-021 §7 — ceremony-era validator VBCs carry no baseline.
-                network_size_baseline: 0,
-                baseline_tick: 0,
-                validator_id,
-                subject_pubkey_sphincs: sphincs_pk,
-                // SECURITY FIX #11: Fail loudly on invalid hex instead of silently producing empty keys.
-                // unwrap_or_default() on hex decode would silently accept corrupted VBC data,
-                // leading to a validator running with empty/wrong Dilithium public key.
-                subject_pubkey_dilithium: hex::decode(&file_vbc.subject_pubkey_dilithium_hex)
-                    .map_err(|e| LambdaError::ConfigError(format!("Invalid Dilithium PK hex in VBC: {}", e)))?,
-                subject_pubkey_ed25519: hex::decode(&file_vbc.subject_pubkey_ed25519_hex)
-                    .map_err(|e| LambdaError::ConfigError(format!("Invalid Ed25519 PK hex in VBC: {}", e)))?,
-                pgp_fingerprint: file_vbc.pgp_fingerprint_hex.as_ref()
-                    .and_then(|h| hex::decode(h).ok())
-                    .unwrap_or_default(),
-                node_name: file_vbc.node_name.clone().unwrap_or_default(),
-                proof_cap: String::new(),
-                issued_at: file_vbc.issued_at,
-                expires_at: file_vbc.expires_at,
-                chain_depth: file_vbc.chain_depth.unwrap_or(0),
-                // AUDIT-FIX v2.11.14: Fail-stop on corrupted VBC hex (was silent drop via filter_map).
-                // Silently dropping entries could reduce issuer quorum below k=3.
-                issuer_set: file_vbc.issuer_set.iter()
-                    .map(|h| hex::decode(h).map_err(|e| LambdaError::InvalidRequest(
-                        format!("VBC issuer_set bad hex '{}': {}", h, e))))
-                    .collect::<Result<Vec<_>, _>>()?,
-                signatures: file_vbc.signatures.iter()
-                    .map(|h| hex::decode(h).map_err(|e| LambdaError::InvalidRequest(
-                        format!("VBC signature bad hex '{}': {}", h, e))))
-                    .collect::<Result<Vec<_>, _>>()?,
-                max_tx: 0,
-                founding_vbc_hash: file_vbc.founding_vbc_hash.as_ref()
-                    .and_then(|h| {
-                        let bytes = hex::decode(h).ok()?;
-                        let arr: [u8; 32] = bytes.try_into().ok()?;
-                        Some(arr)
-                    })
-                    .unwrap_or([0u8; 32]),
-            },
-            supporting_vbcs: vec![],
-        };
-        
+
         // VBC must have exactly 3 issuers and 3 signatures — protocol requirement
         let n_issuers = bundle.target_vbc.issuer_set.len();
         let n_sigs = bundle.target_vbc.signatures.len();
@@ -1664,8 +2224,8 @@ impl ConsensusEngine {
         #[cfg(all(not(test), not(feature = "dev-mode")))]
         {
             if let Err(e) = axiom_core_logic::vbc::verify_vbc_bundle_no_time(&bundle) {
-                error!("VBC startup check failed ({}): issuer PKs in vbc.json do not match \
-                        ROOT_AUTHORITY_PKS in compiled Core. Ceremony/build mismatch.", e);
+                error!("VBC startup check failed ({}): the certificate bundle does not verify to the \
+                        root authorities compiled into this Core (chain, stamp or build mismatch).", e);
                 eprintln!();
                 eprintln!("  AXIOM Lambda cannot start.");
                 eprintln!();
@@ -1696,11 +2256,110 @@ impl ConsensusEngine {
     pub fn vbc_for_signature(&self) -> Option<VBCProofBundle> {
         Some(self.vbc.clone())
     }
+
+    /// YP §26.17.6.5 B2 — the reference every FACT witness / cosign we produce
+    /// carries to OUR certificate (`vbc_reference_hash` over the signed
+    /// certificate). Verifiers resolve it against the bundle we attach to every
+    /// `WitnessSig` (`vbc_for_signature`) — the same bytes.
+    pub fn vbc_reference(&self) -> [u8; 32] {
+        axiom_core_logic::vbc::vbc_reference_hash(&self.vbc.target_vbc)
+    }
+
+    /// YP §26.17.6.5 B4 — verify and KEEP every certificate bundle that passes
+    /// through this validator (a witness's, a cheque signer's, a client's
+    /// offered set): the historical walk to the roots, provisional ones
+    /// skipped. Only verified bundles enter the store, so presenting from it
+    /// can never poison an execution (`FactCertificateInvalid` refuses the
+    /// whole run). Certificates are public material; keeping them is free.
+    fn absorb_certificates<'a>(&self, bundles: impl Iterator<Item = &'a VBCProofBundle>) {
+        let mut stored = 0usize;
+        for bundle in bundles {
+            let vbc = &bundle.target_vbc;
+            if axiom_core_logic::validation::vbc_is_provisional(vbc.issued_at, vbc.expires_at) {
+                continue;
+            }
+            let reference = axiom_core_logic::vbc::vbc_reference_hash(vbc);
+            // Already kept (verified once) — the three SPHINCS+ verifications are not repeated.
+            if matches!(self.storage.get_fact_certificate(&reference), Ok(Some(_))) {
+                continue;
+            }
+            if axiom_core_logic::vbc::verify_vbc_bundle_historical(bundle, 0).is_err() {
+                continue;
+            }
+            let mut buf = Vec::new();
+            if ciborium::into_writer(bundle, &mut buf).is_err() {
+                continue;
+            }
+            match self.storage.store_fact_certificate(&reference, &buf) {
+                Ok(true) => stored += 1,
+                Ok(false) => {}
+                Err(e) => warn!("[FACT-CERT] store failed: {}", e),
+            }
+        }
+        if stored > 0 {
+            info!("[FACT-CERT] stored {} new certificate(s)", stored);
+        }
+    }
+
+    /// YP §26.17.6.5 B4 — the certificate set Core is handed for `chain`: the
+    /// references the chain needs (live-tail witnesses, cosigners, burn
+    /// signers) filled from what was OFFERED with the request, our own
+    /// certificate, then the store. A reference nothing resolves stays absent:
+    /// Core refuses the chain (`FactWitnessUncertified`); nothing is fetched.
+    fn present_certificates(
+        &self,
+        chain: Option<&axiom_core_logic::types::FactChain>,
+        offered: &[VBCProofBundle],
+    ) -> Vec<VBCProofBundle> {
+        let Some(chain) = chain else { return Vec::new(); };
+        let needed = axiom_core_logic::fact::certificate_references(chain);
+        if needed.is_empty() {
+            return Vec::new();
+        }
+        let mut out: Vec<VBCProofBundle> = Vec::new();
+        let mut have: std::collections::BTreeSet<[u8; 32]> = std::collections::BTreeSet::new();
+        for bundle in offered {
+            let r = axiom_core_logic::vbc::vbc_reference_hash(&bundle.target_vbc);
+            if needed.contains(&r) && have.insert(r) {
+                out.push(bundle.clone());
+            }
+        }
+        let own = self.vbc_reference();
+        if needed.contains(&own) && have.insert(own) {
+            out.push(self.vbc.clone());
+        }
+        let mut missing = 0usize;
+        for r in &needed {
+            if have.contains(r) {
+                continue;
+            }
+            match self.storage.get_fact_certificate(r) {
+                Ok(Some(bundle)) => {
+                    have.insert(*r);
+                    out.push(bundle);
+                }
+                Ok(None) => missing += 1,
+                Err(e) => {
+                    warn!("[FACT-CERT] store read failed: {}", e);
+                    missing += 1;
+                }
+            }
+        }
+        if missing > 0 {
+            warn!(
+                "[FACT-CERT] {} of {} witness reference(s) resolve to no certificate here — \
+                 Core will refuse the chain (E_FACT_WITNESS_UNCERTIFIED) unless the client offered them",
+                missing, needed.len()
+            );
+        }
+        out
+    }
     
     /// Get our validator ID
     pub fn validator_id(&self) -> [u8; 32] {
         self.validator_id
     }
+
 
     /// Get a reference to storage (for admin API read-only queries)
     pub fn storage(&self) -> &Arc<Storage> {
@@ -1794,32 +2453,21 @@ impl ConsensusEngine {
 
         let originator_pk: [u8; 32] = self.public_key.to_bytes();
 
-        // Diffusion ID: BLAKE3("AXIOM_FANOUT_ID" || content || originator_pk)
-        // Must match CL10 verification in modes.rs
-        let diffusion_id = {
-            let mut h = blake3::Hasher::new();
-            h.update(b"AXIOM_FANOUT_ID");
-            h.update(&content);
-            h.update(&originator_pk);
-            *h.finalize().as_bytes()
-        };
+        // Diffusion id + signing payload: THE builders Core's CL10 verifies with
+        // (KI#55 Pattern 1, YP §18.8.3/§18.8.4) — never a Lambda-side copy.
+        let diffusion_id = axiom_core_logic::compute::fanout_diffusion_id(&content, &originator_pk);
 
         let ttl_original: u8 = 5;
         let fanout: u8 = 3;
 
-        // Sign: BLAKE3("AXIOM_FANOUT" || diffusion_id || content_type || content || ttl_original || fanout || timestamp)
-        // Must match CL10 verification in modes.rs
-        let sign_data = {
-            let mut h = blake3::Hasher::new();
-            h.update(b"AXIOM_FANOUT");
-            h.update(&diffusion_id);
-            h.update(&axiom_core_logic::types::FANOUT_CONSOLE_RESULT.to_le_bytes());
-            h.update(&content);
-            h.update(&[ttl_original]);
-            h.update(&[fanout]);
-            h.update(&now.to_le_bytes());
-            *h.finalize().as_bytes()
-        };
+        let sign_data = axiom_core_logic::compute::fanout_signing_payload(
+            &diffusion_id,
+            axiom_core_logic::types::FANOUT_CONSOLE_RESULT,
+            &content,
+            ttl_original,
+            fanout,
+            now,
+        );
         let sig = self.signing_key.sign(&sign_data);
 
         axiom_core_logic::types::FanOutMessage {
@@ -1887,6 +2535,17 @@ impl ConsensusEngine {
     }
 
     /// §23.14.6: Get our Ed25519 public key bytes (for admin API is_peer check)
+    /// §5.2.2e — this validator's latest signed Pulse proof (its candidacy
+    /// credential), or None if no audit has passed yet.
+    pub fn last_pulse_proof(&self) -> Option<axiom_core_logic::wire_client::PulseProofRequest> {
+        self.storage.get_last_pulse_proof().ok().flatten()
+    }
+
+    /// YPX-009 §7.2 — executions this validator REFUSED for a failed self-audit.
+    pub fn pulse_audit_failures(&self) -> u64 {
+        self.pulse.audit_failures()
+    }
+
     pub fn public_key_bytes(&self) -> &[u8] {
         self.public_key.as_bytes()
     }
@@ -1894,11 +2553,17 @@ impl ConsensusEngine {
     /// Get the bound wallet balance (stake) for VSP response.
     /// Queries own wallet state by validator's Ed25519 PK.
     fn get_bound_wallet_balance(&self) -> u64 {
-        self.storage.get_wallet_state(self.public_key.as_bytes(), axiom_core_logic::wallet_id::K_DEFAULT, axiom_core_logic::wallet_id::PROOF_TYPE_DMAP)
+        let stored = self.storage.get_wallet_state(self.public_key.as_bytes(), axiom_core_logic::wallet_id::K_DEFAULT, axiom_core_logic::wallet_id::PROOF_TYPE_DMAP)
             .ok()
             .flatten()
-            .map(|ws| ws.balance)
-            .unwrap_or(0)
+            .map(|ws| ws.balance);
+        // §6c (Option A, RULED 2026-09-08): a genesis stake wallet's head is
+        // DERIVED from the compile-time list and never stored, so until its
+        // first move after the lock there is nothing here to read — and
+        // /identity + /peers `stake` showed 0 for every genesis validator
+        // (measured 2026-09-09). The derived opening balance IS the stake;
+        // Lambda's S-ABR miss path already consults the same builder.
+        stored.unwrap_or_else(|| axiom_core_logic::genesis::genesis_opening_balance(self.public_key.as_bytes()))
     }
 
     /// Public accessor for the validator's current stake — same value
@@ -1909,13 +2574,71 @@ impl ConsensusEngine {
         self.get_bound_wallet_balance()
     }
 
+    /// §23.14.6: peer-audit demands whose target could not be resolved to an
+    /// email carrier (for admin API). See the field.
+    pub fn peer_audit_target_unresolved(&self) -> u64 {
+        self.peer_audit_target_unresolved.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// §23.14.6 (KI#213) NotHeld outcomes (for admin API): `(cleared, banned)`.
+    pub fn peer_audit_not_held_counts(&self) -> (u64, u64) {
+        (self.peer_audit_not_held_cleared.load(std::sync::atomic::Ordering::Relaxed),
+         self.peer_audit_not_held_banned.load(std::sync::atomic::Ordering::Relaxed))
+    }
+    /// Dashboard: `(peer audits we sent that PASSED, requests from others we
+    /// answered, of those the ones with no hint for the requester — mailed by
+    /// ANTIE to the request's From:, KI#229)`.
+    pub fn peer_audit_operator_counts(&self) -> (u64, u64, u64) {
+        (self.peer_audits_passed.load(std::sync::atomic::Ordering::Relaxed),
+         self.peer_audit_requests_answered.load(std::sync::atomic::Ordering::Relaxed),
+         self.peer_audit_reply_hint_unresolved.load(std::sync::atomic::Ordering::Relaxed))
+    }
+    /// (for admin API): `(dispatch_failed, reply_unexpected)`.
+    pub fn peer_audit_misc_counts(&self) -> (u64, u64, u64) {
+        (self.peer_audit_dispatch_failed.load(std::sync::atomic::Ordering::Relaxed),
+         self.peer_audit_reply_unexpected.load(std::sync::atomic::Ordering::Relaxed),
+         self.peer_audit_mirror_drift.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// §23.14.3 (2026-09-24): ANTIE could not send our peer-audit request after
+    /// hand-off. The request never left this node, so B must not be timed:
+    /// un-mark the dispatch (the AVM's deadline stops), let the next witness
+    /// build resend (`peer_audit_sent` back to false). Closes the KI#211 residual.
+    pub async fn handle_peer_audit_dispatch_failed(&self, target_email: &str, error: &str) {
+        warn!("§23.14.3: carrier failed to send our peer-audit request to {} ({}) — dispatch un-marked, will retry on the next witness",
+              target_email, error);
+        self.peer_audit_dispatch_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let core = self.core.read().await;
+        core.avm().unmark_peer_audit_dispatched();
+        drop(core);
+        self.peer_audit_sent.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// §23.14 AS BUILT item 10: peer demands armed by (volume, time-bond).
+    /// `None` when the core lock is busy — never a substituted (0, 0) (RULE 6).
+    pub fn peer_audit_trigger_counts(&self) -> Option<(u64, u64)> {
+        self.core.try_write().ok().map(|core| core.avm().peer_audit_trigger_counts())
+    }
+
+    /// Dashboard: AVM `(self armed, self passed, bans issued)`. `None` when the
+    /// core lock is busy — never a substituted zero (RULE 6).
+    pub fn audit_operator_counts(&self) -> Option<(u64, u64, u64)> {
+        self.core.try_write().ok().map(|core| core.avm().audit_operator_counts())
+    }
+
+    /// Operational (dashboard audit-demand card): when the AVM host was last
+    /// (re)started — `(wall_clock_unix_secs, first_attested_tick_after_restart)`.
+    /// `None` when the core lock was busy for this read (never a fake 0).
+    pub fn avm_restart_info(&self) -> Option<(u64, u64)> {
+        self.core.try_read().ok().map(|core| core.avm().avm_restart_info())
+    }
+
     /// §23.14.6: Get current peer-audit ban list (for admin API)
-    pub fn peer_audit_bans(&self) -> Vec<axiom_core_logic::types::PeerAuditBanEntry> {
-        if let Ok(core) = self.core.try_write() {
-            core.avm().peer_audit_bans()
-        } else {
-            Vec::new()
-        }
+    ///
+    /// `None` when the core lock is busy. It used to return an EMPTY list then,
+    /// so `/audit` (and the dashboard) read "no bans" while bans were active —
+    /// seen live 2026-09-26: beta's ban on delta "vanished" 27 min into a 1 h ban.
+    pub fn peer_audit_bans(&self) -> Option<Vec<axiom_core_logic::types::PeerAuditBanEntry>> {
+        self.core.try_write().ok().map(|core| core.avm().peer_audit_bans())
     }
 
     /// Get random hints for response (used for error responses too)
@@ -1945,6 +2668,14 @@ impl ConsensusEngine {
     ///   handle_peer_audit_response(). Returns None here — AVM manages countdown.
     ///
     /// Client-provided confirmations take priority (for peer-audit protocol).
+    /// §23.14.6 SELF-audit (KEPT + FIXED, the owner 2026-09-24 "we should get the self
+    /// audit fixed" — reversing the same-hour option (a) ruling): self is a
+    /// candidate again (`audit::audit_target_candidates` appends `my_validator_pk`)
+    /// and the AVM judges this confirmation against the digest fixed at arming
+    /// (`PendingAudit::self_expected_digest`), not a ring lookup. This side is
+    /// unchanged: the finalizer's `transaction_records` row for `trigger_txid`
+    /// carries the consumed-state `sender_balance`, `produced_state_id`, `amount`
+    /// — the same fields the digest holds.
     fn resolve_audit_confirmation(
         &self,
         client_confirmation: &Option<axiom_core_logic::types::AuditConfirmation>,
@@ -1952,54 +2683,58 @@ impl ConsensusEngine {
         if client_confirmation.is_some() {
             return client_confirmation.clone();
         }
-        let pending = self.pending_audit.lock();
-        if let Some(ref demand) = *pending {
-            // Check if this is a self-audit (target == our PK)
-            let our_pk = self.public_key.as_bytes().to_vec();
-            if demand.target_validator_pk == our_pk {
-                // Self-audit: look up trigger_txid in DB and send raw data
-                debug!("§23.14: Self-audit — looking up trigger_txid={} in DB",
-                       hex::encode(&demand.trigger_txid[..8]));
+        // Clone the demand out and RELEASE pending_audit BEFORE the storage.* call.
+        // resolve_audit_confirmation runs on every witness round; holding the
+        // non-yielding parking_lot pending_audit mutex across a blocking DB read pins
+        // it under the conn mutex and blocks the whole tokio worker thread — a
+        // contention anti-pattern under load. Lock hygiene, behavior-identical.
+        let demand = match self.pending_audit.lock().as_ref() {
+            Some(d) => d.clone(),
+            None => return None,
+        };
+        // Check if this is a self-audit (target == our PK)
+        let our_pk = self.public_key.as_bytes().to_vec();
+        if demand.target_validator_pk == our_pk {
+            // Self-audit: look up trigger_txid in DB and send raw data
+            debug!("§23.14: Self-audit — looking up trigger_txid={} in DB",
+                   hex::encode(&demand.trigger_txid[..8]));
 
-                // Look up trigger_txid in transaction_records (every validator stores these,
-                // not just the finalizer). Receipts are only stored by the k=3 finalizer,
-                // so using receipts would fail when the audit triggers on V1/V2.
-                let tx_record = self.storage.get_transaction_record_by_txid(&demand.trigger_txid)
-                    .ok().flatten();
+            // Look up trigger_txid in transaction_records (every validator stores these,
+            // not just the finalizer). Receipts are only stored by the k=3 finalizer,
+            // so using receipts would fail when the audit triggers on V1/V2.
+            let tx_record = self.storage.get_transaction_record_by_txid(&demand.trigger_txid)
+                .ok().flatten();
 
-                if let Some(tx_record) = tx_record {
-                    // Build confirmation from raw DB data — Lambda does ZERO crypto
-                    let state_id = tx_record.produced_state_id;
-                    let sender_balance = tx_record.sender_balance;
-                    let amount = tx_record.amount;
+            if let Some(tx_record) = tx_record {
+                // Build confirmation from raw DB data — Lambda does ZERO crypto
+                let state_id = tx_record.produced_state_id;
+                let sender_balance = tx_record.sender_balance;
+                let amount = tx_record.amount;
 
-                    info!("§23.14: Self-audit confirmation built from DB — state_id={}, sender_balance={}, amount={}",
-                          hex::encode(&state_id[..8]), sender_balance, amount);
+                info!("§23.14: Self-audit confirmation built from DB — state_id={}, sender_balance={}, amount={}",
+                      hex::encode(&state_id[..8]), sender_balance, amount);
 
-                    Some(axiom_core_logic::types::AuditConfirmation {
-                        challenge_nonce: demand.challenge_nonce,
-                        target_validator_pk: demand.target_validator_pk.clone(),
-                        sender_balance,
-                        receiver_balance: 0,
-                        state_id,
-                        amount,
-                    })
-                } else {
-                    warn!("§23.14: Self-audit — trigger_txid {} not found in transaction_records",
-                          hex::encode(&demand.trigger_txid[..8]));
-                    None
-                }
+                Some(axiom_core_logic::types::AuditConfirmation {
+                    challenge_nonce: demand.challenge_nonce,
+                    target_validator_pk: demand.target_validator_pk.clone(),
+                    sender_balance,
+                    receiver_balance: 0,
+                    state_id,
+                    amount,
+                })
             } else {
-                // Peer-audit: handled asynchronously via ANTIE email.
-                // The peer-audit request is sent via handle_peer_audit_outbound()
-                // (piggybacked on WitnessResponse). Response arrives later via
-                // handle_peer_audit_response(). AVM handles countdown + banning.
-                debug!("§23.14.6: Peer-audit demand active for target={} — awaiting ANTIE response",
-                       hex::encode(&demand.target_validator_pk[..std::cmp::min(8, demand.target_validator_pk.len())]));
-                None // Peer-audit confirmation comes via handle_peer_audit_response(), not here
+                warn!("§23.14: Self-audit — trigger_txid {} not found in transaction_records",
+                      hex::encode(&demand.trigger_txid[..8]));
+                None
             }
         } else {
-            None
+            // Peer-audit: handled asynchronously via ANTIE email.
+            // The peer-audit request is sent via handle_peer_audit_outbound()
+            // (piggybacked on WitnessResponse). Response arrives later via
+            // handle_peer_audit_response(). AVM handles countdown + banning.
+            debug!("§23.14.6: Peer-audit demand active for target={} — awaiting ANTIE response",
+                   hex::encode(&demand.target_validator_pk[..std::cmp::min(8, demand.target_validator_pk.len())]));
+            None // Peer-audit confirmation comes via handle_peer_audit_response(), not here
         }
     }
 
@@ -2007,7 +2742,7 @@ impl ConsensusEngine {
     /// Looks up state_ids from DB, builds raw TxDigests.
     /// Lambda does ZERO crypto — Core replays Argon2id→BLAKE3 chain.
     fn resolve_pulse_audit(&self) -> Option<axiom_core_logic::types::PulseAuditResponse> {
-        let request = self.pending_pulse_audit.lock().take()?;
+        let request = self.pulse.take_request()?;
 
         let mut entries = Vec::with_capacity(request.state_ids.len());
         for (i, state_id) in request.state_ids.iter().enumerate() {
@@ -2051,14 +2786,6 @@ impl ConsensusEngine {
     }
 
     /// YPX-009 §4: Store Pulse audit request from Core for next TX.
-    fn handle_pulse_audit_request(&self, request: Option<axiom_core_logic::types::PulseAuditRequest>) {
-        if let Some(req) = request {
-            info!("YPX-009: Core emitted PulseAuditRequest — {} entries, epoch={}",
-                  req.state_ids.len(), req.epoch);
-            *self.pending_pulse_audit.lock() = Some(req);
-        }
-    }
-
     fn handle_audit_demand(&self, demand: Option<axiom_core_logic::types::AuditDemand>) {
         if let Some(ref d) = demand {
             info!("§23.14: Core generated audit demand — target={}, nonce={}",
@@ -2079,6 +2806,33 @@ impl ConsensusEngine {
         }
     }
 
+    /// §23.14.1 — what Lambda's mirror must do, given the AVM's pending demand (the
+    /// source of truth) and Lambda's own copy. Extracted so a test drives it (RULE 6
+    /// §3a). Two demands are the SAME audit iff their nonces match; a nonce Lambda does
+    /// not hold means the AVM (re-)armed and Lambda's copy is absent or STALE.
+    pub(crate) fn audit_mirror_action(
+        avm: Option<&axiom_core_logic::types::AuditDemand>,
+        lambda: Option<&axiom_core_logic::types::AuditDemand>,
+    ) -> MirrorAction {
+        match (avm, lambda) {
+            (Some(a), Some(l)) if a.challenge_nonce == l.challenge_nonce => MirrorAction::Keep,
+            (Some(_), _) => MirrorAction::Adopt,
+            (None, Some(_)) => MirrorAction::Clear,
+            (None, None) => MirrorAction::Keep,
+        }
+    }
+
+    /// §23.14.6 — the pk a peer-audit REQUEST goes to, from the AVM's demand: never
+    /// SELF. A self demand is answered by a confirmation (§23.14.4), not by mailing
+    /// ourselves a request and then judging our own signed reply against whatever
+    /// demand is pending when it comes back (measured 2026-09-25: delta 1×, kappa 2×).
+    pub(crate) fn peer_audit_outbound_target(
+        demand: &axiom_core_logic::types::AuditDemand,
+        our_pk: &[u8],
+    ) -> Option<Vec<u8>> {
+        if demand.target_validator_pk.as_slice() == our_pk { None } else { Some(demand.target_validator_pk.clone()) }
+    }
+
     /// §23.14.6: Get the outbound peer-audit request (for ANTIE to send via email).
     ///
     /// Called after each witness request processing. If there's a pending peer-audit
@@ -2086,44 +2840,155 @@ impl ConsensusEngine {
     /// containing the request and target email (from validator hints).
     ///
     /// Returns None if: no pending peer-audit, already sent, or target email unknown.
-    pub fn pending_peer_audit_outbound(&self) -> Option<crate::types::OutboundPeerAudit> {
-        // Check if we already sent
+    /// §23.14: mirror the AVM's pending demand into Lambda's `pending_audit`
+    /// (or clear a stale one). MUST be called with NO core guard held on this
+    /// thread — it takes a BLOCKING `core.read()` (KI#210: a `try_read` here
+    /// silently skipped the mirror under witness load and the self-audit expired).
+    ///
+    /// Called (2026-09-24) before EVERY Core execution that can carry a
+    /// confirmation — the CL2 pre-pass, the witness/finalize path, the CL5
+    /// redeem — not only after a witness execution: a demand armed at a CL5 or
+    /// at the previous round's finalize stayed unmirrored until the next witness
+    /// round, and every execution in between burned a countdown tick with no
+    /// confirmation (measured: "self-audit pending … carries NO audit_confirmation"
+    /// at remaining=10,9,8 right after arming).
+    async fn sync_audit_mirror(&self) {
+        let core = self.core.read().await;
+        let avm_demand = core.avm().pending_time_bond_demand();
+        drop(core);
+        let lambda_demand = self.pending_audit.lock().clone();
+        match Self::audit_mirror_action(avm_demand.as_ref(), lambda_demand.as_ref()) {
+            MirrorAction::Keep => {}
+            MirrorAction::Adopt => {
+                // The AVM armed a demand Lambda does not hold — either Lambda missed it
+                // (time-bond armed under witness load) or, worse, Lambda still holds a
+                // STALE one: the AVM resolved the previous audit and re-armed a NEW
+                // demand in the same execution. Adopt the AVM's copy so a PEER demand
+                // sends to ITS target and a SELF demand gets a confirmation for ITS
+                // nonce. MEASURED 2026-09-25 (soak on a39d466c, kappa 17:05–17:07Z):
+                // the stale copy said "self" while the AVM held "epsilon"; the outbound
+                // path mailed epsilon's request to kappa@axiom, kappa answered itself,
+                // epsilon never saw it and was banned NonResponds — an innocent, and
+                // kappa refused every tx epsilon had witnessed for the rest of the run.
+                // eta's "confirmation ignored — nonce/target do not match" ×2 was the
+                // same drift on a self demand.
+                let d = avm_demand.expect("Adopt implies the AVM holds a demand");
+                if let Some(stale) = lambda_demand.as_ref() {
+                    warn!("§23.14: audit mirror DRIFT — Lambda held nonce={} target={} while the AVM holds nonce={} target={}; adopting the AVM's (the source of truth)",
+                          hex::encode(&stale.challenge_nonce[..8]),
+                          hex::encode(&stale.target_validator_pk[..std::cmp::min(8, stale.target_validator_pk.len())]),
+                          hex::encode(&d.challenge_nonce[..8]),
+                          hex::encode(&d.target_validator_pk[..std::cmp::min(8, d.target_validator_pk.len())]));
+                    self.peer_audit_mirror_drift.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    info!("§23.14: Core generated audit demand — target={}, nonce={}",
+                          hex::encode(&d.target_validator_pk[..std::cmp::min(8, d.target_validator_pk.len())]),
+                          hex::encode(&d.challenge_nonce[..8]));
+                }
+                *self.pending_audit.lock() = Some(d);
+                self.peer_audit_sent.store(false, std::sync::atomic::Ordering::Relaxed);
+                self.audit_txs_since_demand.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
+            MirrorAction::Clear => {
+                // AVM audit ended (response-completed, confirmed, or banned-on-timeout)
+                // but Lambda still holds it → clear so the next audit isn't wedged. Named
+                // because a self-audit resolved by an injected confirmation on the CL2
+                // pre-pass / finalize / CL5 path clears HERE (measured 2026-09-24: delta's
+                // 12:15Z self demand cleared with no line at all).
+                info!("§23.14: AVM audit ended (resolved or timed out) — clearing Lambda's mirror");
+                *self.pending_audit.lock() = None;
+                self.peer_audit_sent.store(false, std::sync::atomic::Ordering::Relaxed);
+                self.audit_txs_since_demand.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// §23.14.6: the ONE rule that maps a peer-audit DEMAND target to the email
+    /// the request is sent to. Extracted so a test can drive it (RULE 6 §3a).
+    ///
+    /// `target_pk` is `AuditDemand.target_validator_pk` = one of the round's
+    /// `witness_pks` (`core/logic/src/audit.rs::generate_audit_demand`), i.e. a
+    /// witness's **Ed25519** key — the certificate subject, the key in
+    /// `WitnessSig.validator_pk`. The hint field carrying that key is
+    /// `ValidatorHint.ed25519_pk` (`set_carriers` self-advertises
+    /// `VerifyingKey::from(&self.signing_key)`, and every relayed hint carries it).
+    ///
+    /// ⚠ WRONG READING, live until 2026-09-24 (RULE 0 §4): this compared the
+    /// target against `hint.validator_id`, which is `blake3(sphincs_pk)` — a
+    /// different 32 bytes in a different namespace (the SDK's `validator=83cabd19…`
+    /// diag id, vs the demand's `target=4b3325d4…`). It could never match, so the
+    /// request was NEVER sent (`0 sent / 0 received` fleet-wide), and — because the
+    /// AVM then had no notion of "never dispatched" — the demanded CO-WITNESS was
+    /// banned `NonResponds` at expiry: 32 innocent bans in one tier C run, each
+    /// rejecting every TX that peer witnessed for 24 h (`wallet.ownness`,
+    /// `heal.ki204…`, and the emission divergence all trace to it). The
+    /// "hint propagation gap" of KI#207/#210 was this — alpha's live `/peers`
+    /// held all 7 rows with `email:` carriers AND `ed25519_pk` the whole time.
+    pub fn resolve_peer_audit_target_email(
+        hints: &[axiom_core_logic::types::ValidatorHint],
+        target_pk: &[u8],
+    ) -> Option<String> {
+        hints.iter()
+            .find(|h| h.ed25519_pk.as_ref().is_some_and(|k| k.as_slice() == target_pk))
+            .and_then(|h| h.carriers.iter()
+                .find(|c| c.starts_with("email:"))
+                .map(|c| c[6..].to_string()))
+    }
+
+    pub async fn pending_peer_audit_outbound(&self) -> Option<crate::types::OutboundPeerAudit> {
         if self.peer_audit_sent.load(std::sync::atomic::Ordering::Relaxed) {
             return None;
         }
-
-        // Check if AVM has a pending peer-audit request
-        // Use try_lock since we may be called from sync context during response building
-        let core = self.core.try_write().ok()?;
-        let request = core.avm().pending_peer_audit_request()?;
-        drop(core);
-
-        // Resolve target validator's email from hints
-        let pending = self.pending_audit.lock();
-        if let Some(ref demand) = *pending {
-            let target_pk_hex = hex::encode(&demand.target_validator_pk);
-            // Search all hints for the target validator
-            if let Ok(all_hints) = self.storage.get_all_hints() {
-                for hint in &all_hints {
-                    if hex::encode(hint.validator_id) == target_pk_hex {
-                        // Extract email from carriers (format: "email:user@domain")
-                        if let Some(email) = hint.carriers.iter()
-                            .find(|c| c.starts_with("email:"))
-                            .map(|c| c[6..].to_string())
-                        {
-                            self.peer_audit_sent.store(true, std::sync::atomic::Ordering::Relaxed);
-                            return Some(crate::types::OutboundPeerAudit {
-                                request,
-                                target_email: email,
-                            });
-                        }
-                    }
+        // ONE source for the demand: the AVM's pending audit. The target, the txid and
+        // the nonce in the request MUST come from the same demand — the old code took
+        // the target from Lambda's mirror and the request from the AVM, and when the
+        // mirror was stale it mailed the AVM's request to the WRONG validator (itself;
+        // see sync_audit_mirror's Adopt arm). Hold the read guard across the whole build
+        // so the AVM cannot re-arm between "which demand" and "mark dispatched".
+        let core = self.core.read().await;
+        let demand = core.avm().pending_peer_audit_demand()?;
+        let target_pk = Self::peer_audit_outbound_target(&demand, self.public_key.as_bytes())?;
+        {
+            // Keep the mirror on THIS demand, and say so — this runs before the
+            // post-execution sync, so without the line here a demand adopted on this
+            // path never printed "Core generated audit demand" (chain 22 readout:
+            // demands=0 while peer_passed=1).
+            let mut mirror = self.pending_audit.lock();
+            if mirror.as_ref().map(|d| d.challenge_nonce) != Some(demand.challenge_nonce) {
+                if mirror.is_some() {
+                    self.peer_audit_mirror_drift.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    warn!("§23.14: audit mirror DRIFT at dispatch — adopting the AVM's demand (nonce={})",
+                          hex::encode(&demand.challenge_nonce[..8]));
                 }
+                info!("§23.14: Core generated audit demand — target={}, nonce={}",
+                      hex::encode(&demand.target_validator_pk[..std::cmp::min(8, demand.target_validator_pk.len())]),
+                      hex::encode(&demand.challenge_nonce[..8]));
+                *mirror = Some(demand.clone());
+                self.audit_txs_since_demand.store(0, std::sync::atomic::Ordering::Relaxed);
             }
-            debug!("§23.14.6: Cannot send peer-audit — no email carrier for target {}",
-                   &target_pk_hex[..std::cmp::min(16, target_pk_hex.len())]);
         }
-        None
+        let all_hints = self.storage.get_all_hints().ok()?;
+        let Some(email) = Self::resolve_peer_audit_target_email(&all_hints, &target_pk) else {
+            self.peer_audit_target_unresolved.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            warn!("§23.14.6: Cannot send peer-audit — no hint with ed25519_pk={} and an email: carrier ({} hints held)",
+                  hex::encode(&target_pk[..std::cmp::min(8, target_pk.len())]), all_hints.len());
+            return None;
+        };
+        let mut request = core.avm().pending_peer_audit_request()?;
+        core.avm().mark_peer_audit_dispatched();
+        drop(core);
+        request.requester_pk = self.public_key.as_bytes().to_vec();
+        let payload = axiom_core_logic::audit::peer_audit_request_signing_payload(
+            &request.txid, &request.challenge_nonce, &request.requester_pk,
+        );
+        request.requester_sig = self.signing_key.sign(&payload).to_bytes().to_vec();
+        self.peer_audit_sent.store(true, std::sync::atomic::Ordering::Relaxed);
+        info!("§23.14.6: Peer-audit request handed to ANTIE for target {} at {}",
+              hex::encode(&target_pk[..std::cmp::min(8, target_pk.len())]), email);
+        Some(crate::types::OutboundPeerAudit {
+            request,
+            target_email: email,
+        })
     }
 
     /// §23.14.6: Handle inbound peer audit request from remote validator.
@@ -2137,67 +3002,179 @@ impl ConsensusEngine {
     pub async fn handle_peer_audit_request(
         &self,
         request: &axiom_core_logic::types::PeerAuditRequest,
-    ) -> Option<axiom_core_logic::types::PeerAuditResponse> {
+    ) -> PeerAuditAnswer {
         info!("§23.14.6: Received peer-audit request — txid={}, from={}",
               hex::encode(&request.txid[..8]),
               hex::encode(&request.requester_pk[..std::cmp::min(8, request.requester_pk.len())]));
 
-        // Lambda looks up txid in DB — pure DB operation, zero crypto
-        let receipt = self.storage.get_receipt(&request.txid).ok().flatten();
-        let (sender_balance, receiver_balance, state_id, amount) = if let Some(receipt) = &receipt {
-            let tx_record = self.storage.get_transaction_record(&receipt.produced_state_id)
-                .ok().flatten();
-            let sender_balance = tx_record.as_ref().map(|r| r.sender_balance).unwrap_or(0);
-            let amount = tx_record.as_ref().map(|r| r.amount).unwrap_or(0);
-            (sender_balance, 0u64, receipt.produced_state_id, amount)
-        } else {
-            warn!("§23.14.6: Peer-audit request for unknown txid={}", hex::encode(&request.txid[..8]));
-            return None;
-        };
-
-        // Core (the judge) computes hash from raw DB fields and compares
-        let (computed_hash, matches) = axiom_core_logic::audit::verify_inbound_peer_audit(
-            request,
-            sender_balance,
-            receiver_balance,
-            &state_id,
-            amount,
-        );
-
-        let response = axiom_core_logic::types::PeerAuditResponse {
-            txid: request.txid,
-            computed_hash,
-            challenge_nonce: request.challenge_nonce,
-            responder_pk: self.public_key.as_bytes().to_vec(),
-        };
-
-        if !matches {
-            // Our own Lambda's DB is corrupted! Core detected it.
-            // Wait 3 minutes (give ANTIE time to send response), then exit.
-            eprintln!("§23.14.6: FATAL — peer-audit hash mismatch detected on OUR node! \
-                       Our Lambda's DB is corrupted for txid={}. \
-                       Exiting in {} seconds to allow ANTIE response delivery.",
-                      hex::encode(&request.txid[..8]),
-                      axiom_core_logic::types::PEER_AUDIT_CRASH_DELAY_SECS);
-
-            let delay = axiom_core_logic::types::PEER_AUDIT_CRASH_DELAY_SECS;
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_secs(delay));
-                eprintln!("§23.14.6: Crash delay expired. Self-terminating due to DB corruption.");
-                std::process::exit(1);
-            });
-        } else {
-            info!("§23.14.6: Peer-audit verification passed — our DB is honest for txid={}",
-                  hex::encode(&request.txid[..8]));
+        // KI#175: authenticate the request before doing any work. An unsigned or
+        // forged request is dropped (anti-grief) — we never answer it.
+        if !axiom_core_logic::audit::verify_peer_audit_request_sig(request) {
+            warn!("§23.14.6: Dropping peer-audit request with invalid signature (txid={}, claimed_from={})",
+                  hex::encode(&request.txid[..8]),
+                  hex::encode(&request.requester_pk[..std::cmp::min(8, request.requester_pk.len())]));
+            return PeerAuditAnswer::Dropped;
         }
 
-        Some(response)
+        // Dev-only §23.14 audit chaos (feature `audit-chaos`, docs/AXIOM_DESIGN_AuditChaos.md):
+        // decided AFTER authentication, so the fault is exactly "an authenticated validator
+        // answering dishonestly". A production binary has no such path.
+        #[cfg(feature = "audit-chaos")]
+        let chaos = crate::audit_chaos::decide();
+        #[cfg(feature = "audit-chaos")]
+        if chaos == Some(crate::audit_chaos::Mode::Silent) {
+            warn!("§23.14 AUDIT-CHAOS: answering SILENT (no reply) for txid={} to requester={}",
+                  hex::encode(&request.txid[..8]),
+                  hex::encode(&request.requester_pk[..std::cmp::min(8, request.requester_pk.len())]));
+            return PeerAuditAnswer::Dropped;
+        }
+
+        // Lambda looks up txid in DB — pure DB operation, zero crypto.
+        // KI#207 (raw-fields): we REPORT what we stored; we do not judge. The
+        // requester (A) never handed us an expected hash, so there is nothing to
+        // compare against and nothing to self-detect. A is the sole judge and
+        // bans us on mismatch — there is no self-crash here any more (it only
+        // existed because A used to leak the expected hash to us).
+        //
+        // KI#213: what a WITNESS holds is the `witness_digests` row written at CL2
+        // (the finalizer's receipt + transaction_record is the other place the
+        // same fields live). Neither → a SIGNED NotHeld, never silence: a generic
+        // failure here was invisible to A's audit handler and read as
+        // non-response → B banned (measured 2026-09-24).
+        let responder_pk = self.public_key.as_bytes().to_vec();
+        let held = match self.storage.get_witness_digest(&request.txid).ok().flatten() {
+            Some((sender_balance, state_id, amount)) => Some((sender_balance, 0u64, state_id, amount)),
+            None => self.storage.get_receipt(&request.txid).ok().flatten().map(|receipt| {
+                let tx_record = self.storage.get_transaction_record(&receipt.produced_state_id)
+                    .ok().flatten();
+                let sender_balance = tx_record.as_ref().map(|r| r.sender_balance).unwrap_or(0);
+                let amount = tx_record.as_ref().map(|r| r.amount).unwrap_or(0);
+                (sender_balance, 0u64, receipt.produced_state_id, amount)
+            }),
+        };
+        #[cfg(feature = "audit-chaos")]
+        let held = match chaos {
+            Some(crate::audit_chaos::Mode::Forget) if held.is_some() => {
+                warn!("§23.14 AUDIT-CHAOS: answering FORGET (NotHeld although held) for txid={}",
+                      hex::encode(&request.txid[..8]));
+                None
+            }
+            Some(crate::audit_chaos::Mode::Lie) => held.map(|(sb, rb, sid, amt)| {
+                warn!("§23.14 AUDIT-CHAOS: answering LIE (amount+1, signed) for txid={}",
+                      hex::encode(&request.txid[..8]));
+                (sb, rb, sid, amt.wrapping_add(1))
+            }),
+            _ => held,
+        };
+        let (sender_balance, receiver_balance, state_id, amount) = match held {
+            Some(h) => h,
+            None => {
+                warn!("§23.14.6: Peer-audit request for a txid we hold nothing for ({}) — answering NotHeld",
+                      hex::encode(&request.txid[..8]));
+                let payload = axiom_core_logic::audit::peer_audit_not_held_signing_payload(
+                    &request.txid, &request.challenge_nonce, &responder_pk,
+                );
+                let responder_sig = self.signing_key.sign(&payload).to_bytes().to_vec();
+                self.peer_audit_requests_answered.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return PeerAuditAnswer::NotHeld(axiom_core_logic::types::PeerAuditNotHeld {
+                    txid: request.txid,
+                    challenge_nonce: request.challenge_nonce,
+                    responder_pk,
+                    responder_sig,
+                });
+            }
+        };
+
+        // KI#175: sign the raw-field response with our operational wallet so A
+        // can authenticate it and bind it to us (responder_pk == target).
+        let payload = axiom_core_logic::audit::peer_audit_response_signing_payload(
+            &request.txid, &request.challenge_nonce,
+            sender_balance, receiver_balance, &state_id, amount, &responder_pk,
+        );
+        let responder_sig = self.signing_key.sign(&payload).to_bytes().to_vec();
+        self.peer_audit_requests_answered.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        PeerAuditAnswer::Held(axiom_core_logic::types::PeerAuditResponse {
+            txid: request.txid,
+            challenge_nonce: request.challenge_nonce,
+            sender_balance,
+            receiver_balance,
+            state_id,
+            amount,
+            responder_pk,
+            responder_sig,
+        })
+    }
+
+    /// §23.14.6 (KI#213): B's signed NotHeld for OUR pending peer audit.
+    ///
+    /// Authenticated exactly like a raw-fields reply (KI#175: signature AND
+    /// `responder_pk == demanded target`, plus the demand's txid + nonce). Then:
+    ///   - if B PROVABLY co-witnessed the trigger tx — its signature is on the
+    ///     receipt WE stored for that txid — "not held" is lost or hidden data
+    ///     (a co-witness persists its digest at CL2): attributable → ban
+    ///     `NotHeldByCoWitness`, the same standing as a wrong hash;
+    ///   - otherwise (a target we cannot prove executed it — the pre-rotation
+    ///     previous-witness selection) the audit is ANSWERED, not silent: clear,
+    ///     count, no ban. Until this existed the reply was a generic failure the
+    ///     audit never saw, and B was banned NonResponds after 600 s.
+    /// §23.14.6 (KI#213): is this NotHeld ATTRIBUTABLE — did the responder
+    /// provably execute the tx? Proof = its signature on the receipt WE stored
+    /// for that txid (we finalized it; the k signatures are the co-witnesses).
+    /// A co-witness persists its digest at CL2, so "not held" from it is lost or
+    /// hidden data. No receipt, or the responder not among its signers ⇒ not
+    /// attributable ⇒ the audit is cleared without a ban. Extracted so a test
+    /// drives it (RULE 6 §3a).
+    pub fn not_held_from_proven_cowitness(&self, nh: &axiom_core_logic::types::PeerAuditNotHeld) -> bool {
+        self.storage.get_receipt(&nh.txid).ok().flatten()
+            .is_some_and(|r| r.witness_sigs.iter().any(|s| s.validator_pk == nh.responder_pk))
+    }
+
+    pub async fn handle_peer_audit_not_held(&self, nh: &axiom_core_logic::types::PeerAuditNotHeld) {
+        let who = hex::encode(&nh.responder_pk[..std::cmp::min(8, nh.responder_pk.len())]);
+        info!("§23.14.6: Received peer-audit NotHeld — txid={}, from={}", hex::encode(&nh.txid[..8]), who);
+        let demand_ok = {
+            let pending = self.pending_audit.lock();
+            pending.as_ref().is_some_and(|d| d.target_validator_pk == nh.responder_pk
+                && d.trigger_txid == nh.txid && d.challenge_nonce == nh.challenge_nonce)
+        };
+        if !demand_ok {
+            warn!("§23.14.6: NotHeld does not match the pending demand (target/txid/nonce) — ignoring (no ban). from={}", who);
+            return;
+        }
+        if !axiom_core_logic::audit::verify_peer_audit_not_held_sig(nh) {
+            warn!("§23.14.6: NotHeld has invalid operational-wallet signature — ignoring (no ban). from={}", who);
+            return;
+        }
+        let proven_cowitness = self.not_held_from_proven_cowitness(nh);
+        let core = self.core.write().await;
+        if core.avm().pending_peer_audit_hash().is_none() {
+            self.peer_audit_reply_unexpected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            warn!("§23.14.6: NotHeld from {} but no pending peer-audit in the AVM — dropped (late, duplicate or unsolicited)", who);
+            return;
+        }
+        if proven_cowitness {
+            eprintln!("§23.14.6: Peer-audit FAILED — validator {} co-witnessed txid {} (its signature is on our receipt) yet answers NotHeld. BANNING for {}.",
+                      who, hex::encode(&nh.txid[..8]), axiom_dmap_vm::interpreter::peer_audit_ban_duration_text());
+            core.avm().ban_validator(nh.responder_pk.clone(),
+                                     axiom_core_logic::types::PeerAuditBanReason::NotHeldByCoWitness);
+            self.peer_audit_not_held_banned.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            info!("§23.14.6: Peer-audit ANSWERED NotHeld by {} for txid {} — a target we cannot prove co-witnessed it; cleared, no ban (KI#213)",
+                  who, hex::encode(&nh.txid[..8]));
+            self.peer_audit_not_held_cleared.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        core.avm().clear_peer_audit();
+        drop(core);
+        *self.pending_audit.lock() = None;
+        self.peer_audit_sent.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.audit_txs_since_demand.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// §23.14.6: Handle inbound peer audit response from remote validator.
     ///
     /// Remote validator responded to our ping. Core compares the hash.
-    /// Match → clear pending audit. Mismatch → ban for 24h.
+    /// Match → clear pending audit. Mismatch → ban for the ban window (24 h real, 1 h dev).
     pub async fn handle_peer_audit_response(
         &self,
         response: &axiom_core_logic::types::PeerAuditResponse,
@@ -2210,21 +3187,47 @@ impl ConsensusEngine {
 
         // Get expected hash from AVM's pending peer-audit
         if let Some(expected_hash) = core.avm().pending_peer_audit_hash() {
-            // Core is the judge — compare hashes
+            // KI#175: authenticate the response BEFORE any ban. Two checks, both
+            // required — otherwise a forged wrong-fields response injected as B
+            // would get B banned:
+            //   (1) the operational-wallet signature verifies, and
+            //   (2) responder_pk is exactly the peer we demanded (target).
+            // The demand's target_validator_pk is B's witness pk, which IS the
+            // pubkey of B's operational signing_key — so an honest B's response
+            // satisfies both; an attacker cannot produce a valid signature under
+            // B's key.
+            let target_ok = {
+                let pending = self.pending_audit.lock();
+                pending.as_ref().is_some_and(|d| d.target_validator_pk == response.responder_pk)
+            };
+            if !target_ok {
+                warn!("§23.14.6: Peer-audit response responder_pk != demanded target — ignoring (no ban). from={}",
+                      hex::encode(&response.responder_pk[..std::cmp::min(8, response.responder_pk.len())]));
+                return;
+            }
+            if !axiom_core_logic::audit::verify_peer_audit_response_sig(response) {
+                warn!("§23.14.6: Peer-audit response has invalid operational-wallet signature — ignoring (no ban). from={}",
+                      hex::encode(&response.responder_pk[..std::cmp::min(8, response.responder_pk.len())]));
+                return;
+            }
+
+            // Core is the judge — hash B's reported raw fields, compare to A's expected
             if axiom_core_logic::audit::verify_peer_audit_response(&expected_hash, response) {
                 // Match! Peer is honest. Clear pending audit.
                 info!("§23.14.6: Peer-audit PASSED — validator {} is honest",
                       hex::encode(&response.responder_pk[..std::cmp::min(8, response.responder_pk.len())]));
                 core.avm().clear_peer_audit();
                 drop(core);
+                self.peer_audits_passed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // Clear Lambda-level tracking
                 *self.pending_audit.lock() = None;
                 self.peer_audit_sent.store(false, std::sync::atomic::Ordering::Relaxed);
                 self.audit_txs_since_demand.store(0, std::sync::atomic::Ordering::Relaxed);
             } else {
-                // Mismatch! Ban the remote validator for 24h.
-                eprintln!("§23.14.6: Peer-audit FAILED — validator {} returned wrong hash. BANNING for 24h.",
-                         hex::encode(&response.responder_pk[..std::cmp::min(8, response.responder_pk.len())]));
+                // Mismatch! Ban the remote validator for the ban window.
+                eprintln!("§23.14.6: Peer-audit FAILED — validator {} returned wrong hash. BANNING for {}.",
+                         hex::encode(&response.responder_pk[..std::cmp::min(8, response.responder_pk.len())]),
+                         axiom_dmap_vm::interpreter::peer_audit_ban_duration_text());
                 core.avm().ban_validator(
                     response.responder_pk.clone(),
                     axiom_core_logic::types::PeerAuditBanReason::HashMismatch,
@@ -2237,66 +3240,51 @@ impl ConsensusEngine {
                 self.audit_txs_since_demand.store(0, std::sync::atomic::Ordering::Relaxed);
             }
         } else {
-            debug!("§23.14.6: Received peer-audit response but no pending peer-audit — ignoring");
+            self.peer_audit_reply_unexpected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            warn!("§23.14.6: peer-audit response from {} but no pending peer-audit — dropped (late, duplicate or unsolicited)",
+                  hex::encode(&response.responder_pk[..std::cmp::min(8, response.responder_pk.len())]));
         }
     }
 
-    /// §11.5: Issue a Confidence Index for a wallet after successful TX.
+    // §11.5 issue_confidence_index RETIRED — the Ark CI model is receiver-computes
+    // (YPX-010 §7.2 / AXIOM_BUILD_ARK_v1.md rulings 2 & 5): Core stamps the real CI
+    // factors into the sender's k=3 receipt and the receiver scores locally. The
+    // validator-signed placeholder CI (built from hardcoded factors, never read by any
+    // SDK) is gone. The `confidence_index` response field stays as always-None until the
+    // Phase-3/4 CoreID rotation clears it (§13 dead-field cleanup deferred deliberately).
+
+    /// §23.14.6: Resolve a validator's email address from hints by its
+    /// **Ed25519** key — the key a peer-audit `requester_pk` / `responder_pk`
+    /// carries (KI#175: the operational signing key = the witness pk).
+    /// ONE rule with the outbound lookup (`resolve_peer_audit_target_email`).
     ///
-    /// The CI is signed by this validator's Ed25519 key. Client stores it
-    /// and presents it during offline ⟠ Ark trades. The receiver inspects
-    /// CI to decide whether to accept (GREEN/YELLOW/RED).
-    ///
-    /// Core is the law — CI signing message is computed by Core's
-    /// compute_ci_signing_message(). Lambda just provides the data and signs.
-    fn issue_confidence_index(&self, wallet_pk: &[u8]) -> Option<axiom_core_logic::types::ConfidenceIndex> {
-        // Look up wallet stats from storage
-        let wallet_state = self.storage.get_wallet_state(wallet_pk, axiom_core_logic::wallet_id::K_DEFAULT, axiom_core_logic::wallet_id::PROOF_TYPE_DMAP).ok().flatten()?;
-
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        // Build CI with 5-factor data from wallet state (YPX-010)
-        // In production, these factors would come from FACT chain analysis.
-        // Lambda provides the best data it has from its DB.
-        let mut ci = axiom_core_logic::types::ConfidenceIndex {
-            wallet_pk: wallet_pk.to_vec(),
-            last_k3_at: now, // This is a k=3 TX right now
-            ark_tx_count_since_k3: 0, // Reset on k=3
-            k3_balance: wallet_state.balance,
-            ark_tx_mean_amount: 0, // No Ark history yet (just loaded)
-            ark_validator_count: 1, // At least this validator
-            has_fact_scar: false, // Lambda would check FACT chain
-            has_any_k3: true, // This IS a k=3 TX
-            conflict_count: self.stats.double_spend_count.load(std::sync::atomic::Ordering::Relaxed),
-            validator_signature: Vec::new(),
-            issuer_validator_pk: self.public_key.as_bytes().to_vec(),
-        };
-
-        // Core computes the signing message — Lambda signs it
-        let message = axiom_core_logic::ark::compute_ci_signing_message(&ci);
-
-        // Sign with our Ed25519 key
-        use ed25519_dalek::Signer;
-        let signature = self.signing_key.sign(&message);
-        ci.validator_signature = signature.to_bytes().to_vec();
-
-        Some(ci)
+    /// ⚠ WRONG READING, live until 2026-09-24 (the B-side twin of KI#211): this
+    /// compared the requester's Ed25519 key against `hint.validator_id`
+    /// (`blake3(sphincs_pk)`), never matched, so `requester_email` was None and
+    /// ANTIE mailed NO reply — the first delivered requests (epsilon → beta,
+    /// 03:47Z) were answered internally and never sent back; A would have
+    /// banned B NonResponds after 600 s for a reply that was built and dropped.
+    /// §23.14.6 (B's side): the requester's hint address for a peer-audit
+    /// answer. `answered` = an answer (Held or NotHeld) was built; when it was
+    /// and no hint resolves, count `peer_audit_reply_hint_unresolved` — ANTIE
+    /// then replies to the request's `From:` (KI#229), so the answer is still
+    /// sent and this is the observable trace of that fallback.
+    pub fn resolve_peer_audit_reply_email(&self, requester_pk: &[u8], answered: bool) -> Option<String> {
+        let r = self.resolve_validator_email(requester_pk);
+        if r.is_none() && answered {
+            self.peer_audit_reply_hint_unresolved.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        r
     }
 
-    /// §23.14.6: Resolve a validator's email address from hints.
-    /// Looks up the validator_id in the hints table, extracts email from carriers.
-    pub fn resolve_validator_email(&self, validator_id_hex: &str) -> Option<String> {
-        self.storage.get_all_hints().ok()
-            .and_then(|hints: Vec<axiom_core_logic::types::ValidatorHint>| {
-                hints.iter()
-                    .find(|h| hex::encode(h.validator_id) == validator_id_hex)
-                    .and_then(|h| h.carriers.iter()
-                        .find(|c: &&String| c.starts_with("email:"))
-                        .map(|c| c[6..].to_string()))
-            })
+    pub fn resolve_validator_email(&self, ed25519_pk: &[u8]) -> Option<String> {
+        let hints = self.storage.get_all_hints().ok()?;
+        let r = Self::resolve_peer_audit_target_email(&hints, ed25519_pk);
+        if r.is_none() {
+            warn!("§23.14.6: no hint with ed25519_pk={} and an email: carrier ({} hints held) — cannot address this validator",
+                  hex::encode(&ed25519_pk[..std::cmp::min(8, ed25519_pk.len())]), hints.len());
+        }
+        r
     }
 
     /// §23.14.6: Check if a validator is banned by peer-audit.
@@ -2307,34 +3295,73 @@ impl ConsensusEngine {
     }
 
     /// Store a witness response in the per-engine idempotency cache,
-    /// keyed by `response.request_id`. FIFO eviction once
-    /// `WITNESS_IDEMPOTENCY_CACHE_CAP` is exceeded. Safe to call with
+    /// keyed by `response.request_id` (`IdemCache`: count + byte bounded,
+    /// oldest-first — KI#89). Encoded OUTSIDE the lock. Safe to call with
     /// an empty `request_id` — the entry is simply not stored.
-    /// See `process_witness_request`'s dedup gate for read-side.
+    /// Read side: `lookup_witness_response`.
     fn remember_witness_response(&self, response: &WitnessResponse) {
         if response.request_id.is_empty() {
             return;
         }
-        let mut cache = self.witness_idempotency_cache.lock();
-        while cache.len() >= WITNESS_IDEMPOTENCY_CACHE_CAP {
-            cache.pop_front();
-        }
-        cache.push_back((response.request_id.clone(), response.clone()));
+        let Some(bytes) = encode_cached_witness(response) else {
+            warn!("[WITNESS-IDEMPOTENT] request_id={} — CBOR encode failed, NOT cached", response.request_id);
+            return;
+        };
+        let bytes: Arc<[u8]> = bytes.into();
+        self.witness_idempotency_cache.lock().insert(response.request_id.clone(), bytes);
     }
 
     /// Store a redeem response in the per-engine idempotency cache, keyed by
     /// `response.request_id`. Redeem-side mirror of `remember_witness_response`
-    /// (Mac handoff 2026-07-06). FIFO eviction at `WITNESS_IDEMPOTENCY_CACHE_CAP`;
-    /// empty `request_id` is not stored.
+    /// (Mac handoff 2026-07-06; KI#89 bounds). Empty `request_id` is not stored.
     fn remember_redeem_response(&self, response: &RedeemResponse) {
         if response.request_id.is_empty() {
             return;
         }
-        let mut cache = self.redeem_idempotency_cache.lock();
-        while cache.len() >= WITNESS_IDEMPOTENCY_CACHE_CAP {
-            cache.pop_front();
+        let Some(bytes) = cbor_encode(response) else {
+            warn!("[REDEEM-IDEMPOTENT] request_id={} — CBOR encode failed, NOT cached", response.request_id);
+            return;
+        };
+        let bytes: Arc<[u8]> = bytes.into();
+        self.redeem_idempotency_cache.lock().insert(response.request_id.clone(), bytes);
+    }
+
+    /// The cached witness response for `request_id`, VERBATIM (the stripped
+    /// duplicate chain re-attached). The ONE reader of the witness cache — the
+    /// gate in `process_witness_request` and the tests both call it. Decoded
+    /// outside the lock. A stored value that fails to decode is a MISS (logged).
+    pub(crate) fn lookup_witness_response(&self, request_id: &str) -> Option<WitnessResponse> {
+        if request_id.is_empty() {
+            return None;
         }
-        cache.push_back((response.request_id.clone(), response.clone()));
+        let bytes = self.witness_idempotency_cache.lock().get(request_id)?;
+        let decoded = decode_cached_witness(&bytes);
+        if decoded.is_none() {
+            error!("[WITNESS-IDEMPOTENT] request_id={} — cached bytes do not decode; treating as MISS", request_id);
+        }
+        decoded
+    }
+
+    /// The cached redeem response for `request_id`. The ONE reader of the redeem
+    /// cache (gate in `process_redeem_request` + tests).
+    pub(crate) fn lookup_redeem_response(&self, request_id: &str) -> Option<RedeemResponse> {
+        if request_id.is_empty() {
+            return None;
+        }
+        let bytes = self.redeem_idempotency_cache.lock().get(request_id)?;
+        let decoded = ciborium::de::from_reader::<RedeemResponse, _>(&bytes[..]).ok();
+        if decoded.is_none() {
+            error!("[REDEEM-IDEMPOTENT] request_id={} — cached bytes do not decode; treating as MISS", request_id);
+        }
+        decoded
+    }
+
+    /// `/stats` `idempotency` footprint: (witness entries, witness bytes,
+    /// redeem entries, redeem bytes). KI#89 — the plateau the load soak reads.
+    pub(crate) fn idempotency_cache_footprint(&self) -> (usize, usize, usize, usize) {
+        let (we, wb) = { let c = self.witness_idempotency_cache.lock(); (c.len(), c.bytes()) };
+        let (re, rb) = { let c = self.redeem_idempotency_cache.lock(); (c.len(), c.bytes()) };
+        (we, wb, re, rb)
     }
 
     /// Process a witness request
@@ -2344,6 +3371,27 @@ impl ConsensusEngine {
     /// real stored state — S-ABR overlap decision + CLARA/RECALL
     /// attestation gates — then refills from Lambda's own records when
     /// Core says overlapped.
+    /// Fable review 2026-10-01 F-3 — the ONE call every Lambda entry point that
+    /// forwards a client-carried OODS attestation to Core makes first: the
+    /// TARDIS forward-only bound against THIS validator's wall clock
+    /// (`check_attested_tick_not_future`), counted on refusal (RULE 3).
+    fn refuse_future_attested_tick(
+        &self,
+        oods_attestation: Option<&axiom_core_logic::types::NablaOodsAttestation>,
+    ) -> Result<(), LambdaError> {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let verdict = check_attested_tick_not_future(oods_attestation, now_secs);
+        if let Err(ref e) = verdict {
+            self.stats.attested_tick_future_refused
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            warn!("[F-3] refusing request: {}", e);
+        }
+        verdict
+    }
+
     pub async fn process_witness_request(
         &self,
         request: WitnessRequest,
@@ -2357,6 +3405,17 @@ impl ConsensusEngine {
         )
         .unwrap_or((3, axiom_core_logic::wallet_id::PROOF_TYPE_DMAP));
 
+        // YP §26.17.6.5 B4 — keep every certificate this request carries
+        // (verified), then assemble the set Core is handed for the client's chain.
+        self.absorb_certificates(
+            request.fact_certificates.iter()
+                .chain(request.overlapped_signatures.iter().filter_map(|s| s.vbc_bundle.as_ref()))
+                .chain(request.prev_receipts.iter()
+                    .flat_map(|r| r.witness_sigs.iter().filter_map(|s| s.vbc_bundle.as_ref()))),
+        );
+        let presented_certificates =
+            self.present_certificates(request.sender_fact_chain.as_ref(), &request.fact_certificates);
+
         // Request-id idempotency — replay the prior response verbatim
         // when the same request_id arrives again. SDK fan-out (k=3)
         // and §27.5 / S-ABR relay can both deliver the same request to
@@ -2366,13 +3425,19 @@ impl ConsensusEngine {
         // different Dilithium sig), leaving the receiver with orphan
         // duplicate cheques after redeem.  Mac handoff 2026-06-05.
         if !request.request_id.is_empty() {
-            let cache = self.witness_idempotency_cache.lock();
-            if let Some((_, resp)) = cache.iter().find(|(k, _)| k == &request.request_id) {
+            if let Some(resp) = self.lookup_witness_response(&request.request_id) {
+                self.stats.idempotency_witness_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 debug!("[WITNESS-IDEMPOTENT-HIT] request_id={} — replaying cached response",
                        request.request_id);
-                return Ok(resp.clone());
+                return Ok(resp);
             }
+            self.stats.idempotency_witness_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+
+        // Fable review 2026-10-01 F-3 — TARDIS forward-only bound on the carried
+        // attestation, before ANY Core execution on this request: CL2, CL3 and
+        // (via `sign_requested_vbc`) CL8 all read `request.oods_attestation`.
+        self.refuse_future_attested_tick(request.oods_attestation.as_ref())?;
 
         // YPX-002 P6 — simulated ingress latency. Zero-cost when
         // AXIOM_SIM_NET_DELAY_MAX_MS is unset. Placed before any work
@@ -2550,19 +3615,12 @@ impl ConsensusEngine {
         // ZKP work without acceleration".
         if request.transaction.required_k > 0 {
             let tx_proof_type = request.transaction.proof_type;
-            if tx_proof_type == axiom_core_logic::wallet_id::PROOF_TYPE_ZKP {
-                let qual = self.zkp_qualification.lock();
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                if !qual.is_valid(now) {
-                    warn!("ZKP TX accepted on non-ZKP-qualified validator (YPX-007) — \
-                           processing will be slow but MUST proceed for S-ABR continuity. \
-                           proof_type={}, qualified={}, pk={}",
-                          tx_proof_type, qual.zkp_qualified,
-                          hex::encode(&request.transaction.client_pk[..8.min(request.transaction.client_pk.len())]));
-                }
+            if tx_proof_type == axiom_core_logic::wallet_id::PROOF_TYPE_ZKP
+                && self.zkp_qualification.lock().is_none()
+            {
+                warn!("ZKP-tier request on a validator without a qualification record — \
+                       serving anyway (YPX-007 §9.6, S-ABR continuity). pk={}",
+                      hex::encode(&request.transaction.client_pk[..8.min(request.transaction.client_pk.len())]));
             }
             // proof_type == PROOF_TYPE_DMAP (1) or PROOF_TYPE_ARK (2) — same path.
         }
@@ -2607,6 +3665,29 @@ impl ConsensusEngine {
         // Step 2: Get sender's wallet state
         let wallet_state = self.storage.get_wallet_state(&request.transaction.client_pk, sender_k, sender_pt)?;
 
+        // §5.2.2c — the wall-clock half. Core has no clock; Lambda does.
+        //
+        // §4.2a / KI#167 (2026-09-14) — the two NO-VALUE kinds pass this half
+        // exactly as they pass Core's tick half: a certificate request (the
+        // first full certificate and every renewal) and the contribution
+        // emission claim move nothing out of the wallet, and Core carries the
+        // lock pair forward in their produced state. Every debit stays locked.
+        let no_value_kind = request.transaction.is_vbc_request()
+            || request.transaction.is_emission_claim();
+        if let Some(ref ws) = wallet_state {
+            if ws.wall_clock_lock != 0 && !no_value_kind {
+                let now = crate::storage::unix_now_pub();
+                if now < ws.wall_clock_lock {
+                    warn!("STAKE LOCKED (wall clock): now={} < lock={}", now, ws.wall_clock_lock);
+                    // CoreRejected boxes a ValidationError so the wire code is
+                    // E_STAKE_LOCKED; the refusal is Lambda's own.
+                    return Err(LambdaError::CoreRejected(Box::new(
+                        axiom_core_logic::types::ValidationError::StakeLocked,
+                    )));
+                }
+            }
+        }
+
         // YPX-018 — CLARA: NO storage write here.
         //
         // SECURITY HOTFIX (Phase 5e): the previous version called
@@ -2619,11 +3700,14 @@ impl ConsensusEngine {
         //   1. Pass the actual stored state + the clara_attestation to Core.
         //   2. Core CL2 verifies the attestation (signature, NBC trust anchor,
         //      eligibility against the actual stored state).
-        //   3. ONLY after Core returns Accept, Lambda commits the roll-forward
-        //      via storage.clara_roll_forward() (post-Core, fail-closed).
-        //
-        // The post-Core commit is wired below near where the witness response
-        // is built, after finalize_transaction succeeds.
+        //   3. ~~ONLY after Core returns Accept, Lambda commits the roll-forward
+        //      via storage.clara_roll_forward() (post-Core, fail-closed).~~
+        //      DELETED 2026-10-02 (owner ruling, KI#256 review finding 5): it ran
+        //      after finalize_transaction had already written the produced state,
+        //      so it never applied. Core CL2 judges eligibility only (stored ==
+        //      healed_to, KI#260 — its rewrite is deleted too); the stored row
+        //      advances by the ordinary finalize write. Lambda keeps
+        //      NO CLARA storage write at all.
         //
         // Reference: YPX-018 §2.3, Yellow Paper §17.10.14, §26.17.10.
 
@@ -2656,8 +3740,8 @@ impl ConsensusEngine {
                 ));
             }
         
-        // (YPX-007 routing was moved to the top of process_witness_request,
-        // before CL1, so unqualified validators early-reject ZKP TXs.)
+        // (YPX-007: no qualification routing — ZKP TXs are served whether or
+        // not this validator holds a qualification record, KI#125 / §9.6.)
 
         // DEBUG: Log state lookup result
         if let Some(ref state) = wallet_state {
@@ -2673,7 +3757,7 @@ impl ConsensusEngine {
         debug!("Transaction consumed_state_id: {}", 
               hex::encode(&request.transaction.consumed_state_id[..8]));
         
-        // Carry auth_hash from stored wallet state (GAP-A fix: stolen-key protection).
+        // Carry auth_hash from stored wallet state (GAP-A wiring fix; NOT stolen-key protection).
         // auth_hash is set via the dedicated set_auth_hash API (§4.5), not from
         // witness requests. Validators store it independently.
         let stored_auth_hash = self.storage.get_wallet_state(&request.transaction.client_pk, sender_k, sender_pt)
@@ -2736,7 +3820,9 @@ impl ConsensusEngine {
                 // signature byte field to integer-array on round-trip,
                 // which silently corrupts witness verification on cache
                 // hits. CLAUDE.md §13: byte fields don't survive JSON.
-                if let Ok(resp) = ciborium::de::from_reader::<WitnessResponse, _>(&cached_response[..]) {
+                if let Some(WitnessCacheEntry { required_k: cached_k, response: resp }) =
+                    WitnessCacheEntry::decode(&cached_response[..])
+                {
                     // Extract fact_signature and produced_state_id for Core verification
                     let fact_sig = resp.witness_signature.as_ref()
                         .and_then(|ws| ws.fact_signature.as_ref());
@@ -2770,17 +3856,17 @@ impl ConsensusEngine {
                             axiom_core_logic::wallet_id::is_dev_wallet(
                                 &request.transaction.sender_wallet_id,
                             ),
+                            // Fork Settlement R4: the k Core CL3 signed with, stored
+                            // beside the response at production (`WitnessCacheEntry`).
+                            cached_k,
                             &[], // send-path cache — send links never inherit (§1.5.1a)
-                            // §1.5.4: a burn is a send to BURN_ADDRESS; bind its target
-                            // so a burn TX's cached sig matches what Core CL3 signed. A
-                            // mismatch here is a cache MISS (falls through to fresh
-                            // production), never a wrong accept.
-                            if request.transaction.receiver_wallet_id
-                                == axiom_core_logic::types::BURN_ADDRESS {
-                                request.transaction.burn_target_tx_id.as_ref()
-                            } else {
-                                None
-                            },
+                            // §1.5.4 / KI#54: the burn target through Core's ONE
+                            // derivation (`fact_burn_target`, the one CL3 signs with) —
+                            // this site used to gate on BURN_ADDRESS alone, which
+                            // dropped the self-send heal-burn's target (a guaranteed
+                            // miss there). A mismatch is a cache MISS (falls through
+                            // to fresh production), never a wrong accept.
+                            axiom_core_logic::fact::fact_burn_target(&request.transaction),
                             fact_sig,
                         ).is_ok() {
                             info!("YPX-016: Cache VERIFIED by Core (fact_signature valid) pk={} seq={}",
@@ -2825,11 +3911,17 @@ impl ConsensusEngine {
                   hex::encode(&request.transaction.consumed_state_id[..8]),
                   hex::encode(&core_state_id[..8]),
                   hex::encode(&request.transaction.client_pk[..8]));
-            return Err(LambdaError::CoreError(
-                format!("S-ABR state chain mismatch: requested csid={} stored={}",
-                    hex::encode(&request.transaction.consumed_state_id[..8]),
-                    hex::encode(&core_state_id[..8]))
-            ));
+            // TYPED verdict: this is a protocol rejection with an exact meaning
+            // (S-ABR state-chain mismatch), not an internal fault. Reporting it
+            // as CoreError(String) mapped it to E_CORE_UNCLASSIFIED/Internal, so
+            // the client saw an opaque "internal error" instead of
+            // E_SABR_HASH_MISMATCH + RecoverableDrift + ClaraHealNextSend — i.e.
+            // the heal hint this very path exists to signal was dropped. The
+            // csid/stored detail stays in the log line above (client-facing
+            // messages are keyed on the code, never parsed for detail).
+            return Err(LambdaError::CoreRejected(Box::new(
+                axiom_core_logic::types::ValidationError::SABRHashMismatch,
+            )));
         }
 
         // Identity binding: pass stored wallet_id to Core so it can enforce
@@ -2859,29 +3951,62 @@ impl ConsensusEngine {
         // CL2 also verifies, IN CORE, what no Lambda path ever verified
         // before this rewire: the RECALL attestation (Nabla sig + txid
         // binding + over-reclaim equality — forged/attestation-less recalls
-        // die HERE, at witness time) and the CLARA attestation (the
-        // post-Core roll-forward commit below finally matches its comment).
+        // die HERE, at witness time) and the CLARA attestation (eligibility
+        // stored == healed_to only — nothing is rewritten, KI#260).
         // ════════════════════════════════════════════════════════════════
-        let cl2_state = Some(WalletState {
-            public_key: request.transaction.client_pk.clone(),
-            balance: request.claimed_balance_for_sabr,
-            wallet_seq: request.transaction.wallet_seq.saturating_sub(1),
-            state_id: core_state_id,
-            auth_hash: stored_auth_hash.clone(),
-            hibernation_until: request.claimed_hibernation_until,
-            wallet_id: stored_wallet_id.clone(),
-            group_members: None,
-        });
+        // The declared deadlines (hibernation + stake lock) come from ONE
+        // builder shared with the CL3 view below — see
+        // `witness_anchor_state_view` for why they are client-declared and
+        // why the two views must not carry independent literals.
+        let cl2_state = Some(witness_anchor_state_view(
+            &request,
+            request.claimed_balance_for_sabr,
+            request.transaction.wallet_seq.saturating_sub(1),
+            core_state_id,
+            stored_auth_hash.clone(),
+            stored_wallet_id.clone(),
+            // group_members stays None here — CL3's job via the refilled record.
+            None,
+        ));
+        // §23.14 (2026-09-24): the CL2 pre-pass is its own Core execution and
+        // decrements a pending SELF audit's countdown, so it carries the resolved
+        // confirmation too — measured "this CL2 execution carries NO
+        // audit_confirmation" at remaining=4 and 1 while Lambda had built one.
+        self.sync_audit_mirror().await;   // no core guard held yet (the CL2 block takes it below)
+        let resolved_cl2_audit = self.resolve_audit_confirmation(&request.audit_confirmation);
+        let injected_cl2_request;
+        let cl2_request: &axiom_core_logic::types::WitnessRequest = match &resolved_cl2_audit {
+            Some(c) if request.audit_confirmation.is_none() => {
+                let mut r = request.clone();
+                r.audit_confirmation = Some(c.clone());
+                injected_cl2_request = r;
+                &injected_cl2_request
+            }
+            _ => &request,
+        };
         let cl2_outputs = {
             let core = self.core.write().await;
             core.run_cl2(
-                &request,
+                cl2_request,
                 cl2_state.as_ref(),
                 frozen_wallets.clone(),
                 Some(self.public_key.as_bytes().to_vec()),
                 Some(self.vbc_bundle()),
-            )?
+                            presented_certificates.clone(),
+)?
         };
+        // KI#256 live evidence, EVERY hop: `run_cl2` returned Ok, so Core ran the
+        // YPX-018 CL2 CLARA gate on THIS attestation (wallet binding, Nabla sig,
+        // NBC anchor, eligibility) and accepted — a refusal returns E_CLARA_*
+        // above. (Was logged after finalize, which only the k-th hop reaches.)
+        if let Some(ref clara) = request.clara_attestation {
+            info!(
+                "CLARA: Core accepted witness request carrying attestation pk={} heal_txid={} healed_to={}",
+                hex::encode(&request.transaction.client_pk[..8.min(request.transaction.client_pk.len())]),
+                hex::encode(&clara.heal_txid[..8]),
+                hex::encode(&clara.healed_to_state_id[..8]),
+            );
+        }
         // Core's decision — NOT Lambda's. `wire_overlapped` above only chose
         // the state_id view; this drives the refill and everything after.
         let we_are_overlapped = cl2_outputs.is_overlapped == Some(true);
@@ -2893,12 +4018,15 @@ impl ConsensusEngine {
         //  1. FIRST TX / GENESIS (`prev_receipts` empty). AXIOM Origin: "Genesis =
         //     CL2's empty-prev_receipts first-tx path." Core CL2 returns
         //     is_overlapped=Some(true) here as "first TX, all validators
-        //     proceed" — NOT "I hold a prior record." A genesis CLAIM credits
-        //     from the pool and has no prior TransactionRecord by definition,
-        //     so `lookup_previous_tx_record` MISSES — that is normal, not an
-        //     error, and we use the declared values (Core's genesis path
-        //     validated the credit; the balance is bound into the
-        //     genesis_state_id). A genesis-FUNDED send (a stored genesis
+        //     proceed" — NOT "I hold a prior record." A genesis CLAIM has no
+        //     prior TransactionRecord by definition, so
+        //     `lookup_previous_tx_record` MISSES — that is normal, not an
+        //     error, and we use the declared values. (Corrected 2026-10-02,
+        //     KI#251: this read "a genesis CLAIM credits from the pool" — it
+        //     does not. The claim SEND leaves the sender's balance UNCHANGED;
+        //     the pool amount is credited only at the CL5 self-REDEEM of the
+        //     claim cheque. The declared balance is bound into the opening
+        //     genesis_state_id.) A genesis-FUNDED send (a stored genesis
         //     state exists) refills from the genesis pseudo-record. So: try
         //     the lookup, fall back to declared on miss. This is the ONE place
         //     a lookup miss is not fail-stop, because "no prior record" is the
@@ -2937,7 +4065,10 @@ impl ConsensusEngine {
                 }
                 Err(_) => {
                     // Genesis CLAIM (or any first TX with no stored genesis) —
-                    // declared values; Core's genesis-claim path caps + credits.
+                    // declared values. Core's genesis-claim path validates the
+                    // claim; it credits nothing here — the claim send leaves the
+                    // balance unchanged, the credit lands at the CL5 redeem
+                    // (KI#251; was "caps + credits", corrected 2026-10-02).
                     debug!(
                         "S-ABR First-TX (Core CL2): genesis claim, no prior record — declared balance={}",
                         request.claimed_balance_for_sabr
@@ -2998,8 +4129,9 @@ impl ConsensusEngine {
                 let scar_count = scar_consent_gate_count(
                     chain,
                     &request.transaction,
-                    request.clara_attestation.is_some(),
+                    request.clara_attestation.as_ref().map(|a| a.heal_txid),
                 );
+                // ⚠ scar count: use 0 / NON-0 only. Never threshold — it plateaus (CLAUDE.md #14) and core/SDK disagree.
                 if scar_count > 0 {
                     let txid = self.compute_txid(&request.transaction);
 
@@ -3148,25 +4280,21 @@ impl ConsensusEngine {
         // which is consistent across all validators (V1, V2, V3).
         let effective_balance = sabr_result.balance();
 
-        let wallet_state_ref = Some(WalletState {
-            public_key: request.transaction.client_pk.clone(),
-            balance: effective_balance,
-            wallet_seq: sabr_result.wallet_seq().saturating_sub(1),
-            state_id: core_state_id,
-            auth_hash: stored_auth_hash,
-            // YPX-020: use the CLIENT-DECLARED hibernation_until (not stored) so
-            // Core's §15 re-derives the prior state_hash with its real value AND
-            // the binary gate sees the flag. The declared value is NOT trusted
-            // blindly — `verify_state_anchored` rejects unless it re-derives to the
-            // k-signed `prev_receipt.state_hash`, so a wrong value (e.g. 0 to dodge
-            // the gate) fails the hash. REQUIRED for the overlap-relaxed HAL
-            // completion: it reaches FRESH validators that never stored the
-            // re-anchor's produced state, so `wallet_state` here is stale (0) and
-            // §15 would wrongly reject. Mirrors `claimed_balance_for_sabr`.
-            hibernation_until: request.claimed_hibernation_until,
-            wallet_id: stored_wallet_id,
-            group_members: stored_group_members,
-        });
+        // YPX-020 / §5.2.2c: the CLIENT-DECLARED deadlines, from the SAME
+        // builder as the CL2 view above — the argument for declaring them (and
+        // why declaring them is safe) lives once, on
+        // `witness_anchor_state_view`, so the two views cannot drift on it
+        // again. Everything else here is Lambda-derived: the balance and seq
+        // come from the S-ABR record, not the wire.
+        let wallet_state_ref = Some(witness_anchor_state_view(
+            &request,
+            effective_balance,
+            sabr_result.wallet_seq().saturating_sub(1),
+            core_state_id,
+            stored_auth_hash,
+            stored_wallet_id,
+            stored_group_members,
+        ));
 
         // [PRODUCED-INPUTS DIAG] — emitted by EVERY validator before
         // Core CL3 runs. `produced_state_id` is BLAKE3 over (pk,
@@ -3227,7 +4355,10 @@ impl ConsensusEngine {
         
         // Step 6: Check if k reached (variable per YPX-007)
         let prev_receipts = self.collect_prev_receipts(&request).await?;
-        let k = effective_k(&request.transaction);
+        // YP §17.3.1.4 v2.19.0 (KI#150): k is Core's — CL2 extracted it from the
+        // receiver address (protocol receivers are Core's choice), never
+        // `tx.required_k` (client-supplied). Floor 3.
+        let k = (cl2_outputs.required_k as usize).max(MIN_WITNESSES);
 
         if all_sigs.len() >= k {
             // We have enough witnesses - produce final receipt via Core (CL3)
@@ -3288,50 +4419,21 @@ impl ConsensusEngine {
                 }
             };
 
-            // YPX-018 Phase 5e — POST-CORE CLARA roll-forward commit (fail-closed).
-            //
-            // Core CL2 just verified the attestation cryptographically and the
-            // eligibility against this validator's stored state. Now Lambda
-            // commits the storage update — the only safe order. If the commit
-            // fails for any reason, fail the whole witness request: we cannot
-            // emit a witness signature for a TX whose state didn't actually
-            // advance locally.
-            if let Some(ref clara) = request.clara_attestation {
-                if clara.wallet_pk.as_slice() == request.transaction.client_pk.as_slice() {
-                    let applied = self.storage.clara_roll_forward(
-                        &request.transaction.client_pk,
-                        sender_k, sender_pt,
-                        &clara.healed_from_state_id,
-                        &clara.healed_to_state_id,
-                        clara.healed_at_seq,
-                        clara.healed_balance, // Phase 5f Finding 4
-                        &clara.garbage_state_ids,
-                    )?;
-                    if !applied {
-                        // This validator's stored state is not in the garbage
-                        // list — it was never poisoned by the partial, or it
-                        // already rolled forward from a prior TX. Proceed with
-                        // normal witness production. The attestation was for
-                        // the poisoned validators; clean validators just skip.
-                        debug!(
-                            "CLARA: roll-forward not applicable (validator not poisoned) pk={}",
-                            hex::encode(&request.transaction.client_pk[..8.min(request.transaction.client_pk.len())]),
-                        );
-                    }
-                    info!(
-                        "CLARA: post-Core roll-forward applied pk={} → {}",
-                        hex::encode(&request.transaction.client_pk[..8.min(request.transaction.client_pk.len())]),
-                        hex::encode(&clara.healed_to_state_id[..8]),
-                    );
-                }
-            }
+            // ~~YPX-018 Phase 5e — POST-CORE CLARA roll-forward commit~~ — DELETED
+            // 2026-10-02 (owner ruling on the KI#256 review): it ran AFTER
+            // `finalize_transaction` had written the produced state at the same
+            // key, so it could never apply on a successful witness (MEASURED). A
+            // poisoned row advances by that ordinary finalize write. The KI#256
+            // evidence line is logged right after `run_cl2` (every hop).
 
-            // YPX-009 §4: Store Pulse audit request from Core for next TX
-            self.handle_pulse_audit_request(pulse_audit_request.clone());
+            // YPX-009 §4: the audit request was captured at the AVM exit
+            // (`PulseSink`), for this and every other execution.
+            let _ = &pulse_audit_request;
 
-            // YPX-009 §5: Forward PulseProof to Nabla for gossip broadcast.
-            // Fire-and-forget: Lambda signs the proof, Nabla gossips it to peers.
-            if let Some(ref ppd) = pulse_proof_data {
+            // YPX-009 §5: Forward every PulseProof captured since the last
+            // witness — this execution's and any from redeems — to Nabla for
+            // gossip. Fire-and-forget: Lambda signs, Nabla gossips.
+            for ppd in self.pulse.take_proofs().iter() {
                 let validator_pk = *self.public_key.as_bytes();
                 let epoch = ppd.epoch;
                 let full_accumulator = ppd.full_accumulator;
@@ -3340,16 +4442,13 @@ impl ConsensusEngine {
                 let sample_size = ppd.sample_size;
                 let argon2id_per_sec = ppd.argon2id_per_sec;
 
-                // Sign the pulse proof payload (same domain tag as Nabla verification)
-                let sign_payload = {
-                    let mut hasher = blake3::Hasher::new();
-                    hasher.update(b"AXIOM_PULSE_PROOF");
-                    hasher.update(&validator_pk);
-                    hasher.update(&epoch.to_le_bytes());
-                    hasher.update(&full_accumulator);
-                    hasher.update(&audit_hash);
-                    *hasher.finalize().as_bytes()
-                };
+                // Sign the pulse proof payload — Core's ONE builder (Pattern 1;
+                // Nabla verifies and CL8's §5.2.2e candidacy rule checks the
+                // same bytes).
+                // A LIVE Pulse carries no seed tick (part iii is the candidacy
+                // proof's); the payload is byte-identical to before.
+                let sign_payload = axiom_core_logic::pulse::pulse_proof_sign_payload(
+                    &validator_pk, epoch, &full_accumulator, &audit_hash, None);
                 use ed25519_dalek::Signer;
                 let signature = self.signing_key.sign(&sign_payload).to_bytes().to_vec();
 
@@ -3368,37 +4467,21 @@ impl ConsensusEngine {
                     audit_hash,
                     argon2id_per_sec,
                     signature,
+                    attested_tick: None,
                 };
-                let envelope = axiom_core_logic::nabla_wire::WireMessage::PulseProofRequest(req);
-                let mut cbor_req = Vec::new();
-                match ciborium::ser::into_writer(&envelope, &mut cbor_req) {
-                    Ok(()) => {
-                        let mut framed = Vec::with_capacity(4 + cbor_req.len());
-                        framed.extend_from_slice(&(cbor_req.len() as u32).to_be_bytes());
-                        framed.extend_from_slice(&cbor_req);
-                        tokio::spawn(async move {
-                            use tokio::io::{AsyncWriteExt, AsyncReadExt};
-                            // TCP port = HTTP port + 1074 (HTTP 6226 → TCP 7300).
-                            let nabla_addr = "127.0.0.1:7300";
-                            if let Ok(mut stream) = tokio::net::TcpStream::connect(nabla_addr).await {
-                                let _ = stream.write_all(&framed).await;
-                                // Drain the length-prefixed response (best
-                                // effort — fire-and-forget).
-                                let mut len_buf = [0u8; 4];
-                                let _ = tokio::time::timeout(
-                                    std::time::Duration::from_secs(5),
-                                    stream.read_exact(&mut len_buf),
-                                ).await;
-                                tracing::debug!("YPX-009: PulseProof forwarded to Nabla via TCP (epoch={})", epoch);
-                            } else {
-                                tracing::warn!("YPX-009: Could not connect to Nabla at {} for PulseProof", nabla_addr);
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        tracing::warn!("YPX-009: CBOR encode PulseProofRequest failed: {}", e);
-                    }
+                // §5.2.2e — keep the latest SIGNED proof: it is this validator's
+                // candidacy credential (admin `/pulse`; `validator-setup
+                // --request-vbc` reads it and attaches it to the request).
+                if let Err(e) = self.storage.set_last_pulse_proof(&req) {
+                    warn!("YPX-009: could not persist the latest PulseProof: {}", e);
                 }
+                let envelope = axiom_core_logic::nabla_wire::WireMessage::PulseProofRequest(req);
+                tokio::spawn(async move {
+                    match Self::nabla_tcp_request(&envelope, "PulseProofResponse").await {
+                        Ok(_) => tracing::info!("YPX-009: PulseProof forwarded to Nabla via TCP (epoch={})", epoch),
+                        Err(e) => tracing::warn!("YPX-009: PulseProof forward to Nabla failed: {}", e),
+                    }
+                });
             }
 
             // finalize_transaction patches fact_signature, receipt_signature,
@@ -3481,6 +4564,15 @@ impl ConsensusEngine {
                     || recv == axiom_core_logic::types::FEE_ADDRESS
             };
 
+            // YPX-010 §12 — an Ark settlement KEEPS the cheque. A settlement is the
+            // offline send replayed online; issuing the cheque is what mints the
+            // receiver's VALIDATOR-backed cheque, whose claim is the receiver's
+            // double-redeem anchor (Nabla `cheque_claims` consume-once, §12.3) and,
+            // for the sender side, heals the send-link scar on registration. Lambda
+            // therefore has NO settlement-specific branch — a settlement is a normal
+            // send here; the receiver settles its redeem idempotently (SDK, §12.2) and
+            // Nabla's consume-once adjudicates any double-spend. Only protocol TXs
+            // (burn/deed/fee — no receiver wallet) skip the cheque.
             let cheque = if is_protocol_tx {
                 None
             } else {
@@ -3498,6 +4590,26 @@ impl ConsensusEngine {
                     dmap_output_hash,
                     request.nabla_hint.clone(), // YPX-002 §3.2 sticky Nabla
                 ))
+            };
+
+
+            // ── A VBC REQUEST PRODUCES A CERTIFICATE, NEVER A CHEQUE ──────
+            // `AXIOM_DESIGN_ValidatorJoin.md` §5.2.2d. The cheque slot is the
+            // right place for it (same round, same k), but the two must never
+            // both be present: a certificate carries no value, and anything
+            // that files it as a pending cheque would show a cert as money.
+            let (cheque, vbc_signature) = if request.transaction.is_vbc_request() {
+                (None, Some(self.sign_requested_vbc(&request).await?))
+            } else if axiom_core_logic::validation::is_initial_anchor(
+                &request.transaction, None, !request.prev_receipts.is_empty(),
+            ) {
+                // KI#216 INITIAL-ANCHOR: a wallet's self-made first state moves
+                // nothing — like the certificate request above, nothing is
+                // minted (a 0-atom self-cheque would only ever be litter the
+                // app is told to redeem). ONE predicate, Core's.
+                (None, None)
+            } else {
+                (cheque, None)
             };
 
             // Delivery log: Lambda records intent. encrypted=false because Lambda
@@ -3595,10 +4707,14 @@ impl ConsensusEngine {
                 overlapped_signatures: all_sigs,
                 rejection: None,
                 cheque_for_receiver: cheque,
+                vbc_signature,
                 receipt: Some(receipt.clone()),
                 produced_state_id: Some(receipt.produced_state_id.to_vec()),
                 commitment_hash: request.commitment_hash.clone(),
                 state_hash: Some(receipt.state_hash.to_vec()),
+                // §32.3 — surface Core's authoritative sender-lineage so the SDK
+                // adopts (never recomputes) it into the rebuilt redeem receipt.
+                sender_state: receipt.sender_state.map(|s| s.to_vec()),
                 // receipt.receipt_commitment is always non-zero at this
                 // point because finalize_transaction (consensus.rs:4308)
                 // hard-errors if Core didn't return one — so we always
@@ -3608,13 +4724,24 @@ impl ConsensusEngine {
                 txid: receipt.txid.to_vec(),
                 validator_hints: response_hints,
                 sender_fact_chain,
-                audit_demand: self.pending_audit.lock().clone(),
+                // DEADLOCK FIX (2026-09-23, CoreID ab98b539): take the pending_audit
+                // snapshot in its OWN statement so the MutexGuard is dropped HERE. Written
+                // inline as `audit_demand: self.pending_audit.lock().clone()`, the guard is a
+                // temporary that lives to the END of this struct literal — so it is STILL held
+                // when `outbound_peer_audit` (a few fields down) calls pending_peer_audit_outbound(),
+                // which re-locks pending_audit (a non-reentrant parking_lot::Mutex) at
+                // consensus.rs:~2470 → self-deadlock. It only surfaces once §23.14 arms a
+                // peer-audit request (before that, pending_peer_audit_outbound returns None early
+                // at :2452 and never reaches the re-lock), which is why claim/redeem worked and the
+                // fleet then wedged the first witness after "Core generated audit demand" — all 18
+                // lambda threads futex_wait (gdb-confirmed live, the first peer-audit roll).
+                audit_demand: { let d = self.pending_audit.lock().clone(); d },
                 audit_request: pulse_audit_request,
                 nonce_challenge: pulse_nonce_challenge,
                 pulse_proof: pulse_proof_data,
                 audit_failed: pulse_audit_failed,
-                outbound_peer_audit: self.pending_peer_audit_outbound(),
-                confidence_index: self.issue_confidence_index(&request.transaction.client_pk),
+                outbound_peer_audit: self.pending_peer_audit_outbound().await,
+                confidence_index: None, // Ark CI retired (receiver-computes); field stays None until Phase-3/4 rotation
                 scar_consent_for_receiver: None,
                 scar_consent_voucher: scar_consent_voucher_out.clone(),
             };
@@ -3637,8 +4764,9 @@ impl ConsensusEngine {
                 let tx_hash = *blake3::hash(
                     &serde_json::to_vec(&request.transaction).unwrap_or_default()
                 ).as_bytes();
-                let mut serialized = Vec::new();
-                if ciborium::ser::into_writer(&response, &mut serialized).is_ok() {
+                // Fork Settlement R4: store the k of the CL3 run that produced
+                // this response's fact_signature (the finalizer's receipt k).
+                if let Some(serialized) = WitnessCacheEntry::encode(receipt.required_k, &response) {
                     let _ = self.storage.set_witness_cache(
                         &request.transaction.client_pk,
                         sender_k, sender_pt,
@@ -3685,13 +4813,54 @@ impl ConsensusEngine {
             // `audit_confirmation`, `audit_response`,
             // `clara_attestation` — all envelope-sourced inside
             // `produce_witness{_dmap}`; no longer threaded here.
-            let _ = (&prev_receipts, &resolved_audit);
+            let _ = &prev_receipts;
+            // §23.14 (KI#210): thread the Lambda-RESOLVED audit confirmation into
+            // the CL2 WITNESS Core call — the finalize path already does this
+            // (consensus.rs ~3641, `resolved_finalize_audit`). produce_witness_dmap
+            // reads `envelope.audit_confirmation`, which is the CLIENT's and is None
+            // for a SELF-audit (the validator resolves its own from its DB). Before
+            // this, the self-audit confirmation was BUILT (resolve_audit_confirmation)
+            // but delivered to Core ONLY on finalize, so a self-audit armed while
+            // this validator then acted as a WITNESS — the common case, since only
+            // ONE validator finalizes per round — never received its confirmation
+            // and expired to a self-terminate (tier C: 15 expired vs 13 cleared-on-
+            // finalize, KI#210). resolve_audit_confirmation already prefers a
+            // client-supplied confirmation, so this only fills the self-audit gap;
+            // the trigger tx is in this validator's audit buffer (the demand arms
+            // only on the audited execution — pulse_post_execute returns early when
+            // `!accumulate`), so the injected confirmation verifies.
+            let injected_request;
+            let core_request: &axiom_core_logic::types::WitnessRequest = match &resolved_audit {
+                Some(c) if request.audit_confirmation.is_none() => {
+                    let mut r = request.clone();
+                    r.audit_confirmation = Some(c.clone());
+                    injected_request = r;
+                    &injected_request
+                }
+                _ => &request,
+            };
             let proof = {
                 let vbc = Some(self.vbc_bundle());
                 let mut core = self.core.write().await;
-                if self.proof_mode == "dmap" {
+                // KI#50 — dispatch on the REQUEST, never on our own advertised
+                // mode. `proof_mode` says what our hardware is good at; it must
+                // not decide what a client receives. Every validator serves BOTH:
+                // DMAP is the base service (always produced), and a ZKP-tier
+                // receiver additionally gets a STARK — slower on weak hardware,
+                // but never substituted.
+                let wants_zkp = axiom_core_logic::wallet_id::extract_security_level(
+                        &request.transaction.receiver_wallet_id,
+                    )
+                    .map(|(_k, proof_type)| proof_type == axiom_core_logic::wallet_id::PROOF_TYPE_ZKP)
+                    .unwrap_or(false);
+                if wants_zkp && self.proof_mode == "dmap" {
+                    warn!("CL3: ZKP-tier request on a dmap-advertising node — serving it \
+                           anyway (expect higher latency). proof_mode is an advertisement, \
+                           not a restriction.");
+                }
+                if !wants_zkp {
                     core.produce_witness_dmap(
-                        &request,
+                        core_request,
                         wallet_state_ref.as_ref(),
                         frozen_wallets.clone(),
                         oracle_stake_proof.clone(),
@@ -3701,10 +4870,13 @@ impl ConsensusEngine {
                         Some(self.dilithium_pk.clone()),
                         Some(self.validator_id),
                         Some(&self.signing_key),
-                    )?
+                        false,
+                        resolved_pulse_audit.clone(),
+                                            presented_certificates.clone(),
+)?
                 } else {
                     core.produce_witness(
-                        &request,
+                        core_request,
                         wallet_state_ref.as_ref(),
                         frozen_wallets.clone(),
                         oracle_stake_proof,
@@ -3714,26 +4886,59 @@ impl ConsensusEngine {
                         Some(self.dilithium_sk.clone()),
                         Some(self.dilithium_pk.clone()),
                         Some(self.validator_id),
-                    )?
+                        Some(&self.signing_key),
+                        false,
+                        resolved_pulse_audit.clone(),
+                                            presented_certificates.clone(),
+)?
                 }
             };
 
-            // §23.14: Clear pending audit if we sent a confirmation to Core.
-            // Core (AVM) clears its own tracking; mirror here for admin/stats.
-            if resolved_audit.is_some() {
-                let mut pending = self.pending_audit.lock();
-                if pending.is_some() {
-                    info!("§23.14: Audit confirmation resolved — clearing pending audit");
-                    *pending = None;
-                    self.audit_txs_since_demand.store(0, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
+            // §23.14: do NOT clear Lambda's mirror here because "we injected a
+            // confirmation" — the AVM judges it, and it may have RE-ARMED a new demand
+            // in this very execution. The mirror is reconciled from the AVM below
+            // (sync_audit_mirror: Keep / Adopt / Clear). The old unconditional clear
+            // logged "Audit confirmation resolved" on injection, not on resolution, and
+            // left the mirror stale on a same-execution re-arm (2026-09-25, KI#215).
+            let _ = &resolved_audit;
 
-            // §23.14: Track audit demand from Core and update TX counter
+            // §23.14: Track audit demand from Core and update TX counter (VOLUME
+            // trigger — the guest writes outputs.audit_demand).
             self.handle_audit_demand(proof.outputs.audit_demand.clone());
 
-            // YPX-009 §4: Store Pulse audit request from Core for next TX
-            self.handle_pulse_audit_request(proof.outputs.audit_request.clone());
+            // §23.14.1 Keep Lambda's pending peer-audit in sync with the AVM's (the
+            // source of truth, armed by BOTH the volume trigger and the TIME-BOND).
+            // The time-bond arms ONLY the AVM (host-only, re-execution safety — it never
+            // writes outputs.audit_demand), and the ban-on-timeout path in enforce_audit_pre
+            // clears ONLY the AVM. So mirror BOTH directions here, else: (fwd) a time-bond
+            // audit never sends a request — pending_peer_audit_outbound needs the target
+            // from Lambda's pending — and falsely bans the target for NonResponds with no
+            // request sent (live 2026-09-22, delta → 4b3325d4); (rev) a stale Lambda pending
+            // wedges the next audit (peer_audit_sent stuck true). Only act on a successful
+            // read (a failed try_read must NOT be read as "AVM audit ended"). CoreID-neutral.
+            {
+                // KI#210/#207: mirror the time-bond demand regardless of self/peer.
+                // pending_peer_audit_demand() returns PEER demands only; the guest
+                // volume trigger is dev-gated out — so a SELF-audit time-bond was
+                // mirrored by NEITHER path, Lambda's resolve_audit_confirmation
+                // found nothing to confirm, and the AVM countdown self-terminated
+                // the validator. pending_time_bond_demand() returns self OR peer.
+                //
+                // RELIABLE, not try_read: this thread dropped the core WRITE guard at
+                // the end of the `proof` block above, so a blocking read cannot
+                // self-deadlock. The old `try_read()` failed whenever ANOTHER witness
+                // held core.write under load (each produce_witness is ~5s of
+                // argon2id), silently dropping the mirror — the self-audit was never
+                // confirmed and the countdown self-terminated the validator (tier C,
+                // KI#210). Blocking WAITS for the peer's write instead of skipping, so
+                // `avm_demand.is_none()` now reliably means "the AVM has no pending
+                // audit" (the clear-stale branch below can trust it).
+                // Extracted to `sync_audit_mirror` (2026-09-24) so the CL2 pre-pass
+                // and the CL5 redeem path can mirror BEFORE their Core call too.
+                self.sync_audit_mirror().await;
+            }
+
+            // YPX-009 §4: the audit request is captured at the AVM exit (`PulseSink`).
 
             // Extract Core-computed values — Lambda MUST NOT compute these
             let txid = proof.outputs.txid.ok_or_else(|| {
@@ -3780,6 +4985,18 @@ impl ConsensusEngine {
                 let fact_sig8 = proof.outputs.fact_signature.as_ref()
                     .map(|s| hex8(s))
                     .unwrap_or_else(|| "NONE".into());
+                // §23.14.6 (KI#213): persist what THIS witness holds for the tx —
+                // the exact fields the audit digest hashes (`interpreter.rs`
+                // `pulse_post_execute`: sender_balance = inputs.current_state.balance
+                // or 0, state_id = produced_state_id, amount). Only the finalizer
+                // stores a receipt, so without this a co-witness could answer a
+                // peer audit only with "not held". CoreID-neutral, Lambda-only.
+                let digest_sender_balance = wallet_state_ref.as_ref().map(|s| s.balance).unwrap_or(0);
+                if let Err(e) = self.storage.store_witness_digest(
+                    &txid, digest_sender_balance, &produced_state_id, request.transaction.amount,
+                ) {
+                    warn!("§23.14.6: could not persist witness digest for txid={}: {}", hex8(&txid), e);
+                }
                 eprintln!(
                     "[FACT-SIGN-DIAG] val={} txid={} consumed={} produced={} new_balance={} \
                      amount={} is_genesis={} tx_wseq={} ws_balance={} ws_seq={} \
@@ -3814,6 +5031,7 @@ impl ConsensusEngine {
             if let Some(ref sender_chain) = request.sender_fact_chain {
                 our_sig.checkpoint_sig = axiom_core_logic::compute::cosign_provisional_checkpoint(
                     sender_chain, self.validator_id, &self.dilithium_pk, &self.dilithium_sk,
+                    self.vbc_reference(),
                 ).ok().flatten();
             }
             // Nabla register receipt signature: Ed25519 over
@@ -3922,6 +5140,16 @@ impl ConsensusEngine {
                     // (the SAME value it bound into new_state_hash), so the
                     // next send sees it at the gate + §15 re-derive.
                     hibernation_until: proof.outputs.hibernation_until,
+                    // §5.2.2c — persist the wall-clock lock Core produced, the
+                    // SAME value it bound into new_state_hash. Lambda wrote 0
+                    // here until 2026-09-05, so a staked wallet's NEXT tx failed
+                    // the §15 anchor re-derive: Lambda is the only layer that
+                    // knows stored state, and it was blind to the lock.
+                    wall_clock_lock: proof.outputs.wall_clock_lock,
+                    emission_claimed_epoch: proof.outputs.emission_claimed_epoch,
+                    // §6b.13 — persist the floor Core bound (a VbcRequest raises it).
+                    stake_floor_until: proof.outputs.stake_floor_until,
+                    wallet_format: proof.outputs.wallet_format,
                     wallet_id: bound_wallet_id,
                 };
                 self.storage.store_tx_record_and_wallet_state(&tx_record, &sender_state, sender_k, sender_pt)?;
@@ -3946,26 +5174,29 @@ impl ConsensusEngine {
             
             // GAP-C FIX (Option B): V1/V2 include their execution proof in cheque.
             // Previously empty — now receiver can verify 2+ of k proofs.
-            let cheque = self.create_validator_cheque(
-                &request.transaction,
-                txid,
-                &our_sig,
-                state_hash,
-                produced_state_id,
-                sender_fact_for_cheque,
-                &proof.execution_proof_bytes,  // GAP-C: include proof from non-finalizing path
-                None, // No ZKP nonce on non-k=3 path (DMAP doesn't need one)
-                proof.proof_type,
-                proof.dmap_input_hash,
-                proof.dmap_output_hash,
-                request.nabla_hint.clone(), // YPX-002 §3.2 sticky Nabla
-            );
+            // YPX-010 §12 — an Ark settlement KEEPS the cheque (it mints the receiver's
+            // validator-backed cheque = the double-redeem anchor). No settlement branch:
+            // a settlement is a normal send here.
+            let cheque = Some(self.create_validator_cheque(
+                    &request.transaction,
+                    txid,
+                    &our_sig,
+                    state_hash,
+                    produced_state_id,
+                    sender_fact_for_cheque,
+                    &proof.execution_proof_bytes,  // GAP-C: include proof from non-finalizing path
+                    None, // No ZKP nonce on non-k=3 path (DMAP doesn't need one)
+                    proof.proof_type,
+                    proof.dmap_input_hash,
+                    proof.dmap_output_hash,
+                    request.nabla_hint.clone(), // YPX-002 §3.2 sticky Nabla
+                ));
 
             // Delivery log: encrypted=false (Lambda doesn't know PGP status —
             // ANTIE handles encryption after receiving the cheque via IPC).
             let recv_email = request.transaction.receiver_wallet_id
                 .split('/').next().unwrap_or("");
-            if !recv_email.is_empty() {
+            if cheque.is_some() && !recv_email.is_empty() {
                 self.storage.log_cheque_delivery(&txid, recv_email, false).ok();
             }
 
@@ -3982,17 +5213,39 @@ impl ConsensusEngine {
                 our_sig.receipt_commitment_sig = Some(self.sign_receipt_commitment(rc));
             }
 
+
+            // ── A VBC REQUEST PRODUCES A CERTIFICATE, NEVER A CHEQUE ──────
+            // `AXIOM_DESIGN_ValidatorJoin.md` §5.2.2d. The cheque slot is the
+            // right place for it (same round, same k), but the two must never
+            // both be present: a certificate carries no value, and anything
+            // that files it as a pending cheque would show a cert as money.
+            let (cheque, vbc_signature) = if request.transaction.is_vbc_request() {
+                (None, Some(self.sign_requested_vbc(&request).await?))
+            } else if axiom_core_logic::validation::is_initial_anchor(
+                &request.transaction, None, !request.prev_receipts.is_empty(),
+            ) {
+                // KI#216 INITIAL-ANCHOR: a wallet's self-made first state moves
+                // nothing — like the certificate request above, nothing is
+                // minted (a 0-atom self-cheque would only ever be litter the
+                // app is told to redeem). ONE predicate, Core's.
+                (None, None)
+            } else {
+                (cheque, None)
+            };
+
             // Generate hints for response (per Yellow Paper 27.5)
             let validator_id_hex = hex::encode(self.validator_id);
             let response_hints = self.storage.get_random_hints(3, &validator_id_hex)?;
 
             let response = WitnessResponse {
+                sender_state: None,
                 request_id: request.request_id,
                 success: true,
                 witness_signature: Some(our_sig),
                 overlapped_signatures: all_sigs,
                 rejection: None,
-                cheque_for_receiver: Some(cheque),  // Now always produce cheque
+                cheque_for_receiver: cheque,  // None when settlement (§12.1 skip-cheque)
+                vbc_signature,
                 receipt: None,  // No receipt until k=3
                 produced_state_id: Some(produced_state_id.to_vec()),
                 commitment_hash: request.commitment_hash.clone(),
@@ -4001,13 +5254,24 @@ impl ConsensusEngine {
                 txid: txid.to_vec(),
                 validator_hints: response_hints,
                 sender_fact_chain: None,  // Only available when k=3 reached
-                audit_demand: self.pending_audit.lock().clone(),
+                // DEADLOCK FIX (2026-09-23, CoreID ab98b539): take the pending_audit
+                // snapshot in its OWN statement so the MutexGuard is dropped HERE. Written
+                // inline as `audit_demand: self.pending_audit.lock().clone()`, the guard is a
+                // temporary that lives to the END of this struct literal — so it is STILL held
+                // when `outbound_peer_audit` (a few fields down) calls pending_peer_audit_outbound(),
+                // which re-locks pending_audit (a non-reentrant parking_lot::Mutex) at
+                // consensus.rs:~2470 → self-deadlock. It only surfaces once §23.14 arms a
+                // peer-audit request (before that, pending_peer_audit_outbound returns None early
+                // at :2452 and never reaches the re-lock), which is why claim/redeem worked and the
+                // fleet then wedged the first witness after "Core generated audit demand" — all 18
+                // lambda threads futex_wait (gdb-confirmed live, the first peer-audit roll).
+                audit_demand: { let d = self.pending_audit.lock().clone(); d },
                 audit_request: proof.outputs.audit_request.clone(),
                 nonce_challenge: proof.outputs.nonce_challenge.clone(),
                 pulse_proof: proof.outputs.pulse_proof.clone(),
                 audit_failed: proof.outputs.audit_failed,
-                outbound_peer_audit: self.pending_peer_audit_outbound(),
-                confidence_index: self.issue_confidence_index(&request.transaction.client_pk),
+                outbound_peer_audit: self.pending_peer_audit_outbound().await,
+                confidence_index: None, // Ark CI retired (receiver-computes); field stays None until Phase-3/4 rotation
                 scar_consent_for_receiver: None,
                 scar_consent_voucher: scar_consent_voucher_out.clone(),
             };
@@ -4026,8 +5290,9 @@ impl ConsensusEngine {
                 let tx_hash = *blake3::hash(
                     &serde_json::to_vec(&request.transaction).unwrap_or_default()
                 ).as_bytes();
-                let mut serialized = Vec::new();
-                if ciborium::ser::into_writer(&response, &mut serialized).is_ok() {
+                // Fork Settlement R4: store the k of the CL3 run that produced
+                // this response's fact_signature.
+                if let Some(serialized) = WitnessCacheEntry::encode(proof.outputs.required_k, &response) {
                     let _ = self.storage.set_witness_cache(
                         &request.transaction.client_pk,
                         sender_k, sender_pt,
@@ -4076,6 +5341,27 @@ impl ConsensusEngine {
                     // Genesis - create a pseudo-record with genesis state
                     if wallet_pk.len() == 32 {
                         let pk_array: [u8; 32] = wallet_pk.try_into().unwrap_or([0u8; 32]);
+                        // §6c — a genesis stake wallet has no STORED genesis state;
+                        // its opening balance is derived, same builder as the id above.
+                        let opening = axiom_core_logic::genesis::genesis_opening_balance(&pk_array);
+                        if opening > 0 {
+                            return Ok(TransactionRecord {
+                                tx_id: [0u8; 32],
+                                produced_state_id: genesis_id,
+                                wallet_pk: wallet_pk.to_vec(),
+                                balance_after: opening,
+                                wallet_seq_after: 0,
+                                group_members_after: None,
+                                is_genesis_claim: None,
+                                status: WalletStateStatus::Confirmed,
+                                // Genesis opens at the CHOSEN default tier — creation
+                                // chooses, nothing is checked here (§17.3.1.4 v2.19.0).
+                                required_k: axiom_core_logic::wallet_id::K_DEFAULT,
+                                proof_type: axiom_core_logic::wallet_id::PROOF_TYPE_DMAP,
+                                amount: 0,
+                                sender_balance: opening,
+                            });
+                        }
                         if let Ok(Some(genesis_state)) = self.storage.get_genesis_state(&pk_array, k, proof_type) {
                             return Ok(TransactionRecord {
                                 tx_id: [0u8; 32],  // No previous tx for genesis
@@ -4086,8 +5372,8 @@ impl ConsensusEngine {
                                 group_members_after: genesis_state.group_members.clone(),
                                 is_genesis_claim: None,
                                 status: WalletStateStatus::Confirmed,
-                                required_k: 3,  // Genesis uses default k=3
-                                proof_type: 1,  // Genesis uses DMAP
+                                required_k: axiom_core_logic::wallet_id::K_DEFAULT, // CHOSEN at creation (§17.3.1.4 v2.19.0)
+                                proof_type: axiom_core_logic::wallet_id::PROOF_TYPE_DMAP,
                                 amount: 0,  // Genesis has no TX amount
                                 sender_balance: genesis_state.balance,  // Genesis balance
                             });
@@ -4159,34 +5445,31 @@ impl ConsensusEngine {
         let pk_array: [u8; 32] = pk.try_into()
             .map_err(|_| LambdaError::InvalidRequest("Public key must be 32 bytes".into()))?;
 
-        // Try stored genesis state first (has the correct balance)
-        // NOTE: get_genesis_state is still pk-keyed — the wallet_id re-key that
-        // lets the k=3 and k=0 tiers of one pk coexist in storage is the rest of
-        // step 4 (YPX-010 §10.5). Until then, the COMPUTE path below is tier-aware.
+        // Try stored genesis state first (has the correct balance). The row is
+        // keyed by the STATE CLASS inside storage (§16.14.12 v2.19.0, KI#149).
         if let Ok(Some(genesis)) = self.storage.get_genesis_state(&pk_array, k, proof_type) {
             return Ok(genesis.state_id);
         }
 
-        // Compute via Core with standard genesis balance (tier-aware, §10.5)
-        Ok(axiom_core_logic::genesis::compute_genesis_state_id(&pk_array, 10000, k, proof_type))
-    }
-    
-    
-    /// Calculate required overlap for a given k value
-    /// 
-    /// | k | Required Overlap |
-    /// |---|-----------------|
-    /// | 3 | 2               |
-    /// | 4 | 3               |
-    /// | 5 | 3               |
-    fn required_overlap(k: usize) -> usize {
-        match k {
-            3 => 2,
-            4 => 3,
-            5 => 3,
-            _ => (k + 1).div_ceil(2), // General formula: ceiling((k+1)/2)
+        // §6c — a GENESIS STAKE WALLET's opening state is a function of the
+        // compile-time list (1,000,000 AXC baked in); derive it through Core's
+        // one builder before the legacy fallback, so its first send after the
+        // three-year lock is recognised without a stored genesis state.
+        if axiom_core_logic::genesis::genesis_opening_balance(&pk_array) > 0 {
+            return Ok(axiom_core_logic::genesis::opening_state_id_for(&pk_array, k, proof_type));
         }
+        // Compute via Core with the standard genesis balance. YP §16.14.12
+        // v2.19.0 (KI#149): the fold takes the STATE CLASS, so a first-ever k=5
+        // receive opens at the same state the wallet's Standard address did.
+        let (k_class, pt_class) = axiom_core_logic::wallet_id::state_class(k, proof_type);
+        Ok(axiom_core_logic::genesis::compute_genesis_state_id(&pk_array, 10000, k_class, pt_class))
     }
+    
+    
+    // `required_overlap(k)` DELETED 2026-10-01 (Fable review F-1(b)): its last
+    // production caller was the redeem Step 1b fallback, which now reads the
+    // carried receipt; it was a hand copy of `wallet_id::sabr_overlap` (RULE 1),
+    // the ONE rule Core and every Lambda site call.
     
     // Verify a witness signature is cryptographically valid
     //
@@ -4432,7 +5715,7 @@ impl ConsensusEngine {
         );
         axiom_core_logic::compute::advance_fact_checkpoint(
             &mut chain, self.validator_id, &self.dilithium_pk, &self.dilithium_sk,
-            oods_view_healthy,
+            self.vbc_reference(), oods_view_healthy,
         ).map_err(|e| LambdaError::CoreError(format!("FACT advance_checkpoint: {:?}", e)))?;
 
         if let Some(cp) = chain.checkpoint.as_ref() {
@@ -4447,14 +5730,12 @@ impl ConsensusEngine {
 
     // compress_sender_chain_in_place REMOVED (v2.11.16-beta21):
     // FACT compression is now handled by Core inside the AVM. Lambda no longer
-    // calls verify_and_compress_fact_chain at the ingress boundary. The scar
-    // rule invariant (no compression with scarred links) is enforced by Core.
+    // compresses at the ingress boundary. The scar rule invariant (no compression
+    // with scarred links) is enforced by Core. The function this once named,
+    // verify_and_compress_fact_chain, was deleted 2026-08-18: it was the
+    // pre-SEC-07 immediate-compress path, unreachable from production while
+    // carrying a depth reject that read as live enforcement.
 
-    /// Compute produced state ID for a transaction
-    /// This is the new state ID that will be consumed by the next transaction
-    /// 
-    /// MUST match Core's computation exactly!
-    /// Formula: SHA3-256("AXIOM_STATE" || pk || new_balance || new_seq || consumed_state_id || nonce)
     /// Collect receipts for overlapped validators
     async fn collect_prev_receipts(
         &self,
@@ -4494,6 +5775,10 @@ impl ConsensusEngine {
         // Returns: (receipt, updated_fact_chain, execution_proof_bytes, zkp_nonce, proof_type,
         //           pulse_audit_request, pulse_nonce_challenge, pulse_proof_data, pulse_audit_failed,
         //           dmap_input_hash, dmap_output_hash)
+        // YP §26.17.6.5 B4 — the certificates for the client's chain (the request's
+        // offered set was absorbed into the store by `process_witness_request`).
+        let presented_certificates =
+            self.present_certificates(envelope.sender_fact_chain.as_ref(), &envelope.fact_certificates);
         info!("Finalizing transaction with {} witnesses (production={}, group_member_index={:?})",
               witness_sigs.len(), self.is_production_mode(), envelope.group_member_index);
 
@@ -4523,8 +5808,28 @@ impl ConsensusEngine {
         // Fallback: cached chain from storage (for backwards compat / JSON bloat avoidance).
         let my_pk = self.public_key.as_bytes().to_vec();
         let vbc = Some(self.vbc_bundle());
-        // Route proof generation: ZKP (STARK) vs DMAP (memory attestation)
-        let use_dmap = self.proof_mode == "dmap";
+        // KI#50 — route on the REQUEST's proof tier, never on `self.proof_mode`.
+        // `proof_mode` is an ADVERTISEMENT of what this node's hardware is good
+        // at; it must not decide what a client receives. This mirrors the
+        // witness-dispatch site (~L3686): DMAP is the base service (always
+        // produced — `produce_witness` now captures the DMAP attestation too,
+        // core_client.rs KI#50 note), and a ZKP-tier receiver ADDITIONALLY gets
+        // a STARK — slower on weak hardware, but never substituted. Before this
+        // fix, `use_dmap = self.proof_mode == "dmap"` meant a dmap-advertising
+        // validator never produced a STARK for a ZKP-tier client even though
+        // its prover was loaded and ready (and a zkvm node served ONLY ZKP,
+        // handing DMAP-tier clients zeroed dmap hashes).
+        let wants_zkp = axiom_core_logic::wallet_id::extract_security_level(
+                &transaction.receiver_wallet_id,
+            )
+            .map(|(_k, proof_type)| proof_type == axiom_core_logic::wallet_id::PROOF_TYPE_ZKP)
+            .unwrap_or(false);
+        if wants_zkp && self.proof_mode == "dmap" {
+            warn!("CL3 finalize: ZKP-tier request on a dmap-advertising node — serving it \
+                   anyway (expect higher latency). proof_mode is an advertisement, not a \
+                   restriction.");
+        }
+        let use_dmap = !wants_zkp;
         // ZKP nonce only needed for STARK proofs (binds into the proof for anti-replay)
         let zkp_nonce: Option<[u8; 32]> = if !use_dmap && self.is_production_mode() {
             Some(rand::random())
@@ -4549,7 +5854,23 @@ impl ConsensusEngine {
         // `audit_response` as separate args but they were always
         // sourced from `resolve_*` on the envelope at the caller;
         // collapsed here.
-        let _ = (&resolved_audit, &resolved_pulse);
+        let _ = &resolved_pulse;
+        // §23.14 (2026-09-24): the finalizing CL3 is its own Core execution and
+        // decrements a pending SELF audit's countdown, so it must carry the
+        // resolved confirmation too. KI#210 fix (1) threaded it into the WITNESS
+        // path only; here it was discarded (`let _ = …`) and the finalize ran on
+        // the raw envelope — measured: "self-audit pending … this CL3 execution
+        // carries NO audit_confirmation". Same injection shape as the witness path.
+        let injected_finalize_envelope;
+        let envelope: &axiom_core_logic::types::WitnessRequest = match &resolved_audit {
+            Some(c) if envelope.audit_confirmation.is_none() => {
+                let mut r = envelope.clone();
+                r.audit_confirmation = Some(c.clone());
+                injected_finalize_envelope = r;
+                &injected_finalize_envelope
+            }
+            _ => envelope,
+        };
 
         let proof = {
             // Witness-perf fix (beta10, 2026-04-13): DMAP path takes read() so
@@ -4574,7 +5895,10 @@ impl ConsensusEngine {
                     Some(self.dilithium_pk.clone()),
                     Some(self.validator_id),
                     Some(&self.signing_key),
-                )
+                    true,
+                    resolved_pulse.clone(),
+                                    presented_certificates.clone(),
+)
             } else {
                 let mut core = self.core.write().await;
                 core.produce_witness(
@@ -4588,7 +5912,11 @@ impl ConsensusEngine {
                     Some(self.dilithium_sk.clone()),
                     Some(self.dilithium_pk.clone()),
                     Some(self.validator_id),
-                )
+                    Some(&self.signing_key),
+                    true,
+                    resolved_pulse.clone(),
+                                    presented_certificates.clone(),
+)
             };
 
             let elapsed = start.elapsed();
@@ -4725,7 +6053,8 @@ impl ConsensusEngine {
                 commitment_hash,
                 epoch: transaction.epoch,
                 witness_sigs,
-                required_k: transaction.required_k,
+                // Core-extracted (KI#150) — never `tx.required_k` (client-supplied).
+                required_k: proof.outputs.required_k,
                 core_id: transaction.core_id,
                 // Source of truth: Core CL3 attested this from
                 // tx.sender_wallet_id and bound it into
@@ -4738,6 +6067,10 @@ impl ConsensusEngine {
                 // YPX-021 §8.2 — same carry-back contract as is_dev_class:
                 // stamp exactly what Core CL3 bound into receipt_commitment.
                 oods_flag: proof.outputs.oods_flag,
+                // P3.6 — same carry-back: stamp the Core-computed CI so the receipt's
+                // stored field matches what k=3 signed (verify_receipt_commitment
+                // recomputes from it on the next CL2).
+                confidence_index: proof.outputs.confidence_index.clone(),
             },
         );
         debug_assert_eq!(
@@ -4778,14 +6111,14 @@ impl ConsensusEngine {
             }),
             is_genesis_claim: Some(transaction.is_genesis_claim()),
             status: WalletStateStatus::Pending,  // PENDING until ACK
-            required_k: transaction.required_k,
+            required_k: proof.outputs.required_k, // Core-extracted (KI#150), never the client's
             proof_type: transaction.proof_type,
             amount: transaction.amount,
             sender_balance: wallet_state.map(|ws| ws.balance).unwrap_or(0),
         };
         self.storage.store_transaction_record(&tx_record)?;
         debug!("k={} stored PENDING tx record: vid={} produced_state_id={} balance={} seq={}",
-              transaction.required_k,
+              proof.outputs.required_k,
               hex::encode(&self.validator_id[..4]),
               hex::encode(&produced_state_id[..8]), new_balance, new_wallet_seq);
 
@@ -4825,20 +6158,6 @@ impl ConsensusEngine {
             envelope.sender_fact_chain.clone()
         };
         let existing_fact_for_storage = existing_fact.clone();
-        // Build receiver contact for scar healing propagation
-        // wallet_id format: "email/hex8" — extract email from it
-        let receiver_contact = {
-            let wid = &transaction.receiver_wallet_id;
-            let email = if let Some(slash) = wid.rfind('/') {
-                wid[..slash].to_string()
-            } else {
-                wid.clone() // fallback: use whole wallet_id as email
-            };
-            Some(axiom_core_logic::types::ReceiverContact {
-                wallet_id: wid.clone(),
-                email,
-            })
-        };
         // eprintln!("[TIMING] finalize_transaction: about to call build_fact_link with {} sigs", fact_witness_sigs.len());
         // Build FACT link if we have k=3 valid FACT sigs for THIS transaction.
         // 
@@ -4848,24 +6167,21 @@ impl ConsensusEngine {
         // In this case, we still produce the receipt but return None for the FACT chain.
         // The later validator (V3) will have accumulated enough current-TX
         // FACT sigs to build the complete link.
-        // YPX-018 heal-forward: when is_heal=true, start a fresh FACT chain
-        // with just the heal link. The pre-heal chain can't be extended (its
-        // tip is at X_prev, the heal consumed X_pending — discontinuity).
-        // The heal link has valid Core-signed Dilithium fact_signatures, so
-        // Core's verify_fact_chain accepts the 1-link chain with full
-        // signature verification. No Core boundary change needed.
-        //
-        // YPX-022 RECALL (2026-07-06 forward redesign): recall is NO LONGER here.
-        // It is a standard forward self-send consuming the wallet's CURRENT tip,
-        // so its FACT link extends the existing chain exactly like any send
-        // (tip == produced_state_id). The old fresh-chain branch was needed only
-        // by the re-anchor (which consumed the pre-send state, off the tip) — that
-        // model is gone.
-        let heal_existing = if transaction.is_heal() {
-            None
-        } else {
-            existing_fact.as_ref()
-        };
+        // KI#147 (2026-09-12): a heal EXTENDS the wallet's chain like every
+        // other link — YP §8.4.4a "every heal APPENDS a link", §17.10 "heal()
+        // mints a fresh TIP link". From 2026-04-12 (`151a2dad`, "YPX-018
+        // heal-forward") this site started a FRESH 1-link chain on every heal
+        // because the re-anchor of that era consumed a state OFF the tip. That
+        // model is gone (YPX-022 forward redesign: recall and heal are forward
+        // self-sends consuming the wallet's CURRENT tip), and the fresh chain
+        // survived only because the verifier accepted any origin. YP
+        // §26.17.6.5 B1 now requires the chain to begin at the wallet's derived
+        // opening state, so a restarted chain strands the wallet: every later
+        // send is E_FACT_ORIGIN_INVALID (two soak wallets, 2026-09-12). Core's
+        // `build_fact_link` refuses a link whose `previous_state_id` is not the
+        // tip (FactChainBreak), so an off-tip heal fails closed here instead
+        // of minting an origin — no fallback branch.
+        let heal_existing = existing_fact.as_ref();
 
         // [CHAIN-EXTEND DIAG] paired with SDK's [CHAIN-RECV DIAG] on the
         // send/redeem extraction path. Match by `txid[..8]` across the
@@ -4942,8 +6258,11 @@ impl ConsensusEngine {
             transaction.amount,
             proof.outputs.required_k,  // Core-extracted from receiver_wallet_id, not client-supplied 0
             &fact_witness_sigs,
-            receiver_contact,
-            transaction.burn_target_tx_id,
+            // KI#54 — ONE derivation, shared with the CL3 witness-signing
+            // path. Passing `transaction.burn_target_tx_id` raw here while
+            // the witnesses gated on BURN_ADDRESS is what made every
+            // self-send heal-burn fail with FactInsufficientWitnesses.
+            axiom_core_logic::fact::fact_burn_target(&transaction).copied(),
             None,  // sender_anchor — only redeem links use it
             // Sticky class lock — derived from the TX's sender_wallet_id.
             // Core's `build_fact_link` also enforces the chain's tip
@@ -5050,6 +6369,98 @@ impl ConsensusEngine {
                     e,
                     heal_existing.map(|c| c.links.len()).unwrap_or(0),
                 );
+                // [FACT-DROP DIAG] Which drop path emptied the witness list?
+                //
+                // `build_fact_link` reports FactInsufficientWitnesses when
+                // fewer than k witnesses SURVIVE its filter, but the existing
+                // `with_fact_sig` count above measures a DIFFERENT quantity
+                // (signature present), so the log reads self-contradictory:
+                // 3-of-3 signatures present, yet insufficient witnesses. The
+                // filter drops a witness for exactly three reasons — no
+                // vbc_bundle (empty Dilithium pk), a signature that does not
+                // verify against the recomputed commitment, or a duplicate
+                // validator_id. Name which one, per witness.
+                //
+                // When the reason is a bad signature, the likeliest cause is
+                // that the finalizer and the witnesses computed the
+                // commitment over DIFFERENT inputs. So probe the inputs
+                // individually: if a sig verifies under a variant, that
+                // variant names the disagreeing field exactly. Burning or
+                // RECALLing to paper over that would destroy value over what
+                // is a finalizer/witness input mismatch, not anything the
+                // sender or receiver did.
+                if matches!(e, axiom_core_logic::types::ValidationError::FactInsufficientWitnesses) {
+                    use axiom_core_logic::fact::compute_fact_commitment;
+                    let is_dev = axiom_core_logic::wallet_id::is_dev_wallet(&transaction.sender_wallet_id);
+                    let no_scars: Vec<[u8; 32]> = Vec::new();
+                    // Fork Settlement R4: the k handed to `build_fact_link` above —
+                    // the value the finalizer verified under.
+                    let k = proof.outputs.required_k;
+                    let as_passed = compute_fact_commitment(
+                        &txid, &transaction.consumed_state_id, &produced_state_id,
+                        transaction.amount, None, is_dev, k, &no_scars,
+                        axiom_core_logic::fact::fact_burn_target(&transaction),
+                    );
+                    // One variant per commitment input we might disagree on.
+                    let variants: [(&str, [u8; 32]); 4] = [
+                        ("burn_target=None", compute_fact_commitment(
+                            &txid, &transaction.consumed_state_id, &produced_state_id,
+                            transaction.amount, None, is_dev, k, &no_scars, None)),
+                        ("is_dev_class=flipped", compute_fact_commitment(
+                            &txid, &transaction.consumed_state_id, &produced_state_id,
+                            transaction.amount, None, !is_dev, k, &no_scars,
+                            transaction.burn_target_tx_id.as_ref())),
+                        ("sender_anchor=consumed", compute_fact_commitment(
+                            &txid, &transaction.consumed_state_id, &produced_state_id,
+                            transaction.amount, Some(&transaction.consumed_state_id), is_dev,
+                            k, &no_scars, transaction.burn_target_tx_id.as_ref())),
+                        // R4 (2b-ii): a signer/finalizer `required_k` split (the
+                        // design's B1 — the witness's CL3 run and the finalizer's
+                        // derived different k, e.g. the k=0 receiver branch's
+                        // online_settlement input) names itself here.
+                        ("required_k=floor3", compute_fact_commitment(
+                            &txid, &transaction.consumed_state_id, &produced_state_id,
+                            transaction.amount, None, is_dev,
+                            axiom_core_logic::fact::MIN_FACT_WITNESSES as u8, &no_scars,
+                            axiom_core_logic::fact::fact_burn_target(&transaction))),
+                    ];
+                    let mut seen: std::collections::BTreeSet<[u8; 32]> = std::collections::BTreeSet::new();
+                    for (i, sig) in fact_witness_sigs.iter().enumerate() {
+                        let dpk = sig.vbc_bundle.as_ref()
+                            .map(|v| v.target_vbc.subject_pubkey_dilithium.clone())
+                            .unwrap_or_default();
+                        let drop_reason = if sig.fact_signature.is_none() {
+                            "NO_FACT_SIGNATURE".to_string()
+                        } else if dpk.is_empty() {
+                            "NO_VBC_BUNDLE (empty dilithium pk)".to_string()
+                        } else {
+                            let fs = sig.fact_signature.as_ref().unwrap();
+                            if axiom_core_logic::verify::verify_dilithium(&dpk, &as_passed, fs).is_ok() {
+                                if !seen.insert(sig.validator_id) {
+                                    "DUPLICATE_VALIDATOR_ID".to_string()
+                                } else {
+                                    "SURVIVES (not this one)".to_string()
+                                }
+                            } else {
+                                let m = variants.iter()
+                                    .find(|(_, c)| axiom_core_logic::verify::verify_dilithium(&dpk, c, fs).is_ok())
+                                    .map(|(n, _)| *n);
+                                match m {
+                                    Some(n) => format!("BAD_SIG — but VERIFIES under variant `{}`                                                         ⇒ finalizer/witness disagree on THAT input", n),
+                                    None => "BAD_SIG (no probed variant matches — commitment                                              differs on an input not probed)".to_string(),
+                                }
+                            }
+                        };
+                        eprintln!(
+                            "[FACT-DROP DIAG] txid={} witness[{}] validator={} is_heal={}                              burn_target={} dpk_len={} reason={}",
+                            hex::encode(&txid[..8]), i,
+                            hex::encode(&sig.validator_id[..4.min(sig.validator_id.len())]),
+                            transaction.is_heal(),
+                            transaction.burn_target_tx_id.is_some(),
+                            dpk.len(), drop_reason,
+                        );
+                    }
+                }
                 None
             }
         };
@@ -5084,6 +6495,12 @@ impl ConsensusEngine {
             // YPX-020: persist the Core-produced hibernation deadline (same value
             // bound into new_state_hash) so the next send hits the CL2 gate + §15.
             hibernation_until: proof.outputs.hibernation_until,
+            // §5.2.2c — same rule as the witness path: persist what Core bound.
+            wall_clock_lock: proof.outputs.wall_clock_lock,
+            emission_claimed_epoch: proof.outputs.emission_claimed_epoch,
+            // §6b.13 — persist what Core bound.
+            stake_floor_until: proof.outputs.stake_floor_until,
+            wallet_format: proof.outputs.wallet_format,
             wallet_id: finalize_wallet_id,
         };
         self.storage.set_wallet_state(&sender_state, finalize_k, finalize_pt)?;
@@ -5103,6 +6520,131 @@ impl ConsensusEngine {
             proof.dmap_input_hash, proof.dmap_output_hash))
     }
     
+    /// Sign a candidate's REQUESTED certificate — what a `TxKind::VbcRequest`
+    /// round produces instead of a payment cheque.
+    ///
+    /// The owner's ruling (`AXIOM_DESIGN_ValidatorJoin.md` §5.2.2d): *"a VBC request
+    /// is treat[ed] the same as a normal TX"*. So there is no separate
+    /// handshake, no admin round trip, no new wire op — the same witness round,
+    /// the same k, the same anchoring. Only the artifact differs.
+    ///
+    /// **Everything consequential is delegated to `commit_vbc_sign`** — the
+    /// renewal gate, the founding-hash lineage, the once-ever budget decrement
+    /// and the approval record. That reuse is deliberate (RULE 1): a second
+    /// issuance path would be a second place for the budget to be spent and the
+    /// lineage to be decided, and the two would drift silently because each
+    /// looks correct alone.
+    async fn sign_requested_vbc(
+        &self,
+        request: &WitnessRequest,
+    ) -> Result<axiom_core_logic::types::VbcIssuerSignature, LambdaError> {
+        let bundle = request.vbc_request.as_ref().ok_or_else(|| {
+            LambdaError::InvalidRequest(
+                "VbcRequest transaction carries no vbc_request certificate".into())
+        })?;
+        let vbc = &bundle.target_vbc;
+
+        // The two shape rules live in a free function so they are reachable
+        // from a test WITHOUT an engine, a mesh, or a Core round trip. The
+        // subject binding below is the load-bearing check at this site; a
+        // check that cannot be driven cannot be shown to fail, and one that
+        // has never been seen to fail has been assumed, not verified
+        // (RULE 6).
+        check_vbc_request_shape(vbc, &request.transaction.client_pk)
+            .map_err(LambdaError::InvalidRequest)?;
+
+        // §5.2.2e part iii — the ISSUER's own checks on a PROVISIONAL request's
+        // candidacy proof, BEFORE Core spends a ~70 s SPHINCS+ signature on it:
+        // the per-key window (zero cost) and the native replay of the proof's
+        // Fiat-Shamir sample (~0.2 s). Core remains the authority on the proof
+        // (key, signature, seed tick vs the round's attestation, freshness —
+        // `pulse::verify_candidacy_pulse`); this is the issuer refusing to pay
+        // for a claim that cannot be true. A provisional WITHOUT a proof, or one
+        // whose signature does not verify, is left to Core's 1319/1320 — this
+        // code adds nothing there and never replays unsigned work.
+        if axiom_core_logic::validation::vbc_is_provisional(vbc.issued_at, vbc.expires_at) {
+            if let Some(p) = bundle.candidacy_pulse.as_ref() {
+                let last = self.candidacy_requests.lock().get(&p.validator_pk).copied();
+                check_candidacy_at_issuer(p, last)?;
+                if let Some(t) = p.attested_tick {
+                    self.candidacy_requests.lock().insert(p.validator_pk, t);
+                }
+            }
+        }
+
+        let issuer_set_hex: Vec<String> =
+            vbc.issuer_set.iter().map(hex::encode).collect();
+
+        // A cert the candidate already holds rides in `supporting_vbcs` and is
+        // treated as the RENEWAL predecessor. Nothing is trusted about it here:
+        // `commit_vbc_sign` verifies it chain-to-root, pins it to the same
+        // subject, and refuses it outside the renewal window. Absent = initial
+        // issuance, which is the ordinary case for a joining validator.
+        // ⚠ `supporting_vbcs` now carries the ISSUER certificates (§5.3 needs
+        // them to read the three genesis lineages). A renewal predecessor is
+        // distinguished by SUBJECT: it is a certificate for this same
+        // candidate. Taking `.first()` blindly treated an issuer's cert as the
+        // predecessor and died with "previous VBC does not verify".
+        let previous_vbc = bundle.supporting_vbcs.iter()
+            .find(|c| c.subject_pubkey_sphincs == vbc.subject_pubkey_sphincs)
+            .map(|prev| {
+            axiom_core_logic::types::VBCProofBundle {
+                target_vbc: prev.clone(),
+                supporting_vbcs: vec![],
+                candidacy_pulse: None, renewal_work_receipt: None,
+            }
+        });
+
+        // `stake_proof: None` is NOT a gap — it is the request. CL8 decides
+        // provisional-vs-full itself (`modes.rs` §7.1): an unstaked cert is
+        // signable ONLY if its lifetime is inside `PROVISIONAL_VBC_EXPIRY_SECS`,
+        // and a provisional cert cannot serve as a witness credential
+        // (`vbc_is_provisional`, enforced 2026-09-01). Lambda does not
+        // second-guess that rule, and must not acquire a stake proof on the
+        // candidate's behalf to "help" — that would manufacture the very
+        // evidence the gate exists to demand.
+        let (signature, signer_sphincs_pk, commitment) = self.commit_vbc_sign(
+            &hex::encode(&vbc.subject_pubkey_sphincs),
+            &hex::encode(&vbc.subject_pubkey_ed25519),
+            &vbc.proof_cap,
+            &vbc.node_name,
+            vbc.issued_at,
+            vbc.expires_at,
+            vbc.chain_depth,
+            &issuer_set_hex,
+            &request.request_id,
+            previous_vbc,
+            // Same clock source as the gateway path. Not an attested tick —
+            // Lambda has none (KI#130).
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            request.oods_attestation.clone(),
+            // Sign the certificate the candidate assembled — genesis lineage,
+            // OODS stamp and the issuers' own certs included. Rebuilding it
+            // from the scalars above dropped all four and CL8 refused with
+            // E_VBC_ISSUER_CERT_MISSING (a bare E_INVALID_VBC before
+            // 2026-09-04, which is why this took a session to find).
+            Some(bundle),
+            // §5.2.2e — the request's own epoch (unix secs, SDK `send_imperative`).
+            request.transaction.epoch,
+        ).await?;
+
+        info!(
+            "[VBC-REQUEST] signed requested cert for subject {} (node_name={}, \
+             expires_at={}) — certificate returned, NO cheque",
+            &hex::encode(&vbc.subject_pubkey_ed25519)[..16.min(vbc.subject_pubkey_ed25519.len() * 2)],
+            vbc.node_name, vbc.expires_at,
+        );
+
+        Ok(axiom_core_logic::types::VbcIssuerSignature {
+            signature,
+            signer_sphincs_pk,
+            commitment,
+        })
+    }
+
     /// Create a ValidatorCheque for delivery to receiver
     /// 
     /// Called after witnessing a transaction. This validator's cheque
@@ -5134,87 +6676,68 @@ impl ConsensusEngine {
         nabla_hint: Option<axiom_core_logic::types::NablaHint>,
     ) -> ValidatorCheque {
         use ed25519_dalek::Signer;
-        
-        // YPX-018 Phase 5f bug fix: use the transaction's real sender_wallet_id.
-        // Pre-fix this constructed a synthetic placeholder ("sender-<hex>/00000000")
-        // which broke CLARA's cheque-level self-send check AND YPX-007
-        // verify_pk_binding in nabla::clara::register_clara. Real heal cheques
-        // failed Nabla registration even though the protocol logic was correct.
-        // The Transaction struct carries sender_wallet_id (CL1 §11.9, set by
-        // the client and verified by Core's sender_wallet_id ↔ pk binding rule).
-        let sender_wallet_id = transaction.sender_wallet_id.clone();
 
-        // Create cheque structure (without signature)
-        let mut cheque = ValidatorCheque {
-            txid,
-            validator_id: self.validator_id,
-            validator_pk: self.public_key.as_bytes().to_vec(),
-            signature: vec![], // Will be filled below
-            execution_proof: execution_proof_bytes.to_vec(),
+        // P3.5 (BUILD_ARK §3.2): the cheque STRUCT construction lives in
+        // `axiom_core_logic::cheque_build` — one builder shared with the Ark session's
+        // k=0 issuer. Lambda contributes its validator identity + carrier/fee context
+        // and the oracle-adjusted claim; the shared builder derives the rest from the
+        // transaction. Lambda still signs with its own validator key (below).
+        let oracle_claim = {
+            // Oracle claims with oracle_config.enabled=false are rejected at the
+            // process_witness_request entry point before reaching here; this path only
+            // executes when oracle is enabled.
+            let mut oc = transaction.oracle_claim.clone();
+            if let Some(ref mut claim) = oc {
+                claim.payout_amount = self
+                    .oracle_config
+                    .compute_payout(&claim.platform_url, claim.credit_delta);
+            }
+            oc
+        };
+        let issuer = axiom_core_logic::cheque_build::ChequeIssuerContext {
+            issuer_id: self.validator_id,
+            issuer_pk: self.public_key.as_bytes().to_vec(),
             vbc_bundle: self.vbc_for_signature(),
             carrier_type: self.carrier_type.clone(),
             carrier_address: self.carrier_address.clone(),
-            sender_wallet_id,
-            receiver_wallet_id: transaction.receiver_wallet_id.clone(),
-            amount: transaction.amount,
-            // Validator signs its own configured rate at cheque-issuance
-            // time. Bound into the cheque commitment so the receiver's
-            // Core CL5 can compute total_fee deterministically without
-            // trusting any client proposal (closes
-            // E_RECEIPT_COMMITMENT_MISMATCH — 2026-06-05 PM).
-            // Cast u16 -> u32 to match the wire/Core type.
-            rate_bps: self.fee_config.rate_bps as u32,
-            reference: transaction.reference.clone(),
-            epoch: transaction.epoch,
+            // YPX-010 §12.7 — an Ark settlement cheque is FEE-FREE (rate_bps = 0). The
+            // Ark fee lives at the charge-in/unload boundaries, never on the tap or its
+            // settlement; the offline receiver already credited the gross amount. A
+            // normal send keeps the operator-configured rate. (Cast u16 -> u32.)
+            rate_bps: if axiom_core_logic::wallet_id::both_endpoints_ark(
+                &transaction.sender_wallet_id, &transaction.receiver_wallet_id) {
+                0
+            } else {
+                self.fee_config.rate_bps as u32
+            },
             created_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
+        };
+        // YP §26.17.6.5 B4 — the certificates the receiver's validators will need
+        // for this chain's witnesses travel WITH the cheque (the sender's
+        // witnesses are strangers to the receiver). Our own and the co-signers'
+        // are in the store; the send link's signers ride as `vbc_bundle`.
+        let fact_certificates = self.present_certificates(sender_fact_chain.as_ref(), &[]);
+        let mut cheque = axiom_core_logic::cheque_build::build_cheque_unsigned(
+            transaction,
+            txid,
             state_hash,
             produced_state_id,
             sender_fact_chain,
+            execution_proof_bytes,
             zkp_nonce,
             proof_type,
             dmap_input_hash,
             dmap_output_hash,
-            // YPX-002 §3.2: sender's designated sticky Nabla, stamped at issuance
-            // from the witness request. Pass-through only; never validated by Core.
             nabla_hint,
-            // YPX-002 §4.6: sender's raw Ed25519 wallet_pk, stamped at issuance from
-            // `transaction.client_pk`. The receiver needs this to run the `/query`
-            // call in the §4.6 verification routine — Nabla's SMT is keyed on the
-            // raw pubkey, and the email-format `sender_wallet_id` above is not a
-            // valid Nabla lookup key. Pass-through, unsigned, advisory only.
-            // `client_pk` is always 32 bytes on a well-formed Ed25519 transaction;
-            // malformed TXs are rejected upstream, so we stamp None only if the
-            // TryInto fails defensively rather than propagating a panic into the
-            // cheque issuance path.
-            sender_wallet_pk: <[u8; 32]>::try_from(transaction.client_pk.as_slice()).ok(),
-            oracle_claim: {
-                // Oracle claims with oracle_config.enabled=false are rejected at the
-                // process_witness_request entry point (line ~1851) before reaching here.
-                // This path only executes when oracle is enabled.
-                let mut oc = transaction.oracle_claim.clone();
-                if let Some(ref mut claim) = oc {
-                    claim.payout_amount = self.oracle_config.compute_payout(
-                        &claim.platform_url, claim.credit_delta,
-                    );
-                }
-                oc
-            },
-            // YPX-022 RECALL (forward redesign): stamp the recalled txid on the recall
-            // cheque so the receiver's Core CL5 reads it (genesis-guard exemption + the
-            // SDK's is_recall_cheque discriminator). Bound into the cheque commitment
-            // below (compute_cheque_commitment). None for every non-recall cheque, so a
-            // normal cheque's commitment is byte-identical.
-            recall_target_tx_id: if transaction.is_recall() {
-                transaction.recall_target_tx_id
-            } else {
-                None
-            },
-        };
+            oracle_claim,
+            fact_certificates,
+            &issuer,
+        );
 
-        // Sign the cheque commitment
+        // Sign the cheque commitment with THIS validator's key.
         let commitment = self.compute_cheque_commitment(&cheque);
         let signature = self.signing_key.sign(&commitment);
         cheque.signature = signature.to_bytes().to_vec();
@@ -5247,15 +6770,16 @@ impl ConsensusEngine {
         // Replay the prior response verbatim when the same request_id arrives
         // again (before any re-execution / consume-once).
         if !request.request_id.is_empty() {
-            let cache = self.redeem_idempotency_cache.lock();
-            if let Some((_, resp)) = cache.iter().find(|(k, _)| k == &request.request_id) {
+            if let Some(resp) = self.lookup_redeem_response(&request.request_id) {
+                self.stats.idempotency_redeem_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // info! (not debug!) — a duplicate redeem is rare and notable: it means a
                 // client resubmitted the same request_id, and this replay is what saves the
                 // sender from the E_CHEQUE_ALREADY_REDEEMED quarantine. Worth a normal-level log.
                 info!("[REDEEM-IDEMPOTENT-HIT] request_id={} — replaying cached response (duplicate redeem absorbed)",
                       request.request_id);
-                return Ok(resp.clone());
+                return Ok(resp);
             }
+            self.stats.idempotency_redeem_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let result = self.process_redeem_request_inner(request).await;
         // Cache the first response for this request_id so a later duplicate
@@ -5282,14 +6806,46 @@ impl ConsensusEngine {
         self.stats.redeem_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         debug!("Processing redeem request: {}", request.request_id);
 
+        // Fable review 2026-10-01 F-3 — TARDIS forward-only bound on the carried
+        // attestation, before any Core execution (the CL5 attestation recompute
+        // and the CL5 run both forward `request.oods_attestation`).
+        self.refuse_future_attested_tick(request.oods_attestation.as_ref())?;
+
         let bundle = &request.cheque_bundle;
         
         // Step 1: Verify we have k cheques (k from receiver's address, YPX-007)
-        let (redeem_k_raw, redeem_pt) = bundle.cheques.first()
-            .and_then(|c| {
-                axiom_core_logic::wallet_id::extract_security_level(&c.receiver_wallet_id).ok()
-            })
-            .unwrap_or((3, 1));  // Default: k=3, DMAP
+        let (redeem_k_raw, redeem_pt) = match bundle.cheques.first().map(|c| {
+            axiom_core_logic::wallet_id::extract_security_level(&c.receiver_wallet_id)
+        }) {
+            Some(Ok(tier)) => tier,
+            // YP §17.3.1.4 v2.19.0 (KI#150): the tier is CHECKED here, so it is
+            // never defaulted — no cheque / undecodable receiver address → refuse.
+            other => {
+                let (code, category, msg) = if other.is_none() {
+                    (axiom_errors::error_code::E_INSUFFICIENT_CHEQUES,
+                     axiom_errors::ErrorCategory::ProtocolReject,
+                     "Insufficient cheques: empty bundle".to_string())
+                } else {
+                    (axiom_errors::error_code::E_INVALID_WALLET_ID,
+                     axiom_errors::ErrorCategory::ClientBug,
+                     "Invalid receiver_wallet_id: tier undecodable".to_string())
+                };
+                return Ok(RedeemResponse {
+                    request_id: request.request_id,
+                    success: false,
+                    new_balance: None,
+                    new_state_id: None,
+                    witness_signature: None,
+                    commitment_hash: None,
+                    state_hash: None,
+                    receipt_commitment: None,
+                    error_response: Some(crate::error_response::static_error(code, category, msg)),
+                    validator_hints: vec![],
+                    fact_signature: None,
+                    receiver_fact_chain: None,
+                });
+            }
+        };
         let redeem_k = (redeem_k_raw as usize).max(MIN_WITNESSES);
         if !bundle.has_k_cheques(redeem_k) {
             return Ok(RedeemResponse {
@@ -5321,62 +6877,76 @@ impl ConsensusEngine {
             });
         }
         
-        // Step 1b: S-ABR overlap enforcement on redeem (2026-04-16).
+        // Step 1b: the fresh-validator redeem gate (S-ABR overlap, 2026-04-16;
+        // declared-state anchor, Fable review 2026-10-01 F-1(a); `known` keyed on
+        // the TransactionRecord too, F-1(a) liveness fix + F-1(b)).
         //
-        // Same rule as sends: a fresh validator (no stored state for this
-        // receiver) MUST NOT accept a redeem without sufficient overlap sigs.
-        // Without this gate, a fresh validator accepts any replay carrying a
-        // stale txid_attestation — the PART:1 gap found in soak testing.
-        //
-        // Two cases:
-        //   OVERLAPPED (we have receiver's state in storage): proceed — we
-        //     can verify state_id consistency ourselves.
-        //   FRESH (no stored state): require overlap_sigs >= MIN_OVERLAP.
-        //     The overlap sigs prove that overlapped validators authorized
-        //     this state transition. Same trust model as S-ABR for sends.
-        //
-        // First-time receivers (never received before) have no stored state
-        // on ANY validator → all validators are "fresh" but overlap_sigs = 0
-        // is correct (genesis path, no prior state to protect).
+        // LAMBDA HYGIENE, not the enforcement: Core CL5 anchors the receiver's
+        // declared state to its last k-signed receipt and runs the redeem S-ABR
+        // overlap itself (`modes::cl5_anchor_receiver_state` /
+        // `cl5_receiver_overlap`, F-1(b)). This gate only refuses EARLY, before
+        // any Core work, the one shape a validator can judge from its own
+        // records: a returning receiver (non-zero declared state) at a validator
+        // that knows nothing of the state being consumed AND that carries fewer
+        // prior-hop sigs than the receipt's overlap needs. The rule, its history
+        // and the liveness defect it fixes: `fresh_validator_redeem_refusal`.
         {
-            let we_have_receiver_state = self.storage.get_wallet_state(&request.receiver_pk, redeem_k_raw, redeem_pt)
+            let declared = request.current_state.as_ref();
+            let we_hold_a_row = self.storage.get_wallet_state(&request.receiver_pk, redeem_k_raw, redeem_pt)
                 .ok().flatten()
                 .map(|ws| ws.state_id != [0u8; 32])
                 .unwrap_or(false);
-
-            if !we_have_receiver_state {
-                // We are a FRESH validator for this receiver.
-                let overlap_count = request.overlapped_signatures.len();
-                // First-time receiver: no state anywhere → overlap_count=0 is fine
-                // Returning receiver: must have overlap sigs from prev witness set
-                // We can't distinguish these purely from local state (we have
-                // nothing stored either way). The distinction comes from
-                // whether any OTHER validator has state — but we can't ask.
-                // Gate: if client provides overlap sigs, enforce minimum count.
-                // If 0 sigs AND cheque receiver has never transacted with us,
-                // this is either first-time (legitimate) or a replay routed
-                // to avoid overlap (illegitimate). The txid_attestation check
-                // downstream (Step 5) is the second line of defense.
-                if overlap_count > 0 && overlap_count < Self::required_overlap(overlap_count.max(MIN_WITNESSES)) {
-                    return Ok(RedeemResponse {
-                        request_id: request.request_id,
-                        success: false,
-                        new_balance: None,
-                        new_state_id: None,
-                        witness_signature: None,
-                        commitment_hash: None,
-                        state_hash: None,
-                        receipt_commitment: None,
-                        error_response: Some(crate::error_response::static_error(
-                            axiom_errors::error_code::E_SABR_INSUFFICIENT_OVERLAP,
-                            axiom_errors::ErrorCategory::ProtocolReject,
-                            format!("Redeem S-ABR: {} overlap sigs insufficient for fresh validator", overlap_count),
-                        )),
-                        validator_hints: vec![],
-                        fact_signature: None,
-                        receiver_fact_chain: None,
-                    });
-                }
+            // "I witnessed the tx that PRODUCED the declared state" — every one of
+            // that round's k witnesses stores this record (the send path writes
+            // the `wallets` row at the FINALIZER only), so this is what makes a
+            // send's non-finalizer witnesses "known" for the wallet's next receive.
+            let we_witnessed_the_declared_state = declared
+                .filter(|s| s.state_id != [0u8; 32])
+                .map(|s| self.storage.get_transaction_record(&s.state_id).ok().flatten().is_some())
+                .unwrap_or(false);
+            // YP §17.3.1.4 v2.19.0 (KI#150): the strict majority of the
+            // receiver's PREVIOUS round — the carried receipt's witness count —
+            // the same `sabr_overlap(prev_k)` Core requires.
+            let required = match request.prev_receipts.last() {
+                Some(r) => axiom_core_logic::wallet_id::sabr_overlap(
+                    (r.witness_sigs.len() as u8).max(axiom_core_logic::wallet_id::K_MIN)) as usize,
+                None => axiom_core_logic::wallet_id::sabr_overlap(axiom_core_logic::wallet_id::K_MIN) as usize,
+            };
+            let refusal = fresh_validator_redeem_refusal(
+                we_hold_a_row || we_witnessed_the_declared_state,
+                request.fact_witness_sigs.len(),
+                required,
+                // The ONE opening-state predicate Core's anchor uses, judged for
+                // the redeeming key and the cheque's receiver tier.
+                declared.map(|s| s.is_opening_state(&request.receiver_pk, redeem_k_raw, redeem_pt)),
+            );
+            if let Some(FreshRedeemRefusal::UnanchoredDeclaredState) = refusal {
+                // RULE 3: a security refusal needs a counter, not just a log.
+                self.stats.redeem_unanchored_state_refused
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                warn!("[F-1] fresh validator refuses redeem: receiver declares a non-zero \
+                       state this validator never witnessed, with {} prior-hop sigs (< {}) \
+                       (request_id={})", request.fact_witness_sigs.len(), required, request.request_id);
+                return Ok(RedeemResponse {
+                    request_id: request.request_id,
+                    success: false,
+                    new_balance: None,
+                    new_state_id: None,
+                    witness_signature: None,
+                    commitment_hash: None,
+                    state_hash: None,
+                    receipt_commitment: None,
+                    error_response: Some(crate::error_response::static_error(
+                        axiom_errors::error_code::E_SABR_INSUFFICIENT_OVERLAP,
+                        axiom_errors::ErrorCategory::ProtocolReject,
+                        "Redeem S-ABR: this validator never witnessed the receiver's declared \
+                         (non-zero) state and the request carries too few overlap signatures — \
+                         redeem at the receiver's previous witnesses first".to_string(),
+                    )),
+                    validator_hints: vec![],
+                    fact_signature: None,
+                    receiver_fact_chain: None,
+                });
             }
         }
 
@@ -5457,7 +7027,11 @@ impl ConsensusEngine {
                             .map_err(|e| LambdaError::CoreExecutionError(
                                 format!("ZkvmVerifier: {}", e)
                             ))?;
-                        let outputs = verifier.verify(&receipt)
+                        // verify_checkpoint, not verify — see the note at
+                        // nabla/src/registration.rs's proof_type==0 arm. The
+                        // guest commits ZkpCheckpointOutputs; decoding it as
+                        // PublicOutputs failed every cheque on the ZKP tier.
+                        let outputs = verifier.verify_checkpoint(&receipt)
                             .map_err(|e| LambdaError::CoreValidationFailed(
                                 format!("Cheque ZKP invalid: {}", e)
                             ))?;
@@ -5472,10 +7046,9 @@ impl ConsensusEngine {
                         // Layer 2: ZKP nonce binding — proof must match this cheque's nonce
                         if let Some(ref nonce) = cheque.zkp_nonce {
                             let expected_hash = {
-                                let mut h = blake3::Hasher::new();
-                                h.update(b"AXIOM_ZKP_NONCE");
-                                h.update(nonce);
-                                *h.finalize().as_bytes()
+                                // Pattern 1 sweep — ONE builder, shared with the
+                                // host VM and the zkVM guest.
+                                axiom_core_logic::compute::zkp_nonce_hash(nonce)
                             };
                             match outputs.zkp_nonce_hash {
                                 Some(h) if h == expected_hash => {}
@@ -5508,7 +7081,9 @@ impl ConsensusEngine {
             // All validators run Core CL3 via produce_witness_dmap and include
             // DMAP attestations in their cheques. This prevents compromised
             // validators from rubber-stamping without running Core.
-            let min_proofs = if bundle.cheques.len() >= 3 { 2 } else { 1 };
+            // YP §17.3.1.4 v2.19.0 (KI#150): a strict majority of the round's k
+            // — `sabr_overlap(k)` (3→2, 4→3, 5→3) — never a literal.
+            let min_proofs = (axiom_core_logic::wallet_id::sabr_overlap(redeem_k as u8) as usize).max(1);
             if verified_proof_count < min_proofs {
                 return Err(LambdaError::CoreValidationFailed(
                     format!("Only {} valid execution proofs — need at least {} for k={} consensus",
@@ -5649,8 +7224,15 @@ impl ConsensusEngine {
                         bundle,
                         cl5_state.balance,
                         cl5_state.wallet_seq,
-                        cl5_state.hibernation_until, // YPX-020 — carry receiver's stored hibernation
+                        cl5_state.hibernation_until, // YPX-020 — the request-carried hibernation
+                        cl5_state.wall_clock_lock,   // §5.2.2c — request-carried; must match what the SDK hashed
+                        cl5_state.emission_claimed_epoch,
+                        cl5_state.stake_floor_until, // §6b.13 — request-carried, as the SDK hashed it
+                        cl5_state.wallet_format,
                         cl5_state.state_id,
+                        // Fable review 2026-10-01 F-1(b) — the receiver's last
+                        // receipt, exactly as the SDK hashed it (L1).
+                        request.prev_receipts.clone(),
                         request.cheque_claim_proof.clone(),
                         request.txid_attestation.clone(),
                         request.oods_attestation.clone(), // YPX-021 §8.2 — same request-carried value the SDK hashed
@@ -5943,6 +7525,49 @@ impl ConsensusEngine {
             }
         }
 
+        // Step 5c (L4, Fable review 2026-10-01 F-1(b)): the receiver's DECLARED
+        // pre-redeem state must not be one THIS validator already saw consumed —
+        // by an ACK'd send, or by a redeem this validator witnessed (marked at
+        // store time below). The receive-side mirror of the send path's
+        // `is_state_consumed(consumed_state_id)` refusal: a REWIND (redeeming
+        // from a state the wallet has already moved past) at one of that state's
+        // previous witnesses is refused here from its own records. Hygiene, not
+        // the enforcement (Core's anchor + overlap are; a rewind that gets past
+        // colluding witnesses is a self-fork for Nabla). After Step 5, so a
+        // retry of the SAME cheque still answers E_CHEQUE_ALREADY_REDEEMED (the
+        // SDK's salvage path) — only a DIFFERENT consumption reaches this.
+        if let Some(ref client_state) = request.current_state {
+            if client_state.state_id != [0u8; 32]
+                && self.storage.is_state_consumed(&client_state.state_id)?
+            {
+                self.storage.unmark_cheque_redeemed(&txid).ok();
+                self.stats.double_spend_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                warn!("REDEEM DOUBLE-CONSUMPTION REJECTED: receiver's declared state {} was \
+                       already consumed in a prior transaction this validator witnessed (pk={})",
+                      hex::encode(&client_state.state_id[..8]),
+                      hex::encode(&request.receiver_pk[..request.receiver_pk.len().min(8)]));
+                return Ok(RedeemResponse {
+                    request_id: request.request_id,
+                    success: false,
+                    new_balance: None,
+                    new_state_id: None,
+                    witness_signature: None,
+                    commitment_hash: None,
+                    state_hash: None,
+                    receipt_commitment: None,
+                    error_response: Some(crate::error_response::static_error(
+                        axiom_errors::error_code::E_STATE_ID_CONSUMED,
+                        axiom_errors::ErrorCategory::ProtocolReject,
+                        "Redeem: the receiver's declared state was already consumed in a prior \
+                         transaction this validator witnessed",
+                    )),
+                    validator_hints: vec![],
+                    fact_signature: None,
+                    receiver_fact_chain: None,
+                });
+            }
+        }
+
         // Step 6: Determine receiver's current state
         // 
         // CRITICAL FOR CONSISTENCY: All validators must compute the same new_state_id.
@@ -5966,7 +7591,7 @@ impl ConsensusEngine {
         debug!("Using client-provided state for receiver: balance={}, seq={}",
               client_state.balance, client_state.wallet_seq);
         // Preserve existing auth_hash from receiver's stored state (if any).
-        // Redeem must NOT clear the receiver's stolen-key protection.
+        // Redeem must NOT clear the receiver's auth_hash (it is not stolen-key protection.
         let existing_auth = self.storage.get_wallet_state(&request.receiver_pk, redeem_k_raw, redeem_pt)
             .ok().flatten().and_then(|ws| ws.auth_hash);
         let receiver_state = Some(StoredWalletState {
@@ -5978,6 +7603,30 @@ impl ConsensusEngine {
             status: WalletStateStatus::Confirmed,
             group_members: None,
             auth_hash: existing_auth, hibernation_until: 0,
+            // ── L2 (Fable review 2026-10-01 F-1(b)): the DECLARED §15 fields go
+            // to Core VERBATIM; Lambda's row is a PRE-CHECK only (Step 5b +
+            // the consumed-state refusal above), never a substitute. ──────────
+            //
+            // ⚠ WRONG READING, corrected 2026-10-01 (RULE 0 §4). This row used
+            // to take the lock and emission mark FROM LAMBDA'S OWN STORAGE
+            // (`row.unwrap_or(0)`, "a client must not be able to clear its lock
+            // by declaring it") and the floor as `max(stored, declared)`. That
+            // was not an authority: a validator holding NO row fed `0`, one
+            // holding a STALE row (it served the wallet before the floor / lock
+            // was set) fed the stale value, and Core CL5 ran no anchor — so a
+            // round of such validators let the client's declaration stand (F-1).
+            // And once Core anchors (below), substituting a row value would make
+            // Core anchor a value the client did NOT declare and refuse an honest
+            // redeem. The authority is the receiver's LAST K-SIGNED RECEIPT,
+            // carried in `request.prev_receipts`: Core CL5 re-derives these
+            // declared values to its `state_hash` (`modes::
+            // cl5_anchor_receiver_state`), so a declared `0` on a locked /
+            // floored wallet is `E_STATE_NOT_ANCHORED` at every validator.
+            wall_clock_lock: client_state.wall_clock_lock,
+            emission_claimed_epoch: client_state.emission_claimed_epoch,
+            stake_floor_until: client_state.stake_floor_until,
+            // §6b.13 — the client's block; Core CL5 refuses any but CURRENT.
+            wallet_format: client_state.wallet_format,
             wallet_id: None,
         });
 
@@ -6030,6 +7679,18 @@ impl ConsensusEngine {
             .sum();
         let receiver_state_id = receiver_state.as_ref().map(|s| s.state_id);
         let current_balance = receiver_state.as_ref().map(|s| s.balance).unwrap_or(0);
+        // §5.2.2c / §4.2a / §6b.13 — the receiver's DECLARED lock, emission
+        // mark, floor and format block (L2, see the row above): what Core
+        // anchors to the carried receipt. `receiver_state` is always `Some`
+        // here (built from the §15-mandatory `current_state`).
+        let receiver_wall_clock_lock =
+            receiver_state.as_ref().map(|s| s.wall_clock_lock).unwrap_or(0);
+        let receiver_emission_claimed_epoch =
+            receiver_state.as_ref().map(|s| s.emission_claimed_epoch).unwrap_or(0);
+        let receiver_stake_floor_until =
+            receiver_state.as_ref().map(|s| s.stake_floor_until).unwrap_or(0);
+        let receiver_wallet_format = receiver_state.as_ref().map(|s| s.wallet_format)
+            .unwrap_or(axiom_core_logic::types::WalletFormat::CURRENT);
         let (new_balance, new_seq) = if let Some(current) = receiver_state {
             // Existing wallet - add cheque amount, subtract receiver-pays fees
             let new_balance = current.balance
@@ -6056,9 +7717,29 @@ impl ConsensusEngine {
         let sender_fact_chain = bundle.fact_chain.clone()
             .or_else(|| request.receiver_fact_chain.clone());
 
+        // YP §26.17.6.5 B4 — keep the certificates the cheques carry (their signers'
+        // and the issuing validator's set for the sender's earlier witnesses), then
+        // assemble the set for the money sender's chain as Core resolves it (Step 4b).
+        self.absorb_certificates(
+            bundle.cheques.iter()
+                .flat_map(|c| c.vbc_bundle.iter().chain(c.fact_certificates.iter()))
+                .chain(request.fact_witness_sigs.iter().filter_map(|s| s.vbc_bundle.as_ref())),
+        );
+        let offered_certificates: Vec<VBCProofBundle> = bundle.cheques.iter()
+            .flat_map(|c| c.vbc_bundle.iter().cloned().chain(c.fact_certificates.iter().cloned()))
+            .collect();
+        let presented_certificates = self.present_certificates(
+            axiom_core_logic::fact::redeem_fact_chain_ref(bundle, &sender_fact_chain),
+            &offered_certificates,
+        );
+
         // Step 7b: CORE VALIDATION - Core is the cryptographic gatekeeper
         // Core validates: k=3 cheques, consistency, balance math
         // AND MOST IMPORTANTLY: Core computes the new_state_id AND signs FACT!
+        // §23.14 (2026-09-24): mirror the AVM demand BEFORE taking the core guard,
+        // so a demand armed at a previous CL5/finalize is confirmable on THIS
+        // redeem instead of the next witness round.
+        self.sync_audit_mirror().await;
         let redeem_proof = {
             let core = self.core.write().await;
             // Receiver's existing FACT chain — Core appends the redeem
@@ -6066,12 +7747,14 @@ impl ConsensusEngine {
             // gathered). The SDK ships it on the redeem request.
             let receiver_fact_chain = request.receiver_fact_chain.clone();
             // Prior validators' FACT WitnessSigs accumulated for this
-            // redeem TX. Read from the dedicated `fact_witness_sigs`
-            // field (NOT `overlapped_signatures` — the latter is the
-            // S-ABR overlap proof on the send path, over a different
-            // commitment with a different signature algorithm). Core's
+            // redeem TX — the dedicated `fact_witness_sigs` field (the
+            // send path's `WitnessRequest::overlapped_signatures` is a
+            // different proof, Ed25519 over a different commitment; the
+            // redeem envelope has no such field since 2026-10-01). Core's
             // CL5 uses these (plus the locally produced sig) to assemble
-            // the FactLink when this validator is the finalizer.
+            // the FactLink when this validator is the finalizer, AND, since
+            // Fable review 2026-10-01 F-1(b), as the redeem's S-ABR overlap
+            // proof at a validator that did not witness `prev_receipts`.
             let prior_fact_sigs = request.fact_witness_sigs.clone();
             // UMP-safe call: pass the envelope by reference, let
             // core_client::validate_redeem source every wire field
@@ -6089,6 +7772,13 @@ impl ConsensusEngine {
                 current_balance,
                 new_seq,
                 new_balance,
+                // §5.2.2c — the DECLARED lock (L2): CL5's stake-lock gate refuses
+                // a truthful non-zero lock, and its receiver anchor refuses a
+                // forged `0` against the carried receipt (F-1(b)).
+                receiver_wall_clock_lock,
+                receiver_emission_claimed_epoch,
+                receiver_stake_floor_until,
+                receiver_wallet_format,
                 sender_fact_chain.clone(),
                 receiver_state_id,
                 receiver_fact_chain,
@@ -6096,7 +7786,13 @@ impl ConsensusEngine {
                 Some(self.dilithium_pk.clone()),
                 Some(self.validator_id),
                 Some(self.vbc_bundle()),
-            )?
+                            presented_certificates,
+                // §23.14 (2026-09-24): a CL5 redeem is an audited execution and
+                // decrements a pending SELF audit's countdown — it must carry the
+                // resolved confirmation (measured: "this CL5 execution carries NO
+                // audit_confirmation" ×3 in one countdown).
+                self.resolve_audit_confirmation(&None),
+)?
         };
 
         // Canonical FACT chain pointer for CL5 (must match modes::execute_cl5 Step 4b).
@@ -6142,21 +7838,53 @@ impl ConsensusEngine {
             // REJECTS a chain-less cross-wallet redeem (RedeemSenderAnchorMissing),
             // so the mirror must not quietly print a "clean" commitment for a
             // shape Core refuses to sign: that would read as agreement.
-            let cl5_inherited: Vec<[u8; 32]> = match cl5_chain_ref {
-                Some(fc) => axiom_core_logic::fact::compute_inherited_scar_txids(
-                    fc, &cl5_txid, cl5_self_redeem,
-                ),
-                None if cl5_self_redeem => Vec::new(),
-                None => {
+            //
+            // KI#221 / ForkSettlement Q2 (2026-09-28): calls THE function
+            // modes.rs::execute_cl5 calls at its inherit site —
+            // `fact::cl5_inherited_scar_txids` — with the SAME inputs Core got
+            // (the envelope's txid attestation, forwarded verbatim by
+            // core_client::validate_redeem; the bundle's class), so the mirror
+            // cannot drift from Core's settled-origin skip (Pattern 1). The
+            // fail-closed `None` arms live inside that function.
+            let cl5_inherited: Vec<[u8; 32]> = match axiom_core_logic::fact::cl5_inherited_scar_txids(
+                cl5_chain_ref,
+                bundle,
+                request.txid_attestation.as_ref(),
+                cl5_self_redeem,
+                cl5_dev_class,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
                     eprintln!(
-                        "[Lambda CL5 mirror] no sender FACT chain on a CROSS-WALLET redeem                          (txid={}) — Core CL5 rejects this shape (RedeemSenderAnchorMissing);                          the mirror commitment below is NOT meaningful.",
-                        hex::encode(&cl5_txid[..8]),
+                        "[Lambda CL5 mirror] Core's inherit step refuses this redeem \
+                         (txid={}, {:?}) — Core CL5 rejects this shape; \
+                         the mirror commitment below is NOT meaningful.",
+                        hex::encode(&cl5_txid[..8]), e,
                     );
                     Vec::new()
                 }
             };
+            // Fork Settlement R4 (2026-09-28): the redeem link's `required_k` is
+            // bound into the commitment. CL5 does not surface it
+            // (`PublicOutputs.required_k` is 0 on CL5), so the mirror calls THE
+            // derivation `execute_cl5` calls — `fact::cl5_redeem_required_k` —
+            // with `false`: Lambda's online CL5 never supplies
+            // `receiver_signing_key` (Pattern 1, like the anchor/inherit calls).
+            let cl5_k = match axiom_core_logic::fact::cl5_redeem_required_k(bundle, false) {
+                Ok((k, _)) => k,
+                Err(e) => {
+                    eprintln!(
+                        "[Lambda CL5 mirror] Core's k derivation refuses this redeem \
+                         (txid={}, {:?}) — Core CL5 rejects this shape; \
+                         the mirror commitment below is NOT meaningful.",
+                        hex::encode(&cl5_txid[..8]), e,
+                    );
+                    0
+                }
+            };
             let commitment = axiom_core_logic::fact::compute_fact_commitment(
                 &cl5_txid, &cl5_prev, &new_state_id, amount, cl5_anchor.as_ref(), cl5_dev_class,
+                cl5_k,
                 &cl5_inherited,
                 None, // burn_target_tx_id — this is a redeem mirror, never a burn
             );
@@ -6236,12 +7964,12 @@ impl ConsensusEngine {
 
             eprintln!(
                 "[Lambda CL5 mirror] commitment={} tx={} prev={} new={} amount={} \
-                 anchor={} sender_chain_links={} \
+                 k={} anchor={} sender_chain_links={} \
                  sig=({}) signed_pk[..8]={} published_pk[..8]={} pk_match={} \
                  sig_hash[..8]={} signed_pk_hash[..8]={} published_pk_hash[..8]={} \
                  host_verify_signed={} host_verify_published={}",
                 hex8(&commitment), hex8(&cl5_txid), hex8(&cl5_prev),
-                hex8(&new_state_id), amount,
+                hex8(&new_state_id), amount, cl5_k,
                 cl5_anchor.as_ref().map(|a| hex8(a)).unwrap_or_else(|| "NONE".into()),
                 cl5_resolved_fact_chain.as_ref().map(|fc| fc.links.len()).unwrap_or(0),
                 cl5_sig_hex,
@@ -6275,6 +8003,7 @@ impl ConsensusEngine {
         witness_sig.checkpoint_sig = redeem_proof.outputs.receiver_fact_chain.as_ref()
             .and_then(|chain| axiom_core_logic::compute::cosign_provisional_checkpoint(
                 chain, self.validator_id, &self.dilithium_pk, &self.dilithium_sk,
+                self.vbc_reference(),
             ).ok().flatten());
 
         // Sign Nabla receipt at redeem witness time.
@@ -6295,8 +8024,22 @@ impl ConsensusEngine {
         // receipt_commitment chain), and records the earnings locally.
         // The SDK never proposes a slot; downstream Cores (client CL1,
         // receiver CL5) re-derive and reject any inconsistency.
-        let my_rate_bps = self.fee_config.rate_bps
-            .min(axiom_core_logic::types::MAX_VALIDATOR_FEE_BPS);
+        // YPX-010 §12.7 — an Ark settlement redeem is FEE-FREE: the fee lives at
+        // the charge-in/unload boundaries, never the tap or its settlement, and
+        // the offline receiver already credited the gross amount. A redeem of an
+        // ark→ark (both-endpoints-Ark) cheque bundle charges 0; every other redeem
+        // keeps the operator rate. This matches the fee-free settlement cheque
+        // (rate_bps=0) so Core CL5 and the redeem-witness slot agree.
+        let is_ark_settlement_redeem = bundle.cheques.first()
+            .map(|c| axiom_core_logic::wallet_id::both_endpoints_ark(
+                &c.sender_wallet_id, &c.receiver_wallet_id))
+            .unwrap_or(false);
+        let my_rate_bps = if is_ark_settlement_redeem {
+            0
+        } else {
+            self.fee_config.rate_bps
+                .min(axiom_core_logic::types::MAX_VALIDATOR_FEE_BPS)
+        };
         let my_slot_amount: u64 = ((amount as u128)
             * my_rate_bps as u128
             / axiom_core_logic::types::FEE_BPS_DIVISOR as u128) as u64;
@@ -6429,7 +8172,25 @@ impl ConsensusEngine {
             // StoredWalletState.fact_chain removed (YPX-001 §1.6). The
             // SDK reads `receiver_fact_chain` from the finalizer's response
             // directly; no Lambda-side persistence of the chain.
-            auth_hash: receiver_auth, hibernation_until: 0,
+            auth_hash: receiver_auth,
+            // §5.2.2c — CARRY WHAT CORE BOUND, do not hardcode 0. CL5 binds the
+            // receiver's hibernation into the receipt's state_hash (a claim's
+            // redeem carries it FORWARD rather than clearing it), so storing 0
+            // here makes Lambda's stored state fail Core's §15 anchor re-derive
+            // on the wallet's NEXT send — measured 2026-09-06 as
+            // E_STATE_NOT_ANCHORED after the stake lock had already expired,
+            // which read as "release does not release" and is not that at all.
+            // Same rule the witness path already follows with proof.outputs.
+            hibernation_until: redeem_proof.outputs.hibernation_until,
+            // §5.2.2c — THE SITE WHERE A SUBSIDY CLAIM'S LOCK LANDS. CL5 stamps
+            // it and binds it into the receipt's state_hash, so Lambda must store
+            // exactly what Core returned or the claimant's next send cannot
+            // anchor. Was hardcoded 0.
+            wall_clock_lock: redeem_proof.outputs.wall_clock_lock,
+            emission_claimed_epoch: redeem_proof.outputs.emission_claimed_epoch,
+            // §6b.13 — the floor CL5 carried into the receipt's state_hash.
+            stake_floor_until: redeem_proof.outputs.stake_floor_until,
+            wallet_format: redeem_proof.outputs.wallet_format,
             wallet_id: None,
         };
         // CAS guard: concurrent redeems to the same wallet can race (wallet_seq
@@ -6470,6 +8231,23 @@ impl ConsensusEngine {
         self.storage.store_transaction_record(&tx_record)?;
         debug!("Stored receiver tx record: produced_state_id={} balance={}",
               hex::encode(&new_state_id[..8]), new_balance);
+
+        // L4 (Fable review 2026-10-01 F-1(b)): record the receiver's CONSUMED
+        // pre-state, so a later rewind to a state last consumed by a REDEEM is
+        // visible to Step 5c / the send path's `is_state_consumed` (before this,
+        // only send-consumed states ever were). Marked at STORE time, not ACK:
+        // receivers send no ACK for a redeem, and the redeem is final here for
+        // the receiver's state — there is no PENDING/abandon window (a stalled
+        // round is retried with the SAME cheque, which Step 5 answers first).
+        // NOT via `store_txid_consumed_state(txid, ..)`: that table is keyed by
+        // the cheque txid, which the SENDER's leg already owns — writing the
+        // receiver's state there would make the sender's ACK mark the wrong
+        // state. The zero state is shared by every first-time receiver: never marked.
+        if let Some(ref client_state) = request.current_state {
+            if client_state.state_id != [0u8; 32] {
+                self.storage.mark_state_consumed(&client_state.state_id)?;
+            }
+        }
 
         // [REDEEM-STORE DIAG] — emit by EVERY validator that reaches
         // the receiver-side wallet-state + transaction-record store. The
@@ -6619,9 +8397,11 @@ impl ConsensusEngine {
             &cheque.txid,
             &cheque.state_hash,
             &cheque.produced_state_id,
+            &cheque.sender_wallet_id,
             &cheque.receiver_wallet_id,
             cheque.amount,
             cheque.epoch,
+            cheque.created_at,
             cheque.rate_bps,
             &cheque.dmap_input_hash,
             &cheque.dmap_output_hash,
@@ -6653,7 +8433,42 @@ impl ConsensusEngine {
             carrier_address: self.carrier_address.clone(),
             signature: signature.to_bytes().to_vec(),
             execution_proof: vec![],
-            proof_type: 0, // Default ZKP; updated if DMAP is used
+            // ⚠ KI#187 (2026-09-16) — these stay EMPTY on every redeem, and that
+            // is the defect, not a default. This comment used to read "Default
+            // ZKP; updated if DMAP is used"; NOTHING ever updated them, for as
+            // long as the redeem path has existed (RULE 3 shape 7).
+            //
+            // The asymmetry is deeper than a missing copy: the SEND path builds
+            // a DMAP proof (`core_client.rs::build_dmap_execution_proof`, two
+            // sites) and carries it on its proof struct as
+            // `execution_proof_bytes` + `proof_type`; the CL5 redeem path never
+            // calls it, and `RedeemProof` has no fields to hold it. So a redeem
+            // receipt's k signatures carry NO validator-side execution evidence
+            // while the byte-identical structure from a send carries it.
+            //
+            // RULED 2026-09-18 (the owner): LEAVE AS A DOCUMENTED GAP — proven zero
+            // current security issue. Every reader of this field was traced:
+            //   * Core `execute_cl4` (modes.rs, the MissingExecutionProof loop)
+            //     would reject an empty proof — but CL4 is a RESERVED gate with
+            //     NO production caller (its doc-comment + check_mode_coverage.py;
+            //     proven live by claim→redeem→heal succeeding with empty redeem
+            //     proofs). Dead in production.
+            //   * Nabla `verify_zkp_proofs` sets the `zkp_verified` ACK flag,
+            //     which NOTHING reads as a gate; its `?` rejects only an INVALID
+            //     proof, never an absent one. Nabla fails open regardless.
+            // Redeem fund-safety rests on the client's MANDATORY CL5 proof
+            // (E_LAMBDA_CL5_PROOF_MISSING, Core-verified), the cheque's 2-of-k
+            // proof, the k-quorum (§17.1.2) and consume-once — none read THIS
+            // field. So a hostile SDK + hostile Nabla cannot exploit its absence.
+            //
+            // ⚠ LATENT BLOCKER: the day `execute_cl4` is wired into a production
+            // path, it WILL reject every redeem receipt used as a prev_receipt
+            // (MissingExecutionProof). Whoever activates CL4 MUST first make CL5
+            // build the validator proof here (a copy is not enough — RedeemProof
+            // has no field for it; build it, and prove the CL5-context DMAP proof
+            // verifies through Nabla before rolling). Until then, nothing reads
+            // it and it stays empty. KI#187.
+            proof_type: 0,
             availability_attestation: None,
             validator_hints: hints,
             fact_signature: None,  // Filled by caller from Core CL5 output
@@ -6698,6 +8513,7 @@ impl ConsensusEngine {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+        let zkp_qualification = self.zkp_qualification.lock().clone();
 
         ValidatorStatusResponse {
             request_id: request_id.to_string(),
@@ -6717,7 +8533,8 @@ impl ConsensusEngine {
             uptime_secs: now.saturating_sub(self.stats.started_at),
             witness_count: self.stats.witness_count.load(Relaxed),
             redeem_count: self.stats.redeem_count.load(Relaxed),
-            zkp_qualified: self.stats.zkp_qualified.load(Relaxed),
+            // YPX-007 §9.5 — DERIVED from the one record, never set independently.
+            zkp_qualified: zkp_qualification.is_some(),
             known_validators: self.get_hints(),
             fee_rate_bps: self.fee_config.rate_bps,
             fee_valid_until: self.fee_config.valid_until,
@@ -6732,6 +8549,7 @@ impl ConsensusEngine {
             digit_version: self.management_db.as_ref()
                 .and_then(|db| db.get_digit_version().ok())
                 .unwrap_or(0),
+            zkp_qualification,
         }
     }
     
@@ -6847,146 +8665,6 @@ impl ConsensusEngine {
         })
     }
 
-    /// CL13 / fee ledger Step 9B.3 — chosen-witness handler.
-    ///
-    /// Called when the operator's Lambda sends a
-    /// `WithdrawalMintWitnessRequest` to this validator's gateway
-    /// (this validator is one of the operator's `chosen_witnesses`).
-    ///
-    /// Flow:
-    ///   1. Lambda-side `verify_validator_withdrawal` (the cheap 7-step
-    ///      chain). Cuts off obvious tamper before paying the AVM cost.
-    ///   2. Core CL13 via the AVM — independent re-verification inside
-    ///      the consensus ELF. A compromised originating Lambda cannot
-    ///      smuggle a bad withdrawal past this gate.
-    ///   3. On Accept: sign the canonical mint commitment with this
-    ///      validator's Ed25519 key. Operator collects k=3 of these and
-    ///      assembles the mint receipt in Step 9B.4.
-    ///
-    /// This function is intentionally NOT `async` — the cross-Lambda
-    /// fan-out happens at the operator's side; the witness handler runs
-    /// synchronously on the gateway thread.
-    pub async fn process_withdrawal_mint_witness(
-        &self,
-        req: &axiom_core_logic::types::WithdrawalMintWitnessRequest,
-    ) -> axiom_core_logic::types::WithdrawalMintWitnessResponse {
-        use ed25519_dalek::Signer;
-        use axiom_core_logic::types::WithdrawalMintWitnessResponse;
-
-        let our_pk = self.public_key.as_bytes().to_vec();
-
-        // (1) Lambda-side 7-step verify.
-        let pre = crate::validator_withdrawal::verify_validator_withdrawal(&req.withdrawal);
-        if pre.status != "VERIFIED" {
-            debug!(
-                "WithdrawalMintWitness: Lambda-side verify rejected {}",
-                pre.status
-            );
-            return WithdrawalMintWitnessResponse {
-                request_id: req.request_id.clone(),
-                status: pre.status,
-                witness_pk: our_pk,
-                witness_sig: None,
-                claim_sig: None,
-                mint: None,
-                error_response: None,
-            };
-        }
-
-        // (2) Core CL13 via AVM — independent re-verification.
-        let outputs = {
-            let core = self.core.write().await;
-            match core.execute_cl13(&req.withdrawal) {
-                Ok(o) => o,
-                Err(e) => {
-                    return WithdrawalMintWitnessResponse {
-                        request_id: req.request_id.clone(),
-                        status: format!("REJECTED_CORE_ERROR: {}", e),
-                        witness_pk: our_pk,
-                        witness_sig: None,
-                claim_sig: None,
-                        mint: None,
-                        error_response: Some(crate::error_response::static_error(
-                            axiom_errors::error_code::E_LAMBDA_STORAGE_ERROR,
-                            axiom_errors::ErrorCategory::Internal,
-                            "Core CL13 execution failed",
-                        )),
-                    };
-                }
-            }
-        };
-        if outputs.result != axiom_core_logic::ValidationResult::Accept {
-            let reason = outputs.rejection_reason
-                .map(|r| format!("{}", r))
-                .unwrap_or_else(|| "unknown".to_string());
-            return WithdrawalMintWitnessResponse {
-                request_id: req.request_id.clone(),
-                status: format!("REJECTED_CORE_CL13: {}", reason),
-                witness_pk: our_pk,
-                witness_sig: None,
-                claim_sig: None,
-                mint: None,
-                error_response: None,
-            };
-        }
-        let mint = match outputs.validator_withdrawal_mint {
-            Some(m) => m,
-            None => {
-                // Should be unreachable — Core CL13 Accept always
-                // populates the field. Surface defensively.
-                return WithdrawalMintWitnessResponse {
-                    request_id: req.request_id.clone(),
-                    status: "REJECTED_CORE_OUTPUT_MISSING".into(),
-                    witness_pk: our_pk,
-                    witness_sig: None,
-                claim_sig: None,
-                    mint: None,
-                    error_response: Some(crate::error_response::static_error(
-                        axiom_errors::error_code::E_LAMBDA_STORAGE_ERROR,
-                        axiom_errors::ErrorCategory::Internal,
-                        "Core CL13 Accept without mint output",
-                    )),
-                };
-            }
-        };
-
-        // (3a) Sign the canonical mint commitment — operator uses k=3
-        //      of these for the linked-wallet credit + audit trail.
-        let mint_commitment = axiom_core_logic::compute::compute_withdrawal_mint_commitment(
-            &mint.validator_id,
-            &mint.linked_wallet_id,
-            mint.net_amount,
-            mint.claimed_through_tick,
-        );
-        let mint_sig = self.signing_key.sign(&mint_commitment);
-
-        // (3b) Sign the canonical CLAIM payload — operator forwards k=3
-        //      of these to Nabla in a `MarkValidatorEarningsClaimedRequest`
-        //      so `last_claimed_tick` advances and the same earnings
-        //      can't be re-claimed from a fresh Lambda (Step 9B.8).
-        let claim_payload = axiom_core_logic::compute::compute_validator_claim_payload(
-            &mint.validator_id,
-            mint.claimed_through_tick,
-        );
-        let claim_sig = self.signing_key.sign(&claim_payload);
-
-        info!(
-            "WithdrawalMintWitness signed: vid={} net={} → {} (mint+claim)",
-            hex::encode(&mint.validator_id[..8]),
-            mint.net_amount,
-            hex::encode(&mint.linked_wallet_id[..8]),
-        );
-
-        WithdrawalMintWitnessResponse {
-            request_id: req.request_id.clone(),
-            status: "VERIFIED".to_string(),
-            witness_pk: our_pk,
-            witness_sig: Some(mint_sig.to_bytes().to_vec()),
-            claim_sig: Some(claim_sig.to_bytes().to_vec()),
-            mint: Some(mint),
-            error_response: None,
-        }
-    }
 
     /// Get health status
     pub fn health(&self) -> HealthResponse {
@@ -7012,11 +8690,11 @@ impl ConsensusEngine {
     /// 
     /// This method is for TESTING ONLY - it allows creating genesis wallets
     /// without the real Genesis validator signatures.
-    /// §4.5 / §30.2: Set auth_hash on a wallet (stolen-key protection).
+    /// §4.5 / §30.2: Set auth_hash on a wallet (NOT stolen-key protection).
     ///
-    /// The auth_hash is an Ed25519 public key derived from owner_secret (v2.11.13).
-    /// Once set, every TX must include owner_proof (Ed25519 signature) proving
-    /// knowledge of the secret. Core validates — Lambda just stores the key.
+    /// The auth_hash is an Ed25519 public key derived from the wallet private
+    /// key (v2.11.13). Lambda just stores it. Since 2026-09-25 (KI#108) Core
+    /// reads it nowhere — the `owner_proof` signature it keyed was deleted.
     ///
     /// This is the user-facing API that was missing (G7). Core validation was already
     /// implemented in GAP-A fix (v2.11.3).
@@ -7066,7 +8744,7 @@ impl ConsensusEngine {
             }
         };
 
-        // Set auth_hash — once set, every TX requires owner_proof proof
+        // Set auth_hash — stored only; nothing verifies against it (KI#108)
         state.auth_hash = Some(auth_hash);
 
         // Persist updated state
@@ -7147,6 +8825,13 @@ impl ConsensusEngine {
             auth_hash,
             wallet_id: None,
             hibernation_until: 0,
+            // §5.2.2c — a genesis-funded / synthetic wallet never CLAIMED a
+            // subsidy, so it carries no wall-clock lock. The genesis 3-year
+            // lockup is the separate pk-based GENESIS_VALIDATORS check.
+            wall_clock_lock: 0,
+            emission_claimed_epoch: 0,
+            // §6b.13 — an opening state: no floor, the current format block.
+            stake_floor_until: 0, wallet_format: axiom_core_logic::types::WalletFormat::CURRENT,
         };
 
         self.storage.set_genesis_state(&pk_array, axiom_core_logic::wallet_id::K_DEFAULT, axiom_core_logic::wallet_id::PROOF_TYPE_DMAP, &state)?;
@@ -7214,6 +8899,10 @@ impl ConsensusEngine {
             status: WalletStateStatus::Confirmed,
             group_members: None,
             auth_hash: None, hibernation_until: 0,
+            // §5.2.2c — genesis-funded wallet: no subsidy claim, no lock.
+            wall_clock_lock: 0,
+            emission_claimed_epoch: 0,
+            stake_floor_until: 0, wallet_format: axiom_core_logic::types::WalletFormat::CURRENT,
             wallet_id: None,
         };
 
@@ -7230,211 +8919,8 @@ impl ConsensusEngine {
         Ok(())
     }
 
-    /// Build a ScarRecoveryProof for a healed scar.
-    ///
-    /// Called when Nabla confirms a transaction and a validator needs to attest
-    /// that the scar on the sender's FACT link has been healed.
-    ///
-    /// The heal commitment is computed by Core (compute_scar_heal_commitment),
-    /// and signed with this validator's Dilithium key.
-    pub fn build_scar_recovery_proof(
-        &self,
-        original_tx_id: &[u8; 32],
-        nabla_confirmation: axiom_core_logic::types::NablaConfirmation,
-        receiver_wallet_id: String,
-    ) -> Result<axiom_core_logic::types::ScarRecoveryProof, LambdaError> {
-        use axiom_core_logic::types::{FactWitness, ScarRecoveryProof, PublicInputs, Transaction};
-        use axiom_core_logic::CoreLogicMode;
-
-        // GAP-6 FIX: Route scar heal signing through Core (CL9).
-        // Lambda MUST NOT call sign_dilithium directly.
-        let inputs = PublicInputs {
-            recall_attestation: None,
-            mode: CoreLogicMode::CL9,
-            oods_attestation: None,
-            local_core_id: self.expected_core_id,
-            withdrawal_inputs: None,
-            transaction: Transaction {
-                recall_target_tx_id: None,
-                consumed_state_id: [0u8; 32],
-                client_pk: vec![],
-                sender_wallet_id: String::new(),
-                wallet_seq: 0,
-                receiver_wallet_id: String::new(),
-                receiver_address: None,
-                amount: 0,
-                reference: String::new(),
-                nonce: 0,
-                epoch: 0,
-                client_sig: vec![],
-                owner_proof: None,
-                scar_passcode: None,
-                burn_target_tx_id: None,
-                required_k: 0,
-                proof_type: 0,
-                oracle_claim: None,
-                core_version: String::new(),
-                core_id: [0u8; 32],
-                kind: TxKind::Normal,
-            },
-            prev_receipts: vec![],
-            current_state: None,
-            vbc_bundle: None,
-            cheque_bundle: None,
-            receiver_pk: None,
-            receiver_current_balance: None,
-            receiver_wallet_seq: None,
-            receiver_current_hibernation: None,
-            receiver_new_balance: None,
-            receiver_new_state_id: None,
-            my_validator_pk: None,
-            overlapped_signatures: vec![],
-            group_member_index: None,
-            sender_fact_chain: None,
-            max_fact_links: if self.max_fact_links > 0 { Some(self.max_fact_links as u32) } else { None },
-            receiver_fact_chain: None,
-            my_dilithium_sk: Some(self.dilithium_sk.clone()),
-            my_dilithium_pk: Some(self.dilithium_pk.clone()),
-            my_validator_id: Some(self.validator_id),
-            fact_witness_sigs: vec![],
-            issuer_sphincs_sk: None,
-            cl1_execution_proof: None,
-            zkp_nonce: None,
-            scar_heal_tx_id: Some(*original_tx_id),
-            scar_heal_nabla_id: Some(nabla_confirmation.nabla_node_id),
-            scar_heal_root_hash: Some(nabla_confirmation.root_hash),
-            audit_confirmation: None,
-            nonce_response: None,
-            audit_response: None,
-            wallet_secret: None,
-            fanout_message: None,
-            candidate_balance: None,
-            nabla_stake_proof: None,
-            frozen_wallets: None,
-            console_current_cert: None,
-            console_new_cert: None,
-            console_selector_picks: None,
-            console_nominations: None, txid_attestation: None,
-        cheque_claim_proof: None,
-            clara_attestation: None,
-            phase_out_payload: None,
-            phase_out_era_end_ticks: vec![],
-            phase_out_blocked_era_ids: vec![],
-            current_tick: 0,
-        
-        };
-
-        let outputs = axiom_core_logic::execute_core(inputs);
-
-        let signature = match outputs.result {
-            axiom_core_logic::ValidationResult::Accept => {
-                outputs.fact_signature.ok_or_else(||
-                    LambdaError::CoreError("CL9: Core did not return scar heal signature".into()))?
-            }
-            _ => {
-                let reason = outputs.rejection_reason
-                    .map(|r| format!("{}", r))
-                    .unwrap_or_else(|| "unknown".into());
-                return Err(LambdaError::CoreError(format!("CL9 rejected: {}", reason)));
-            }
-        };
-
-        // Build vbc_genesis_anchor from our VBC's issuer set
-        let vbc_genesis_anchor: Option<Vec<[u8; 32]>> = {
-            let issuer_set = &self.vbc.target_vbc.issuer_set;
-            if issuer_set.is_empty() {
-                None
-            } else {
-                Some(issuer_set.iter().map(|pk| {
-                    *blake3::hash(pk).as_bytes()
-                }).collect())
-            }
-        };
-
-        let witness = FactWitness {
-            validator_id: self.validator_id,
-            validator_pk: self.dilithium_pk.clone(),
-            signature,
-            vbc_genesis_anchor,
-        };
-
-        info!("[SCAR_HEAL] Built recovery proof for tx={} receiver={}",
-            hex::encode(&original_tx_id[..8]), receiver_wallet_id);
-
-        Ok(ScarRecoveryProof {
-            original_tx_id: *original_tx_id,
-            nabla_confirmation,
-            healing_witnesses: vec![witness],
-            receiver_wallet_id,
-            fact_link_index: None,
-        })
-    }
-
-    /// Apply a ScarRecoveryProof to a scarred FACT link.
-    ///
-    /// Verifies the proof via Core (verify_scar_recovery_proof), then sets
-    /// nabla_confirmation on the matching FACT link. Returns downstream
-    /// ReceiverContact targets for notification forwarding.
-    pub fn apply_scar_recovery(
-        &self,
-        proof: &axiom_core_logic::types::ScarRecoveryProof,
-        wallet_pk: &[u8],
-    ) -> Result<Vec<axiom_core_logic::types::ReceiverContact>, LambdaError> {
-        // Verify through Core (sole cryptographic authority)
-        axiom_core_logic::fact::verify_scar_recovery_proof(proof)
-            .map_err(|e| LambdaError::CoreError(format!("Scar recovery proof invalid: {}", e)))?;
-
-        // Wallet state lookup retained for existence check; the
-        // downstream-target scan over StoredWalletState.fact_chain was
-        // removed when that field was deprecated (YPX-001 §1.6 — client
-        // is authoritative). Downstream-receiver notification now needs
-        // the client's FACT chain in scope; until that wiring is added,
-        // we return an empty target list (scar heal still applies to the
-        // sender's chain via the proof itself).
-        // TODO(ark-k0): scar recovery is pk-only here; Standard (k=3) suffices for
-        // normal wallets. If an Ark (k=0) chain ever scar-recovers via this path,
-        // thread the tier from the recovery proof's wallet_id.
-        let _state = self.storage.get_wallet_state(wallet_pk, axiom_core_logic::wallet_id::K_DEFAULT, axiom_core_logic::wallet_id::PROOF_TYPE_DMAP)?
-            .ok_or_else(|| LambdaError::InvalidRequest(
-                format!("Wallet not found: {}", hex::encode(&wallet_pk[..8]))
-            ))?;
-
-        let downstream_targets = Vec::new();
-
-        info!("[SCAR_HEAL] Applied recovery for tx={}, {} downstream targets",
-            hex::encode(&proof.original_tx_id[..8]), downstream_targets.len());
-
-        Ok(downstream_targets)
-    }
-
-    // =========================================================================
-    // YPX-007: ZKP Qualification
-    // =========================================================================
-
-    /// Check if this validator is currently ZKP-qualified.
-    pub fn is_zkp_qualified(&self) -> bool {
-        let qual = self.zkp_qualification.lock();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        qual.is_valid(now)
-    }
-
-    /// Mark this validator as ZKP-qualified after successful benchmark.
-    /// Called by the qualification orchestrator after Core verifies the STARK proof
-    /// and confirms elapsed time < ZKP_QUAL_THRESHOLD_SECS.
-    pub fn set_zkp_qualified(&self) {
-        let mut qual = self.zkp_qualification.lock();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        qual.zkp_qualified = true;
-        qual.qualified_at = Some(now);
-        self.stats.zkp_qualified.store(true, std::sync::atomic::Ordering::Relaxed);
-        info!("ZKP qualification granted at t={}", now);
-    }
+    // YPX-007: `is_zkp_qualified` / `set_zkp_qualified` DELETED 2026-10-03 (KI#125 —
+    // zero callers). The record is written by `set_zkp_qualification` only.
 
 }
 
@@ -7462,9 +8948,12 @@ impl ConsensusEngine {
 /// skipped by mangling a wallet_id).
 ///
 /// **Exemptions** (no external receiver to consent / consent incoherent):
-/// - CLARA attestation present (YPX-018): the wallet healed through a
-///   witnessed TX_HEAL; the heal link's confirmation legitimately lives on
-///   the /clara channel, so its unresolved look is expected.
+/// - CLARA heal LINK (YPX-018, per LINK not per TX): the one link with
+///   `tx_id == ClaraAttestation.heal_txid` does not count as own-unresolved —
+///   its confirmation legitimately lives on the /clara channel. Every OTHER
+///   unresolved link and all inherited taint still gate the post-heal send.
+///   ~~"CLARA attestation present ⇒ the whole TX is exempt"~~ (RULE 0,
+///   2026-10-02, KI#256 review).
 /// - Burn (`burn_target_tx_id`): burns are the CURE for scars; the target
 ///   is pinned by Core's `validate_burn_target`.
 /// - Recall (YPX-022): self-send recovery whose chain legitimately carries
@@ -7506,10 +8995,16 @@ pub(crate) fn verify_scar_consent_voucher(
 pub(crate) fn scar_consent_gate_count(
     chain: &axiom_core_logic::types::FactChain,
     tx: &Transaction,
-    has_clara_attestation: bool,
+    // YPX-001 §1.5.1 CLARA exemption = the HEAL LINK only: its confirmation
+    // lives on the /clara channel, so it carries no `nabla_confirmation` and
+    // would otherwise read as a scar on the post-heal send (KI#256).
+    // ~~"CLARA attestation present ⇒ the whole TX skips the gate"~~ — RULE 0
+    // (2026-10-02): that waived consent for EVERY other scar and inherited
+    // taint on the post-heal send. It never fired while KI#256 kept the
+    // attestation off the wire; activating KI#256 would have opened it.
+    clara_heal_txid: Option<[u8; 32]>,
 ) -> usize {
-    if has_clara_attestation
-        || tx.burn_target_tx_id.is_some()
+    if tx.burn_target_tx_id.is_some()
         || tx.is_recall()
         || tx.is_heal()
         || tx.is_hal_reanchor()
@@ -7536,7 +9031,8 @@ pub(crate) fn scar_consent_gate_count(
             }
             let own_unresolved = l.nabla_confirmation.is_none()
                 && l.recall_proof.is_none()
-                && l.required_k > 0;
+                && l.required_k > 0
+                && clara_heal_txid != Some(l.tx_id);
             // YPX-001 §1.5.1a: inherited taint keeps the link gate-relevant
             // no matter how its own transition resolved — every downstream
             // receiver consents in turn until the ORIGIN txid resolves (or the
@@ -7556,23 +9052,192 @@ pub mod tests {
     /// Compute commitment_hash for tests only.
     /// In production, ONLY Core computes this. Tests need it to create valid signatures.
     fn test_compute_commitment(transaction: &Transaction) -> [u8; 32] {
-        let mut hasher = Hasher::new();
-        hasher.update(b"AXIOM_WITNESS_V2");
-        hasher.update(&transaction.consumed_state_id);
-        hasher.update(&transaction.client_pk);
-        hasher.update(&transaction.wallet_seq.to_le_bytes());
-        hasher.update(transaction.receiver_wallet_id.as_bytes());
-        hasher.update(&transaction.amount.to_le_bytes());
-        hasher.update(&transaction.nonce.to_le_bytes());
-        *hasher.finalize().as_bytes()
+        // Pattern 1 sweep — call the ONE builder instead of re-implementing
+        // the preimage. A test that re-derives the value it exists to protect
+        // cannot fail when that value changes — it agrees with itself while
+        // production and the SDK drift apart.
+        axiom_core_logic::compute::compute_commitment_hash(transaction)
     }
-    
+
+    /// §23.14.6 / KI#207 root cause (2026-09-24): the peer-audit target is a
+    /// witness's Ed25519 key, so the hint lookup MUST key on `ed25519_pk`. The
+    /// pre-fix code keyed on `validator_id` (`blake3(sphincs_pk)`, another
+    /// namespace) and could never match — the request was never sent and the
+    /// innocent co-witness was banned. This test is RED on that code: the
+    /// second hint below has `validator_id == target` and must NOT resolve.
+    #[test]
+    fn peer_audit_target_resolves_by_ed25519_pk_not_validator_id() {
+        let target = [0xBBu8; 32];
+        let hint = |validator_id: [u8; 32], ed25519_pk: Option<[u8; 32]>, carriers: &[&str]| {
+            axiom_core_logic::types::ValidatorHint {
+                validator_id,
+                name: "penguin".into(),
+                carriers: carriers.iter().map(|c| c.to_string()).collect(),
+                proof_cap: None,
+                last_seen: None,
+                ed25519_pk,
+                encryption_public_key: String::new(),
+                supported_encryption: String::new(),
+            }
+        };
+        let hints = vec![
+            // some other validator, fully populated
+            hint([0x11; 32], Some([0x22; 32]), &["email:other@axiom"]),
+            // the BUG's shape: validator_id equals the target, ed25519_pk does not
+            hint(target, Some([0x33; 32]), &["email:wrong@axiom"]),
+            // the real target: ed25519_pk equals the target
+            hint([0x44; 32], Some(target), &["uncle:10.0.0.1:9001", "email:gamma@axiom"]),
+        ];
+        assert_eq!(
+            ConsensusEngine::resolve_peer_audit_target_email(&hints, &target).as_deref(),
+            Some("gamma@axiom"),
+            "the target is an Ed25519 key: match hint.ed25519_pk, take its email: carrier",
+        );
+        // No ed25519_pk on the matching row, or no email carrier → unresolved, never a guess.
+        let no_key = vec![hint([0x44; 32], None, &["email:gamma@axiom"])];
+        assert!(ConsensusEngine::resolve_peer_audit_target_email(&no_key, &target).is_none());
+        let no_email = vec![hint([0x44; 32], Some(target), &["uncle:10.0.0.1:9001"])];
+        assert!(ConsensusEngine::resolve_peer_audit_target_email(&no_email, &target).is_none());
+        // And the pre-fix lookup — by validator_id — would have picked the WRONG row.
+        let by_validator_id = hints.iter().find(|h| h.validator_id == target)
+            .and_then(|h| h.carriers.iter().find(|c| c.starts_with("email:")).cloned());
+        assert_eq!(by_validator_id.as_deref(), Some("email:wrong@axiom"),
+                   "keying on validator_id resolves a different validator (the historical bug)");
+    }
+
+    /// §23.14.6 (KI#213): B answers a peer audit about a tx it never held with a
+    /// SIGNED NotHeld (never silence), and — once the CL2 witness digest exists —
+    /// with the raw fields. Red on the pre-fix code (returned None → ANTIE's
+    /// generic failure → A banned B NonResponds after 600 s).
+    /// KI#215 (2026-09-25): the mirror must ADOPT the AVM's re-armed demand over a stale
+    /// copy, KEEP the same audit, and CLEAR when the AVM has none. Mutation: make the
+    /// nonce comparison `true` and `adopts_…` goes red; drop the `(None, Some)` arm and
+    /// `clears_…` goes red.
+    #[test]
+    fn audit_mirror_adopts_the_avms_re_armed_demand_over_a_stale_copy() {
+        let mk = |nonce: u8, target: u8| axiom_core_logic::types::AuditDemand {
+            target_validator_pk: vec![target; 32], challenge_nonce: [nonce; 32], trigger_txid: [7u8; 32],
+        };
+        let self_demand = mk(1, 0xAA);
+        let re_armed = mk(2, 0xBB);
+        assert_eq!(ConsensusEngine::audit_mirror_action(Some(&self_demand), Some(&self_demand)), MirrorAction::Keep);
+        assert_eq!(ConsensusEngine::audit_mirror_action(Some(&re_armed), Some(&self_demand)), MirrorAction::Adopt,
+                   "the AVM resolved the self audit and re-armed epsilon in one execution — Lambda's copy is STALE");
+        assert_eq!(ConsensusEngine::audit_mirror_action(Some(&re_armed), None), MirrorAction::Adopt);
+        assert_eq!(ConsensusEngine::audit_mirror_action(None, Some(&self_demand)), MirrorAction::Clear);
+        assert_eq!(ConsensusEngine::audit_mirror_action(None, None), MirrorAction::Keep);
+    }
+
+    /// KI#215: a peer-audit request never goes to OURSELVES — a self demand is answered
+    /// by a confirmation, and the target comes from the AVM's demand, not the mirror.
+    #[test]
+    fn peer_audit_outbound_never_targets_self() {
+        let ours = vec![0xAAu8; 32];
+        let peer = axiom_core_logic::types::AuditDemand {
+            target_validator_pk: vec![0xBBu8; 32], challenge_nonce: [3u8; 32], trigger_txid: [7u8; 32],
+        };
+        let me = axiom_core_logic::types::AuditDemand { target_validator_pk: ours.clone(), ..peer.clone() };
+        assert_eq!(ConsensusEngine::peer_audit_outbound_target(&peer, &ours), Some(vec![0xBBu8; 32]));
+        assert_eq!(ConsensusEngine::peer_audit_outbound_target(&me, &ours), None,
+                   "kappa mailed itself a request twice in the 2026-09-25 soak");
+    }
+
+    /// RULE 6: a busy core lock must read as UNKNOWN on /audit, never as "no bans"
+    /// / zero counts (live 2026-09-26: an active 1 h ban read as gone after 27 min).
+    #[tokio::test]
+    async fn audit_reads_are_unknown_not_empty_while_the_core_lock_is_held() {
+        let engine = create_test_engine();
+        assert!(engine.peer_audit_bans().is_some() && engine.peer_audit_trigger_counts().is_some());
+        let _held = engine.core.write().await;
+        assert!(engine.peer_audit_bans().is_none(), "busy lock must not read as an empty ban list");
+        assert!(engine.peer_audit_trigger_counts().is_none());
+        assert!(engine.audit_operator_counts().is_none());
+    }
+
+    #[tokio::test]
+    async fn peer_audit_request_answers_not_held_then_held_after_the_witness_digest() {
+        let engine = create_test_engine();
+        let txid = [0x51u8; 32];
+        let nonce = [0x52u8; 32];
+        // A's request, signed by A's operational key (KI#175) — here our own key stands in for A's.
+        let requester_pk = engine.public_key.as_bytes().to_vec();
+        let payload = axiom_core_logic::audit::peer_audit_request_signing_payload(&txid, &nonce, &requester_pk);
+        let request = axiom_core_logic::types::PeerAuditRequest {
+            txid, challenge_nonce: nonce, requester_pk: requester_pk.clone(),
+            requester_sig: engine.signing_key.sign(&payload).to_bytes().to_vec(),
+        };
+        match engine.handle_peer_audit_request(&request).await {
+            PeerAuditAnswer::NotHeld(nh) => {
+                assert_eq!(nh.txid, txid); assert_eq!(nh.challenge_nonce, nonce);
+                assert_eq!(nh.responder_pk, requester_pk, "signed by OUR operational key");
+                assert!(axiom_core_logic::audit::verify_peer_audit_not_held_sig(&nh), "A can authenticate it");
+                let mut forged = nh.clone(); forged.txid[0] ^= 1;
+                assert!(!axiom_core_logic::audit::verify_peer_audit_not_held_sig(&forged), "bound to the txid");
+            }
+            other => panic!("a tx we never saw must be answered NotHeld, got {other:?}"),
+        }
+        // The CL2 witness path persists the digest → now we HOLD it.
+        engine.storage.store_witness_digest(&txid, 9_970_000_000, &[0x53u8; 32], 1_000_000).unwrap();
+        match engine.handle_peer_audit_request(&request).await {
+            PeerAuditAnswer::Held(r) => {
+                assert_eq!((r.sender_balance, r.state_id, r.amount, r.receiver_balance), (9_970_000_000, [0x53u8; 32], 1_000_000, 0));
+                assert!(axiom_core_logic::audit::verify_peer_audit_response_sig(&r));
+            }
+            other => panic!("a witnessed tx must be answered with its raw fields, got {other:?}"),
+        }
+        // A forged request is DROPPED, never answered either way (KI#175 unchanged).
+        let mut bad = request.clone(); bad.requester_sig[0] ^= 1;
+        assert!(matches!(engine.handle_peer_audit_request(&bad).await, PeerAuditAnswer::Dropped));
+        assert_eq!(engine.peer_audit_operator_counts().1, 2,
+                   "dashboard: the NotHeld and the Held answer count; the dropped forgery does not");
+        // KI#229 — this engine holds no hint for the requester: an ANSWERED
+        // request is counted unresolved (ANTIE mails it to From:); a dropped one
+        // is not. MUTATION: never count ⇒ red.
+        assert_eq!(engine.resolve_peer_audit_reply_email(&requester_pk, true), None);
+        assert_eq!(engine.resolve_peer_audit_reply_email(&requester_pk, false), None);
+        assert_eq!(engine.peer_audit_operator_counts().2, 1,
+                   "one answered-but-hintless reply counted; the dropped one not");
+    }
+
+    /// §23.14.6 (KI#213): a NotHeld is ATTRIBUTABLE (ban) only when the responder's
+    /// own signature is on the receipt WE stored for that txid — i.e. it provably
+    /// executed the tx. Otherwise it clears the audit without a ban.
+    #[test]
+    fn not_held_is_attributable_only_with_the_responders_signature_on_our_receipt() {
+        let engine = create_test_engine();
+        let txid = [0x61u8; 32];
+        let cowitness = vec![0xC0u8; 32];
+        let stranger = vec![0xC1u8; 32];
+        let nh = |pk: &Vec<u8>| axiom_core_logic::types::PeerAuditNotHeld {
+            txid, challenge_nonce: [0x62u8; 32], responder_pk: pk.clone(), responder_sig: vec![],
+        };
+        assert!(!engine.not_held_from_proven_cowitness(&nh(&cowitness)), "no receipt stored → not attributable");
+        let sig = |pk: &Vec<u8>| axiom_core_logic::types::WitnessSig {
+            validator_id: [0u8; 32], validator_pk: pk.clone(), vbc_bundle: None,
+            carrier_type: "email".into(), carrier_address: "x@axiom".into(),
+            signature: vec![1u8; 64], execution_proof: vec![], proof_type: 1,
+            availability_attestation: None, validator_hints: vec![], fact_signature: None,
+            checkpoint_sig: None, receipt_signature: None, receipt_commitment_sig: None,
+            rate_bps: 0, slot_amount: 0,
+        };
+        engine.storage.store_receipt(&axiom_core_logic::types::Receipt {
+            oods_flag: None, confidence_index: None, sender_state: None,
+            txid, state_hash: [2u8; 32], produced_state_id: [3u8; 32], new_wallet_seq: 1,
+            commitment_hash: [0u8; 32], sdid: [0u8; 32], lineage_hash: [0u8; 32],
+            core_version: String::new(), epoch: 0, fact_proof: None, required_k: 3,
+            receipt_commitment: [0u8; 32], fee_breakdown: Vec::new(), is_dev_class: false,
+            core_id: [0u8; 32], witness_sigs: vec![sig(&cowitness)],
+        }).unwrap();
+        assert!(engine.not_held_from_proven_cowitness(&nh(&cowitness)), "its signature is on our receipt → attributable");
+        assert!(!engine.not_held_from_proven_cowitness(&nh(&stranger)), "a validator not on the receipt → not attributable");
+    }
+
     /// Create a test engine using a REAL genesis VBC.
     ///
     /// Looks for VBC in these locations (in order):
     /// 1. AXIOM_TEST_VBC env var  
-    /// 2. test-fixtures/vbc.json (relative to workspace)
-    /// 3. ~/.axiom/axiom-first-penguin-alpha/config/vbc.json
+    /// 2. test-fixtures/vbc-bundle.cbor (relative to workspace)
+    /// 3. ~/axiom/axiom-first-penguin-*/config/vbc-bundle.cbor
     ///
     /// Tests MUST use real VBCs from the genesis ceremony — no mocks.
     pub fn create_test_engine() -> ConsensusEngine {
@@ -7690,6 +9355,7 @@ pub mod tests {
         let mut execution_proof = Vec::new();
         ciborium::ser::into_writer(&att, &mut execution_proof).unwrap();
         ValidatorCheque {
+            fact_certificates: Vec::new(),
             recall_target_tx_id: None,
             txid: [0u8; 32],
             validator_id: [1u8; 32],
@@ -7776,11 +9442,11 @@ pub mod tests {
             eprintln!("[TEST] AXIOM_TEST_VBC={} not found", path);
         }
         
-        // 2. test-fixtures/vbc.json (try several relative paths)
+        // 2. test-fixtures/vbc-bundle.cbor (try several relative paths) — §6b.12: the CBOR bundle
         for candidate in &[
-            "test-fixtures/vbc.json",
-            "../test-fixtures/vbc.json",
-            "../../test-fixtures/vbc.json",
+            "test-fixtures/vbc-bundle.cbor",
+            "../test-fixtures/vbc-bundle.cbor",
+            "../../test-fixtures/vbc-bundle.cbor",
         ] {
             let p = std::path::PathBuf::from(candidate);
             if p.exists() { return p; }
@@ -7804,9 +9470,9 @@ pub mod tests {
             let axiom_dir = std::env::var("AXIOM_DATA_DIR")
                 .unwrap_or_else(|_| format!("{}/axiom", home));
             for v in &validators {
-                // Primary: ~/axiom/{validator}/config/vbc.json
+                // Primary: ~/axiom/{validator}/config/vbc-bundle.cbor
                 let installed = std::path::PathBuf::from(&axiom_dir)
-                    .join(format!("{}/config/vbc.json", v));
+                    .join(format!("{}/config/vbc-bundle.cbor", v));
                 if installed.exists() { return installed; }
             }
         }
@@ -7817,21 +9483,24 @@ pub mod tests {
              ║  TEST VBC NOT FOUND — Lambda tests need a real VBC         ║\n\
              ╠══════════════════════════════════════════════════════════════╣\n\
              ║  Options:                                                   ║\n\
-             ║  1. Set AXIOM_TEST_VBC=/path/to/vbc.json                   ║\n\
-             ║  2. Copy a genesis VBC to test-fixtures/vbc.json            ║\n\
+             ║  1. Set AXIOM_TEST_VBC=/path/to/vbc-bundle.cbor            ║\n\
+             ║  2. Copy a genesis bundle to test-fixtures/vbc-bundle.cbor  ║\n\
              ║  3. Run install_genesis.sh to install validators            ║\n\
              ╚══════════════════════════════════════════════════════════════╝"
         );
     }
     
-    fn create_test_request() -> WitnessRequest {
+    pub(crate) fn create_test_request() -> WitnessRequest {
         // Generate a valid wallet_id with proper checksum
         let receiver_wallet_id = axiom_core_logic::wallet_id::generate_wallet_id(
             "test@example.com", "45", &[0u8; 32]
         ).unwrap();
         WitnessRequest {
+            fact_certificates: Vec::new(),
             scar_consent_voucher: None,
             recall_attestation: None,
+            fob_claim_attestation: None,
+            claimant_vbc: None,
             oods_attestation: None,
             request_id: "test-123".to_string(),
             transaction: Transaction {
@@ -7847,7 +9516,6 @@ pub mod tests {
                 nonce: 1,
                 epoch: 1,
                 client_sig: vec![0u8; 64],
-                owner_proof: None,
                 scar_passcode: None,
                 burn_target_tx_id: None,
                 required_k: 0,
@@ -7862,6 +9530,10 @@ pub mod tests {
             prev_receipts: vec![],
             claimed_balance_for_sabr: 1_000_000,
             claimed_hibernation_until: 0,
+            claimed_wall_clock_lock: 0,
+            claimed_emission_claimed_epoch: 0,
+            claimed_stake_floor_until: 0,
+            claimed_wallet_format: axiom_core_logic::types::WalletFormat::CURRENT,
             requester_address: "sender@example.com".to_string(),
             offered_fee: 100,
             validator_hints: vec![],
@@ -7875,7 +9547,77 @@ pub mod tests {
             audit_response: None,
             clara_attestation: None,
             nabla_hint: None,
+            vbc_request: None,
         }
+    }
+
+    /// §5.2.2c — the state view Lambda hands Core MUST re-derive the k-signed
+    /// `prev_receipt.state_hash` of a STAKE-LOCKED wallet.
+    ///
+    /// This is the check that was missing on 2026-09-06, and its absence is
+    /// what made the release leg unreachable: both witness-path views
+    /// hardcoded `wall_clock_lock: 0`, so Core recomputed a hash the redeem's
+    /// receipt could never match and every post-release send was refused
+    /// `E_STATE_NOT_ANCHORED` — a refusal that reads like a protocol verdict
+    /// on release and is nothing of the kind.
+    ///
+    /// Drive it, don't restate it: the expected hash comes from Core's own
+    /// `compute_state_hash` over the values the claim's redeem bound, and the
+    /// actual hash is recomputed from the VIEW's fields, so nothing here can
+    /// pass by agreeing with itself. The second half is the mutation the
+    /// production code used to be: a view carrying a zeroed lock MUST NOT
+    /// match — without it this test would still pass against the bug.
+    #[test]
+    fn witness_state_view_rederives_a_stake_locked_receipt() {
+        use axiom_core_logic::compute::compute_state_hash;
+
+        const BALANCE: u64 = 5_034_850_000_000;
+        const PRIOR_SEQ: u64 = 3;
+        const HIB: u64 = 1_788_668_432;
+        const LOCK: u64 = 1_788_668_300;
+
+        let mut req = create_test_request();
+        req.transaction.client_pk = vec![7u8; 32];
+        req.transaction.wallet_seq = PRIOR_SEQ + 1;
+        req.claimed_balance_for_sabr = BALANCE;
+        req.claimed_hibernation_until = HIB;
+        req.claimed_wall_clock_lock = LOCK;
+
+        // What the claim redeem's k-signed receipt actually bound (Core CL5
+        // stamps both deadlines into `new_state_hash`).
+        let k_signed = compute_state_hash(
+            &req.transaction.client_pk, BALANCE, PRIOR_SEQ, HIB, LOCK,
+        0, 0, &axiom_core_logic::types::WalletFormat::CURRENT,
+    );
+
+        let view = witness_anchor_state_view(
+            &req, BALANCE, PRIOR_SEQ, [3u8; 32], None, None, None,
+        );
+        let rederived = compute_state_hash(
+            &view.public_key, view.balance, view.wallet_seq,
+            view.hibernation_until, view.wall_clock_lock,
+        0, 0, &axiom_core_logic::types::WalletFormat::CURRENT,
+    );
+        assert_eq!(
+            rederived, k_signed,
+            "the CL2/CL3 state view does not re-derive the k-signed receipt of a \
+             stake-locked wallet — Core's verify_state_anchored will reject every \
+             send this wallet makes, release or not (§5.2.2c / CLAUDE.md §15)",
+        );
+
+        // The mutation, pinned: the ONE field that was wrong must be the one
+        // that decides. If this ever matches, the hash stopped binding the lock
+        // and the assertion above became decoration.
+        let shed_lock = compute_state_hash(
+            &view.public_key, view.balance, view.wallet_seq,
+            view.hibernation_until, 0,
+        0, 0, &axiom_core_logic::types::WalletFormat::CURRENT,
+    );
+        assert_ne!(
+            shed_lock, k_signed,
+            "a zeroed wall_clock_lock re-derived the SAME hash — the anchor no \
+             longer binds the stake lock, so a holder could declare it away",
+        );
     }
 
     // ── Phase 1 multi-carrier discovery (YP §27.5.2, 2026-05-14) ───────
@@ -7962,6 +9704,35 @@ pub mod tests {
         assert_eq!(txid, txid2);
     }
 
+    /// Fork Settlement R4 (2026-09-28): the YPX-016 witness-cache value carries
+    /// the `required_k` Core CL3 signed with, so a cache hit verifies the
+    /// fact_signature under THAT k. Round-trips exactly; a value in the prior
+    /// shape (a bare `WitnessResponse`) does NOT decode — a MISS, never a hit
+    /// verified under a guessed k.
+    #[test]
+    fn witness_cache_entry_carries_required_k_and_refuses_prior_shape() {
+        let resp = WitnessResponse {
+            sender_state: None, request_id: "rk".into(), success: true,
+            witness_signature: None, overlapped_signatures: vec![], rejection: None,
+            cheque_for_receiver: None, receipt: None, produced_state_id: None,
+            commitment_hash: None, state_hash: None, receipt_commitment: None,
+            txid: vec![], validator_hints: vec![], sender_fact_chain: None,
+            audit_demand: None, audit_request: None, nonce_challenge: None,
+            pulse_proof: None, audit_failed: false, outbound_peer_audit: None,
+            confidence_index: None, scar_consent_for_receiver: None,
+            scar_consent_voucher: None, vbc_signature: None,
+        };
+        let bytes = WitnessCacheEntry::encode(5, &resp).expect("encode");
+        let back = WitnessCacheEntry::decode(&bytes).expect("decode");
+        assert_eq!(back.required_k, 5);
+        assert_eq!(back.response.request_id, "rk");
+
+        let mut prior_shape = Vec::new();
+        ciborium::ser::into_writer(&resp, &mut prior_shape).unwrap();
+        assert!(WitnessCacheEntry::decode(&prior_shape).is_none(),
+            "a bare WitnessResponse (no k) must be a cache MISS");
+    }
+
     /// Mac handoff 2026-06-05 — same request_id must replay the prior
     /// response verbatim (same cheque, same signature, same created_at),
     /// not run a fresh CL2/CL3 and emit a distinct cheque.
@@ -7974,6 +9745,7 @@ pub mod tests {
         // `process_witness_request` would require a full witness round.
         let stamp = "req-mac-handoff-2026-06-05".to_string();
         let resp = WitnessResponse {
+            sender_state: None,
             request_id: stamp.clone(),
             success: true,
             witness_signature: None,
@@ -7997,14 +9769,12 @@ pub mod tests {
             confidence_index: None,
             scar_consent_for_receiver: None,
             scar_consent_voucher: None,
+            vbc_signature: None,
         };
 
         // First time through: cache miss; subsequent lookup hits.
         engine.remember_witness_response(&resp);
-        let hit = {
-            let cache = engine.witness_idempotency_cache.lock();
-            cache.iter().find(|(k, _)| k == &stamp).map(|(_, r)| r.clone())
-        };
+        let hit = engine.lookup_witness_response(&stamp);
         assert!(hit.is_some(), "cache must replay request_id={}", stamp);
         assert_eq!(hit.unwrap().request_id, stamp);
 
@@ -8013,10 +9783,8 @@ pub mod tests {
         let mut empty = resp.clone();
         empty.request_id = String::new();
         engine.remember_witness_response(&empty);
-        let empty_hit = {
-            let cache = engine.witness_idempotency_cache.lock();
-            cache.iter().any(|(k, _)| k.is_empty())
-        };
+        let empty_hit = engine.witness_idempotency_cache.lock().len() != 1
+            || engine.lookup_witness_response("").is_some();
         assert!(!empty_hit, "empty request_id must not be stored");
     }
 
@@ -8046,10 +9814,7 @@ pub mod tests {
 
         // Store the first response; a later duplicate lookup must hit + replay it.
         engine.remember_redeem_response(&resp);
-        let hit = {
-            let cache = engine.redeem_idempotency_cache.lock();
-            cache.iter().find(|(k, _)| k == &stamp).map(|(_, r)| r.clone())
-        };
+        let hit = engine.lookup_redeem_response(&stamp);
         assert!(hit.is_some(), "redeem cache must replay request_id={}", stamp);
         let hit = hit.unwrap();
         assert_eq!(hit.request_id, stamp);
@@ -8060,11 +9825,370 @@ pub mod tests {
         let mut empty = resp.clone();
         empty.request_id = String::new();
         engine.remember_redeem_response(&empty);
-        let empty_hit = {
-            let cache = engine.redeem_idempotency_cache.lock();
-            cache.iter().any(|(k, _)| k.is_empty())
-        };
+        let empty_hit = engine.redeem_idempotency_cache.lock().len() != 1
+            || engine.lookup_redeem_response("").is_some();
         assert!(!empty_hit, "empty request_id must not be stored");
+    }
+
+    // ── KI#89 (2026-10-02) — the idempotency caches are bounded by BYTES ─────
+    // Fable review `fable_ki89_review.md` §4. The fixtures below are REAL-SIZE
+    // (measured fleet entries are 450–870 KB): a toy entry cannot pass the byte
+    // assertions, which is why tests #1/#5 failed on the count-only code.
+
+    /// The per-cache byte budget the tests hold the caches to — the register.
+    const KI89_TEST_BUDGET: usize = 67_108_864;
+
+    fn cbor_len<T: serde::Serialize>(v: &T) -> usize {
+        let mut out = Vec::new();
+        ciborium::ser::into_writer(v, &mut out).expect("cbor encode");
+        out.len()
+    }
+
+    fn cbor_bytes<T: serde::Serialize>(v: &T) -> Vec<u8> {
+        let mut out = Vec::new();
+        ciborium::ser::into_writer(v, &mut out).expect("cbor encode");
+        out
+    }
+
+    /// An 8-link FACT chain with 3 Dilithium3-sized witnesses per link
+    /// (1952-byte pk, 3309-byte sig) — the heavy half of a real response.
+    fn ki89_real_size_chain(seed: u8) -> axiom_core_logic::types::FactChain {
+        let links = (0..8u8).map(|i| {
+            let mut l = scar_test_link(3, false);
+            l.tx_id = [seed ^ i; 32];
+            l.witnesses = (0..3u8).map(|w| axiom_core_logic::types::FactWitness {
+                validator_id: [w; 32],
+                validator_pk: (0..1952usize).map(|b| (b as u8).wrapping_mul(31).wrapping_add(w ^ i)).collect(),
+                signature: (0..3309usize).map(|b| (b as u8).wrapping_mul(17).wrapping_add(seed ^ w)).collect(),
+                vbc_hash: [i; 32],
+            }).collect();
+            l
+        }).collect();
+        scar_test_chain(links)
+    }
+
+    fn ki89_witness_sig(engine: &ConsensusEngine) -> axiom_core_logic::types::WitnessSig {
+        axiom_core_logic::types::WitnessSig {
+            validator_id: [9u8; 32], validator_pk: vec![0x5Au8; 32],
+            vbc_bundle: engine.vbc_for_signature(),
+            carrier_type: "email".into(), carrier_address: "alpha@axiom".into(),
+            signature: vec![0x77u8; 64], execution_proof: vec![0x33u8; 512], proof_type: 1,
+            availability_attestation: None, validator_hints: vec![], fact_signature: Some(vec![0x44u8; 3309]),
+            checkpoint_sig: None, receipt_signature: None, receipt_commitment_sig: None,
+            rate_bps: 0, slot_amount: 0,
+        }
+    }
+
+    /// The final-witness shape: cheque with 7 certificate bundles + the chain,
+    /// the SAME chain cloned into the response (`sender_fact_chain`), receipt.
+    fn ki89_real_size_witness_response(engine: &ConsensusEngine, req_id: &str) -> WitnessResponse {
+        let chain = ki89_real_size_chain(0x5C);
+        let mut cheque = mk_dmap_cheque([0xA5; 32], 0x07);
+        cheque.fact_certificates = vec![engine.vbc_bundle(); 7];
+        cheque.vbc_bundle = engine.vbc_for_signature();
+        cheque.sender_fact_chain = Some(chain.clone());
+        let resp = WitnessResponse {
+            sender_state: None,
+            request_id: req_id.to_string(),
+            success: true,
+            witness_signature: Some(ki89_witness_sig(engine)),
+            overlapped_signatures: vec![],
+            rejection: None,
+            cheque_for_receiver: Some(cheque),
+            receipt: Some(axiom_core_logic::types::Receipt {
+                oods_flag: None, confidence_index: None, sender_state: None,
+                txid: [1u8; 32], state_hash: [2u8; 32], produced_state_id: [3u8; 32], new_wallet_seq: 1,
+                commitment_hash: [4u8; 32], sdid: [0u8; 32], lineage_hash: [0u8; 32],
+                core_version: "test".into(), epoch: 0, fact_proof: None, required_k: 3,
+                receipt_commitment: [5u8; 32], fee_breakdown: Vec::new(), is_dev_class: false,
+                core_id: [6u8; 32], witness_sigs: vec![ki89_witness_sig(engine); 3],
+            }),
+            produced_state_id: Some(vec![3u8; 32]),
+            commitment_hash: Some(vec![4u8; 32]),
+            state_hash: Some(vec![2u8; 32]),
+            receipt_commitment: Some(vec![5u8; 32]),
+            txid: vec![1u8; 32],
+            validator_hints: vec![],
+            sender_fact_chain: Some(chain),
+            audit_demand: None,
+            audit_request: None,
+            nonce_challenge: None,
+            pulse_proof: None,
+            audit_failed: false,
+            outbound_peer_audit: None,
+            confidence_index: None,
+            scar_consent_for_receiver: None,
+            scar_consent_voucher: None,
+            vbc_signature: None,
+        };
+        let size = cbor_len(&resp);
+        assert!(size >= 300_000, "real-size witness fixture must be >= 300 KB, got {size}");
+        resp
+    }
+
+    /// The finalizer's redeem reply: the heavy `receiver_fact_chain` (>= 150 KB).
+    fn ki89_real_size_redeem_response(engine: &ConsensusEngine, req_id: &str) -> RedeemResponse {
+        let resp = RedeemResponse {
+            request_id: req_id.to_string(),
+            success: true,
+            new_balance: Some(42),
+            new_state_id: Some([7u8; 32]),
+            witness_signature: Some(ki89_witness_sig(engine)),
+            commitment_hash: Some(vec![4u8; 32]),
+            state_hash: Some(vec![2u8; 32]),
+            receipt_commitment: Some(vec![5u8; 32]),
+            error_response: None,
+            validator_hints: vec![],
+            fact_signature: Some(vec![0x44u8; 3309]),
+            receiver_fact_chain: Some(ki89_real_size_chain(0x3E)),
+        };
+        let size = cbor_len(&resp);
+        assert!(size >= 150_000, "real-size redeem fixture must be >= 150 KB, got {size}");
+        resp
+    }
+
+    /// How many real-size entries overflow the budget by >= 25% (and >= 160).
+    fn ki89_overflow_count(entry_size: usize) -> usize {
+        std::cmp::max(160, (KI89_TEST_BUDGET + KI89_TEST_BUDGET / 4) / entry_size + 1)
+    }
+
+    /// KI#89 test 1 — the witness cache's byte footprint stays <= the budget
+    /// with real-size entries; newest hits, oldest was evicted.
+    #[test]
+    fn witness_idempotency_cache_is_byte_bounded_with_real_size_entries() {
+        let engine = create_test_engine();
+        let base = ki89_real_size_witness_response(&engine, "ki89-w-0");
+        let n = ki89_overflow_count(cbor_len(&base));
+        assert!(n < WITNESS_IDEMPOTENCY_CACHE_CAP, "the BYTE term, not the count cap, must be what evicts");
+        for i in 0..n {
+            let mut r = base.clone();
+            r.request_id = format!("ki89-w-{i}");
+            engine.remember_witness_response(&r);
+        }
+        let total = ki89_witness_cache_bytes(&engine);
+        assert!(total <= KI89_TEST_BUDGET,
+            "witness idempotency cache holds {total} bytes > budget {KI89_TEST_BUDGET} after {n} real-size entries");
+        assert!(ki89_witness_hit(&engine, &format!("ki89-w-{}", n - 1)), "newest entry must hit");
+        assert!(!ki89_witness_hit(&engine, "ki89-w-0"), "oldest entry must have been evicted");
+    }
+
+    /// KI#89 test 5 — redeem mirror of test 1.
+    #[test]
+    fn redeem_idempotency_cache_is_byte_bounded_with_real_size_entries() {
+        let engine = create_test_engine();
+        let base = ki89_real_size_redeem_response(&engine, "ki89-r-0");
+        let n = ki89_overflow_count(cbor_len(&base));
+        assert!(n < WITNESS_IDEMPOTENCY_CACHE_CAP, "the BYTE term, not the count cap, must be what evicts");
+        for i in 0..n {
+            let mut r = base.clone();
+            r.request_id = format!("ki89-r-{i}");
+            engine.remember_redeem_response(&r);
+        }
+        let total = ki89_redeem_cache_bytes(&engine);
+        assert!(total <= KI89_TEST_BUDGET,
+            "redeem idempotency cache holds {total} bytes > budget {KI89_TEST_BUDGET} after {n} real-size entries");
+        assert!(ki89_redeem_hit(&engine, &format!("ki89-r-{}", n - 1)), "newest entry must hit");
+        assert!(!ki89_redeem_hit(&engine, "ki89-r-0"), "oldest entry must have been evicted");
+    }
+
+    // Probes over the fixed cache: the byte total IS `IdemCache::bytes`, and a
+    // hit goes through the ONE reader the gates use.
+    fn ki89_witness_cache_bytes(engine: &ConsensusEngine) -> usize {
+        let c = engine.witness_idempotency_cache.lock();
+        assert_eq!(c.budget, IDEMPOTENCY_CACHE_BYTES, "the engine cache must carry the register");
+        assert_eq!(c.bytes, c.q.iter().map(|e| e.key.len() + e.bytes.len()).sum::<usize>());
+        c.bytes
+    }
+    fn ki89_redeem_cache_bytes(engine: &ConsensusEngine) -> usize {
+        let c = engine.redeem_idempotency_cache.lock();
+        assert_eq!(c.budget, IDEMPOTENCY_CACHE_BYTES, "the engine cache must carry the register");
+        assert_eq!(c.bytes, c.q.iter().map(|e| e.key.len() + e.bytes.len()).sum::<usize>());
+        c.bytes
+    }
+    fn ki89_witness_hit(engine: &ConsensusEngine, id: &str) -> bool {
+        engine.lookup_witness_response(id).is_some()
+    }
+    fn ki89_redeem_hit(engine: &ConsensusEngine, id: &str) -> bool {
+        engine.lookup_redeem_response(id).is_some()
+    }
+
+    /// KI#89 test 2 — a replay is VERBATIM (CBOR byte equality) across the three
+    /// response shapes: (a) final — chain in the cheque AND at top level (the
+    /// duplicate is stripped at store, re-attached at replay); (b) partial —
+    /// cheque carries a chain, `sender_fact_chain: None`; (c) no cheque, a
+    /// top-level chain (heal / protocol-tx shapes). Mutations: skip the
+    /// re-attachment, or strip without setting `chain_dup` → (a) red.
+    #[test]
+    fn witness_idempotency_replay_is_verbatim_after_compaction() {
+        let engine = create_test_engine();
+        let full = ki89_real_size_witness_response(&engine, "ki89-verbatim-a");
+
+        let mut partial = full.clone();
+        partial.request_id = "ki89-verbatim-b".into();
+        partial.sender_fact_chain = None;
+        partial.receipt = None;
+
+        let mut no_cheque = full.clone();
+        no_cheque.request_id = "ki89-verbatim-c".into();
+        no_cheque.cheque_for_receiver = None;
+
+        for original in [&full, &partial, &no_cheque] {
+            engine.remember_witness_response(original);
+            let replay = engine.lookup_witness_response(&original.request_id)
+                .unwrap_or_else(|| panic!("{} must hit", original.request_id));
+            assert!(cbor_bytes(&replay) == cbor_bytes(original),
+                "replay of {} must be byte-identical to the original response", original.request_id);
+        }
+        // The compaction actually happened for shape (a): the stored value is
+        // smaller than the response by at least one chain.
+        let stored = engine.witness_idempotency_cache.lock().get("ki89-verbatim-a").unwrap().len();
+        let chain = cbor_len(full.sender_fact_chain.as_ref().unwrap());
+        assert!(stored + chain <= cbor_len(&full) + 64,
+            "the duplicated chain ({chain} B) must be stripped: stored {stored} B vs response {} B", cbor_len(&full));
+    }
+
+    /// For admin.rs's `/stats` test: cache one small redeem response.
+    pub(crate) fn ki89_remember_small_redeem(engine: &ConsensusEngine, id: &str) {
+        engine.remember_redeem_response(&RedeemResponse {
+            request_id: id.to_string(), success: false, new_balance: None, new_state_id: None,
+            witness_signature: None, commitment_hash: None, state_hash: None,
+            receipt_commitment: None, error_response: None, validator_hints: vec![],
+            fact_signature: None, receiver_fact_chain: None,
+        });
+    }
+
+    fn ki89_small(i: usize) -> Arc<[u8]> {
+        vec![(i % 251) as u8; 100].into()
+    }
+
+    /// KI#89 test 3 — count cap holds (1025 → 1024, first gone); a big entry pops
+    /// EXACTLY the oldest entries until it fits; `bytes` == Σ costs of what is
+    /// left. Mutations: drop the count term → len 1025; drop `bytes -= cost` →
+    /// the exact-sum assertion; drop the byte term → the big-entry assertions.
+    #[test]
+    fn idempotency_eviction_is_oldest_first_and_count_capped() {
+        let budget = 1024 * 200;
+        let mut c = IdemCache::new(WITNESS_IDEMPOTENCY_CACHE_CAP, budget);
+        for i in 0..=WITNESS_IDEMPOTENCY_CACHE_CAP {
+            c.insert(format!("id-{i:05}"), ki89_small(i));
+        }
+        assert_eq!(c.len(), WITNESS_IDEMPOTENCY_CACHE_CAP, "count cap");
+        assert!(c.get("id-00000").is_none(), "the first id is evicted first");
+        assert!(c.get("id-00001").is_some());
+        let per = "id-00000".len() + 100;
+        assert_eq!(c.bytes(), WITNESS_IDEMPOTENCY_CACHE_CAP * per);
+
+        // Headroom is budget - 1024*108; an entry 10 entries' worth larger than
+        // the headroom must pop exactly the 11 oldest (one for the count cap's
+        // slot is already part of the arithmetic: len < cap after any pop).
+        let headroom = budget - c.bytes();
+        let big_len = headroom + 10 * per - "big".len();
+        c.insert("big".into(), vec![0xEE; big_len].into());
+        let popped = WITNESS_IDEMPOTENCY_CACHE_CAP + 1 - c.len();
+        assert_eq!(popped, 10, "exactly the oldest entries that make room are popped");
+        assert!(c.get("id-00010").is_none() && c.get("id-00011").is_some(), "oldest-first");
+        assert!(c.get("big").is_some());
+        assert!(c.bytes() <= budget);
+        assert_eq!(c.bytes(), c.q.iter().map(|e| e.key.len() + e.bytes.len()).sum::<usize>(),
+            "bytes must equal the sum of the costs actually held");
+        assert_eq!(c.bytes(), budget, "the big entry was sized to fill the budget exactly");
+    }
+
+    /// KI#89 test 4 — an entry larger than the whole budget is cached ALONE,
+    /// never refused (a refusal would turn a big final reply into a guaranteed
+    /// miss on the very retry the cache exists for).
+    #[test]
+    fn oversize_entry_is_cached_alone_not_refused() {
+        let mut c = IdemCache::new(WITNESS_IDEMPOTENCY_CACHE_CAP, 1000);
+        c.insert("a".into(), ki89_small(1));
+        c.insert("b".into(), ki89_small(2));
+        c.insert("huge".into(), vec![1u8; 5000].into());
+        assert_eq!(c.len(), 1);
+        assert_eq!(c.get("huge").map(|b| b.len()), Some(5000));
+        assert_eq!(c.bytes(), 5004);
+        // ...and the next normal entry evicts it.
+        c.insert("c".into(), ki89_small(3));
+        assert_eq!(c.len(), 1);
+        assert!(c.get("c").is_some());
+        assert_eq!(c.bytes(), 101);
+    }
+
+    /// KI#55 (2026-10-02) — the Lambda SIGNER of a Console Fan-Out and Core's
+    /// CL10 VERIFIER agree end to end: `build_console_fanout`'s message runs
+    /// through the real `execute_core` CL10 → Accept. Core's verifier bytes are
+    /// pinned to the YP layout by `modes::tests::kat_cl10_accepts_python_fanout_constants`,
+    /// so this test pins the signer transitively (green on the pre-consolidation
+    /// inline signer; kept after). Mutation: swap ttl_original/fanout in the
+    /// signer's call to the builder → Reject (FanOutInvalidSignature).
+    #[test]
+    fn console_fanout_signer_is_accepted_by_core_cl10() {
+        let engine = create_test_engine();
+        let msg = engine.build_console_fanout("ki55-proposal", "Approved", 2);
+        let mut bundle = engine.vbc_bundle();
+        bundle.target_vbc.subject_pubkey_ed25519 = engine.public_key.to_bytes().to_vec();
+        let inputs = axiom_core_logic::PublicInputs {
+            zkq_request: None,
+            fact_certificates: Vec::new(),
+            receiver_current_wall_clock_lock: None,
+            receiver_current_emission_claimed_epoch: None,
+            receiver_current_stake_floor_until: None,
+            receiver_current_wallet_format: None,
+            fob_claim_attestation: None,
+            claimant_vbc: None,
+            receiver_witness: None,
+            receiver_signing_key: None,
+            recall_attestation: None,
+            mode: axiom_core_logic::CoreLogicMode::CL10,
+            oods_attestation: None,
+            local_core_id: [0u8; 32],
+            receiver_current_hibernation: None,
+            // CL10 doesn't use the transaction; pass an explicit default rather
+            // than parsing a JSON string literal at runtime (no JSON on the
+            // protocol path — see AXIOM_GUIDE_Contributor.md Q5).
+            transaction: axiom_core_logic::types::Transaction { epoch: msg.timestamp, ..Default::default() },
+            prev_receipts: vec![],
+            current_state: None,
+            vbc_bundle: Some(bundle),
+            my_validator_pk: None,
+            overlapped_signatures: vec![],
+            cheque_bundle: None,
+            receiver_pk: None,
+            receiver_current_balance: None,
+            receiver_wallet_seq: None,
+            receiver_new_balance: None,
+            receiver_new_state_id: None,
+            group_member_index: None,
+            sender_fact_chain: None,
+            max_fact_links: None,
+            receiver_fact_chain: None,
+            my_dilithium_sk: None,
+            my_dilithium_pk: None,
+            my_validator_id: None,
+            fact_witness_sigs: vec![],
+            issuer_sphincs_sk: None,
+            cl1_execution_proof: None,
+            zkp_nonce: None,
+            audit_confirmation: None,
+            nonce_response: None,
+            audit_response: None,
+            wallet_secret: None,
+            fanout_message: Some(msg.clone()),
+            nabla_stake_proof: None,
+            frozen_wallets: None,
+            console_current_cert: None,
+            console_new_cert: None,
+            console_selector_picks: None,
+            console_nominations: None, txid_attestation: None,
+            cheque_claim_proof: None,
+            clara_attestation: None,
+            phase_out_payload: None,
+            phase_out_era_end_ticks: vec![],
+            phase_out_blocked_era_ids: vec![],
+            current_tick: 0,
+        };
+        let out = axiom_core_logic::execute_core(inputs);
+        assert_eq!(out.result, axiom_core_logic::ValidationResult::Accept, "{:?}", out.rejection_reason);
+        assert_eq!(out.fanout_new_ttl, Some(msg.ttl_current - 1));
     }
 
     #[test]
@@ -8072,18 +10196,10 @@ pub mod tests {
         let engine = create_test_engine();
         let request = create_test_request();
         
-        // Compute commitment_hash as Core would (sign_witness requires it — "can crash, must not lie")
-        let tx = &request.transaction;
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"AXIOM_WITNESS_V2");
-        hasher.update(&tx.consumed_state_id);
-        hasher.update(&tx.client_pk);
-        hasher.update(&tx.wallet_seq.to_le_bytes());
-        hasher.update(tx.receiver_wallet_id.as_bytes());
-        hasher.update(&tx.amount.to_le_bytes());
-        hasher.update(&tx.nonce.to_le_bytes());
-        let commitment: [u8; 32] = *hasher.finalize().as_bytes();
-        
+        // The commitment sign_witness requires — from THE builder (KI#55, RULE 1:
+        // a test that re-derives the value it protects cannot fail when it changes).
+        let commitment = axiom_core_logic::validation::compute_commitment_hash(&request.transaction);
+
         let sig = engine.sign_witness(&request.transaction, Some(&commitment)).unwrap();
         
         assert!(!sig.validator_pk.is_empty());
@@ -8112,7 +10228,7 @@ pub mod tests {
             last_tx_id: None,
             status: WalletStateStatus::Confirmed,
             group_members: None,
-            auth_hash: None, hibernation_until: 0,
+            auth_hash: None, hibernation_until: 0, wall_clock_lock: 0, emission_claimed_epoch: 0, stake_floor_until: 0, wallet_format: axiom_core_logic::types::WalletFormat::CURRENT,
             wallet_id: None,
         };
 
@@ -8136,17 +10252,8 @@ pub mod tests {
         );
         request.produced_state_id = Some(produced_state_id.to_vec());
         
-        // Compute commitment_hash (as Core CL2 would — sign_witness requires it)
-        let tx = &request.transaction;
-        let mut ch_hasher = blake3::Hasher::new();
-        ch_hasher.update(b"AXIOM_WITNESS_V2");
-        ch_hasher.update(&tx.consumed_state_id);
-        ch_hasher.update(&tx.client_pk);
-        ch_hasher.update(&tx.wallet_seq.to_le_bytes());
-        ch_hasher.update(tx.receiver_wallet_id.as_bytes());
-        ch_hasher.update(&tx.amount.to_le_bytes());
-        ch_hasher.update(&tx.nonce.to_le_bytes());
-        let commitment_hash: [u8; 32] = *ch_hasher.finalize().as_bytes();
+        // The commitment CL2 would compute — from THE builder (KI#55, RULE 1).
+        let commitment_hash = axiom_core_logic::validation::compute_commitment_hash(&request.transaction);
         request.commitment_hash = Some(commitment_hash.to_vec());
         
         let result = engine.process_witness_request(request).await;
@@ -8174,16 +10281,6 @@ pub mod tests {
     // ========================================================================
     
     #[test]
-    fn test_required_overlap() {
-        // k=3 requires 2 overlap
-        assert_eq!(ConsensusEngine::required_overlap(3), 2);
-        // k=4 requires 3 overlap
-        assert_eq!(ConsensusEngine::required_overlap(4), 3);
-        // k=5 requires 3 overlap
-        assert_eq!(ConsensusEngine::required_overlap(5), 3);
-    }
-    
-    #[test]
     fn test_sabr_overlapped_validator_balance_match() {
         let engine = create_test_engine();
         
@@ -8205,7 +10302,7 @@ pub mod tests {
             last_tx_id: None,
             status: WalletStateStatus::Confirmed,
             group_members: None,
-            auth_hash: None, hibernation_until: 0,
+            auth_hash: None, hibernation_until: 0, wall_clock_lock: 0, emission_claimed_epoch: 0, stake_floor_until: 0, wallet_format: axiom_core_logic::types::WalletFormat::CURRENT,
             wallet_id: None,
         };
         engine.storage.set_genesis_state(&pk_array, 3, 1, &wallet_state).unwrap();
@@ -8240,7 +10337,7 @@ pub mod tests {
             state_id,
             last_tx_id: None, status: WalletStateStatus::Confirmed,
             group_members: None,
-            auth_hash: None, hibernation_until: 0,
+            auth_hash: None, hibernation_until: 0, wall_clock_lock: 0, emission_claimed_epoch: 0, stake_floor_until: 0, wallet_format: axiom_core_logic::types::WalletFormat::CURRENT,
             wallet_id: None,
         };
         engine.storage.set_wallet_state(&wallet_state, 3, 1).unwrap();
@@ -8274,18 +10371,9 @@ pub mod tests {
         let engine = create_test_engine();
         let request = create_test_request();
         
-        // Compute commitment_hash as Core would
-        let tx = &request.transaction;
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"AXIOM_WITNESS_V2");
-        hasher.update(&tx.consumed_state_id);
-        hasher.update(&tx.client_pk);
-        hasher.update(&tx.wallet_seq.to_le_bytes());
-        hasher.update(tx.receiver_wallet_id.as_bytes());
-        hasher.update(&tx.amount.to_le_bytes());
-        hasher.update(&tx.nonce.to_le_bytes());
-        let commitment: [u8; 32] = *hasher.finalize().as_bytes();
-        
+        // The commitment — from THE builder (KI#55, RULE 1).
+        let commitment = axiom_core_logic::validation::compute_commitment_hash(&request.transaction);
+
         let witness_sig = engine.sign_witness(&request.transaction, Some(&commitment)).unwrap();
         let txid = engine.compute_txid(&request.transaction);
         let state_hash = [0x11; 32];
@@ -8322,6 +10410,7 @@ pub mod tests {
         let epoch = 1u64;
         
         let cheque1 = ValidatorCheque {
+            fact_certificates: Vec::new(),
             recall_target_tx_id: None,
             txid,
             validator_id: [1u8; 32],
@@ -8351,6 +10440,7 @@ pub mod tests {
         };
 
         let cheque2 = ValidatorCheque {
+            fact_certificates: Vec::new(),
             recall_target_tx_id: None,
             txid,
             validator_id: [2u8; 32],
@@ -8380,6 +10470,7 @@ pub mod tests {
         };
 
         let cheque3 = ValidatorCheque {
+            fact_certificates: Vec::new(),
             recall_target_tx_id: None,
             txid,
             validator_id: [3u8; 32],
@@ -8427,6 +10518,7 @@ pub mod tests {
         let receiver = "bob@example.com/12345678".to_string();
         
         let cheque1 = ValidatorCheque {
+            fact_certificates: Vec::new(),
             recall_target_tx_id: None,
             txid,
             validator_id: [1u8; 32],
@@ -8456,6 +10548,7 @@ pub mod tests {
         };
 
         let cheque2 = ValidatorCheque {
+            fact_certificates: Vec::new(),
             recall_target_tx_id: None,
             txid,
             validator_id: [2u8; 32],
@@ -8501,6 +10594,7 @@ pub mod tests {
         
         // Same validator_pk for all three cheques - SHOULD BE REJECTED
         let cheque1 = ValidatorCheque {
+            fact_certificates: Vec::new(),
             recall_target_tx_id: None,
             txid,
             validator_id: [1u8; 32],
@@ -8530,6 +10624,7 @@ pub mod tests {
         };
 
         let cheque2 = ValidatorCheque {
+            fact_certificates: Vec::new(),
             recall_target_tx_id: None,
             txid,
             validator_id: [1u8; 32],
@@ -8559,6 +10654,7 @@ pub mod tests {
         };
 
         let cheque3 = ValidatorCheque {
+            fact_certificates: Vec::new(),
             recall_target_tx_id: None,
             txid,
             validator_id: [1u8; 32],
@@ -8611,198 +10707,6 @@ pub mod tests {
     }
 
     #[test]
-    fn test_scar_heal_commitment_sign_verify() {
-        // Test that sign_scar_heal_commitment produces a signature
-        // that verify_scar_recovery_proof accepts.
-        use axiom_core_logic::types::{FactWitness, ScarRecoveryProof, NablaConfirmation};
-
-        let original_tx_id = [0x42u8; 32];
-        let nabla_node_id = [0x11u8; 32];
-        let root_hash = [0x22u8; 32];
-        let receiver_wallet_id = "receiver@test.local/abc12300".to_string();
-
-        let nabla_confirmation = NablaConfirmation {
-            nabla_node_id,
-            nabla_signature: vec![0u8; 64],  // Not verified in heal proof
-            root_hash,
-            synced_to_tick: 100,
-            ..Default::default()
-        };
-
-        // Generate 3 Dilithium key pairs and sign
-        use fips204::ml_dsa_65;
-        use fips204::traits::SerDes;
-        let mut rng = rand::rngs::OsRng;
-
-        let mut witnesses = Vec::new();
-        for i in 0u8..3 {
-            let (pk, sk) = ml_dsa_65::try_keygen_with_rng(&mut rng).expect("keygen");
-            let pk_bytes = pk.into_bytes().to_vec();
-            let sk_bytes = sk.into_bytes().to_vec();
-
-            let signature = axiom_core_logic::compute::sign_scar_heal_commitment(
-                &sk_bytes,
-                &original_tx_id,
-                &nabla_node_id,
-                &root_hash,
-            ).expect("sign should succeed");
-
-            let validator_id = {
-                let mut id = [0u8; 32];
-                id[0] = i;
-                id
-            };
-
-            witnesses.push(FactWitness {
-                validator_id,
-                validator_pk: pk_bytes,
-                signature,
-                vbc_genesis_anchor: None,
-            });
-        }
-
-        let proof = ScarRecoveryProof {
-            original_tx_id,
-            nabla_confirmation,
-            healing_witnesses: witnesses,
-            receiver_wallet_id,
-            fact_link_index: None,
-        };
-
-        // Verify succeeds
-        let result = axiom_core_logic::fact::verify_scar_recovery_proof(&proof);
-        assert!(result.is_ok(), "Valid scar recovery proof should verify: {:?}", result.err());
-    }
-
-    #[test]
-    fn test_scar_heal_proof_bad_signature_rejected() {
-        use axiom_core_logic::types::{FactWitness, ScarRecoveryProof, NablaConfirmation};
-
-        let original_tx_id = [0x42u8; 32];
-        let nabla_node_id = [0x11u8; 32];
-        let root_hash = [0x22u8; 32];
-
-        let nabla_confirmation = NablaConfirmation {
-            nabla_node_id,
-            nabla_signature: vec![0u8; 64],
-            root_hash,
-            synced_to_tick: 100,
-            ..Default::default()
-        };
-
-        use fips204::ml_dsa_65;
-        use fips204::traits::SerDes;
-        let mut rng = rand::rngs::OsRng;
-
-        let mut witnesses = Vec::new();
-        for i in 0u8..3 {
-            let (pk, _sk) = ml_dsa_65::try_keygen_with_rng(&mut rng).expect("keygen");
-            let pk_bytes = pk.into_bytes().to_vec();
-
-            // Use garbage signature
-            let validator_id = { let mut id = [0u8; 32]; id[0] = i; id };
-            witnesses.push(FactWitness {
-                validator_id,
-                validator_pk: pk_bytes,
-                signature: vec![0xDE; 3309],  // Wrong signature
-                vbc_genesis_anchor: None,
-            });
-        }
-
-        let proof = ScarRecoveryProof {
-            original_tx_id,
-            nabla_confirmation,
-            healing_witnesses: witnesses,
-            receiver_wallet_id: "test@test.local/00000000".to_string(),
-            fact_link_index: None,
-        };
-
-        let result = axiom_core_logic::fact::verify_scar_recovery_proof(&proof);
-        assert!(result.is_err(), "Proof with bad signatures should fail");
-    }
-
-    #[test]
-    fn test_effective_k_variable() {
-        use axiom_core_logic::types::Transaction;
-        use axiom_core_logic::wallet_id::generate_wallet_id_full;
-        use axiom_core_logic::wallet_id::WALLET_IDENTITY_KEY;
-
-        let pk = [0u8; 32];
-        let wid3 = generate_wallet_id_full("test@axiom", "42", &WALLET_IDENTITY_KEY, &pk, 3, 1).unwrap();
-        let wid4 = generate_wallet_id_full("test@axiom", "42", &WALLET_IDENTITY_KEY, &pk, 4, 1).unwrap();
-        let wid5 = generate_wallet_id_full("test@axiom", "42", &WALLET_IDENTITY_KEY, &pk, 5, 1).unwrap();
-
-        let mut tx = Transaction {
-            recall_target_tx_id: None,
-            consumed_state_id: [0u8; 32],
-            client_pk: vec![0u8; 32],
-            sender_wallet_id: String::new(),
-            wallet_seq: 1,
-            receiver_wallet_id: String::new(),
-            receiver_address: None,
-            amount: 100_000,
-            reference: "test".into(),
-            nonce: 1,
-            epoch: 1,
-            client_sig: vec![0u8; 64],
-            owner_proof: None,
-            scar_passcode: None,
-            burn_target_tx_id: None,
-            required_k: 0,
-            proof_type: 0,
-            oracle_claim: None,
-            core_version: String::new(),
-            core_id: [0u8; 32],
-            kind: TxKind::Normal,
-        };
-
-        // Empty receiver_wallet_id → falls back to MIN_WITNESSES=3
-        assert_eq!(super::effective_k(&tx), 3);
-
-        // Standard tier (k=3) receiver
-        tx.receiver_wallet_id = wid3;
-        assert_eq!(super::effective_k(&tx), 3);
-
-        // Secure tier (k=4) receiver
-        tx.receiver_wallet_id = wid4;
-        assert_eq!(super::effective_k(&tx), 4);
-
-        // AAA tier (k=5) receiver
-        tx.receiver_wallet_id = wid5;
-        assert_eq!(super::effective_k(&tx), 5);
-    }
-
-    #[test]
-    fn test_required_overlap_variable_k() {
-        // YPX-007: floor(k/2)+1 — strict majority
-        assert_eq!(ConsensusEngine::required_overlap(3), 2); // 3/2=1, +1=2
-        assert_eq!(ConsensusEngine::required_overlap(4), 3); // 4/2=2, +1=3
-        assert_eq!(ConsensusEngine::required_overlap(5), 3); // 5/2=2, +1=3
-    }
-
-    #[test]
-    fn test_zkp_qualification_state() {
-        use axiom_core_logic::types::QualificationState;
-
-        // Default: not qualified
-        let qual = QualificationState::default();
-        assert!(!qual.zkp_qualified);
-        assert!(!qual.is_valid(1000));
-
-        // After qualifying
-        let qual = QualificationState {
-            zkp_qualified: true,
-            qualified_at: Some(1000),
-            qual_ttl_secs: 86_400,
-        };
-        // Valid within TTL
-        assert!(qual.is_valid(1000));
-        assert!(qual.is_valid(87_399));
-        // Expired after TTL
-        assert!(!qual.is_valid(87_400));
-    }
-
-    #[test]
     fn test_transaction_record_required_k_persisted() {
         let storage = Storage::open_test().unwrap();
 
@@ -8827,10 +10731,9 @@ pub mod tests {
         assert_eq!(loaded.proof_type, 0);
     }
 
-    // (removed) test_ypx007_zkp_tx_rejected_when_unqualified — current
-    // policy is warn-don't-reject when a non-qualified validator serves
-    // a ZKP TX (S-ABR continuity > speed): see
-    // process_witness_request line ~2400 + feedback_no_proof_mode_shortcuts.
+    // (removed) test_ypx007_zkp_tx_rejected_when_unqualified — policy is
+    // warn-don't-reject when a validator without a qualification record serves
+    // a ZKP TX (YPX-007 §9.6): `ki125_zkp_tier_served_without_qualification_record`.
 
     #[tokio::test]
     async fn test_ypx007_dmap_tx_always_accepted_by_routing() {
@@ -8861,6 +10764,82 @@ pub mod tests {
         }
         // We don't assert Ok — the TX will fail for other reasons (no VBC, bad sig).
         // The point: it passes the proof-type routing gate.
+    }
+
+    /// KI#125 / YPX-007 §9.6 — the 2026-06-03 ruling as an executable assertion:
+    /// a validator WITHOUT a qualification record still SERVES a ZKP-tier request.
+    /// The request passes the proof-type point and reaches the next mandatory gate
+    /// (the CL1 proof — this fixture carries none; a full Ok witness needs a real
+    /// client CL1 proof, which a unit engine cannot mint). Mutation (2026-10-03):
+    /// turning the "serving anyway" warn into `return Err(..)` turns this red.
+    #[tokio::test]
+    async fn ki125_zkp_tier_served_without_qualification_record() {
+        use axiom_core_logic::wallet_id::{PROOF_TYPE_ZKP, generate_wallet_id_full, WALLET_IDENTITY_KEY};
+        let engine = create_test_engine();
+        assert!(engine.zkp_qualification.lock().is_none(), "fixture: no record");
+        let mut request = create_test_request();
+        request.transaction.receiver_wallet_id =
+            generate_wallet_id_full("alice@test.com", "42", &WALLET_IDENTITY_KEY, &[0u8; 32], 3, PROOF_TYPE_ZKP).unwrap();
+        request.transaction.required_k = 3;
+        request.transaction.proof_type = PROOF_TYPE_ZKP;
+        match engine.process_witness_request(request).await {
+            Err(LambdaError::CoreValidationFailed(m)) if m.starts_with("CL1: missing execution proof") => {}
+            other => panic!("a ZKP-tier request must be served past the qualification point, got {:?}",
+                            other.map(|r| r.success)),
+        }
+    }
+
+    /// KI#125 — VSP `zkp_qualified` is DERIVED from the one record (YPX-007 §9.5),
+    /// never set independently. Mutation: read anything but the record ⇒ red.
+    #[test]
+    fn ki125_vsp_flag_is_derived_from_record() {
+        let engine = create_test_engine();
+        let att = axiom_core_logic::types::NablaOodsAttestation {
+            oods_size: 1, tick: 100, baseline_size: 0, baseline_tick: 0, nabla_node_pk: [1; 32],
+            nabla_signature: vec![2; 64], nbc_issuer_pk: vec![], nbc_signature: vec![], nbc_commitment: vec![],
+        };
+        let record = axiom_core_logic::types::ZkpQualificationRecord {
+            validator_id: engine.validator_id(), dilithium_pk: vec![3; 8], core_id: [4; 32],
+            program_digest: [5; 32], att_before: att.clone(), att_after: att, zkp_nonce_hash: [6; 32],
+            signature: vec![7; 8],
+        };
+        let r = engine.validator_status("q");
+        assert!(!r.zkp_qualified && r.zkp_qualification.is_none());
+        *engine.zkp_qualification.lock() = Some(record.clone());
+        let r = engine.validator_status("q");
+        assert!(r.zkp_qualified);
+        assert_eq!(r.zkp_qualification, Some(record));
+        *engine.zkp_qualification.lock() = None;
+        let r = engine.validator_status("q");
+        assert!(!r.zkp_qualified && r.zkp_qualification.is_none());
+    }
+
+    /// KI#125 — the startup run on a prover-less validator (every dev box today):
+    /// the ignition completes, no record, status `no prover`, and nothing errors —
+    /// whatever Nabla answers. Mutation: report a prover-less run as
+    /// `nabla unavailable (T0)` ⇒ red.
+    #[tokio::test]
+    async fn ki125_ignite_without_prover_leaves_no_record_and_never_fails() {
+        let engine = create_test_engine();
+        engine.ignite().await;
+        assert!(engine.zkp_qualification.lock().is_none());
+        assert_eq!(*engine.stats.zkp_qual_status.lock(), "no prover");
+        assert!(!engine.validator_status("q").zkp_qualified);
+    }
+
+    /// Fable review 2026-10-03 finding 1 — an ignition that never completed
+    /// (`pulse-gate` Core still blocked) EXITS; a completed one (no prover, as
+    /// here, a failed prover or a Nabla outage all complete it) keeps serving.
+    /// Mutation: `ignition_end_action` always `Serving` ⇒ red (first assert);
+    /// always `ExitRequired` ⇒ red (second + third).
+    #[tokio::test]
+    async fn ki125_blocked_ignition_requires_exit_completed_one_serves() {
+        assert_eq!(ignition_end_action(false), IgnitionEnd::ExitRequired);
+        assert_eq!(ignition_end_action(true), IgnitionEnd::Serving);
+        let engine = create_test_engine();
+        engine.ignite().await;
+        let pulse_ready = engine.core.read().await.avm().is_pulse_ready();
+        assert_eq!(ignition_end_action(pulse_ready), IgnitionEnd::Serving);
     }
 
     #[test]
@@ -9046,7 +11025,7 @@ pub mod tests {
             last_tx_id: None,
             status: WalletStateStatus::Confirmed,
             group_members: None,
-            auth_hash: None, hibernation_until: 0,
+            auth_hash: None, hibernation_until: 0, wall_clock_lock: 0, emission_claimed_epoch: 0, stake_floor_until: 0, wallet_format: axiom_core_logic::types::WalletFormat::CURRENT,
             wallet_id: None,
         };
         engine.storage.set_genesis_state(&pk_a_arr, 3, 1, &wallet_state_a).unwrap();
@@ -9078,30 +11057,6 @@ pub mod tests {
         eprintln!("[TEST] Correctly rejected cross-wallet state consumption: {}", msg);
     }
 
-    /// Boundary test for required_overlap formula at various k values.
-    /// Formula: floor(k/2) + 1 for explicit values, ceil((k+1)/2) for general.
-    /// k=3 → 2, k=5 → 3, k=7 → 4.
-    #[test]
-    fn test_sabr_required_overlap_boundary() {
-        // Explicit table values
-        assert_eq!(ConsensusEngine::required_overlap(3), 2, "k=3 needs 2");
-        assert_eq!(ConsensusEngine::required_overlap(5), 3, "k=5 needs 3");
-
-        // k=7 falls through to general formula: ceil((7+1)/2) = 4
-        assert_eq!(ConsensusEngine::required_overlap(7), 4, "k=7 needs 4");
-
-        // Verify strict majority: overlap > k/2 for all tested values
-        for k in [3usize, 4, 5, 6, 7, 8, 9, 10] {
-            let required = ConsensusEngine::required_overlap(k);
-            assert!(required * 2 > k,
-                "k={}: required_overlap={} must be strict majority (> k/2={})",
-                k, required, k as f64 / 2.0);
-            // Also verify it's not MORE than k (impossible to get more overlaps than k)
-            assert!(required <= k,
-                "k={}: required_overlap={} must not exceed k", k, required);
-        }
-    }
-
     /// Adversarial: Overlapped path must return balance from storage, NEVER from
     /// the client's claimed_balance_for_sabr. Store balance=1000, client claims
     /// 9999. Verify returned balance is exactly 1000.
@@ -9125,7 +11080,7 @@ pub mod tests {
             last_tx_id: None,
             status: WalletStateStatus::Confirmed,
             group_members: None,
-            auth_hash: None, hibernation_until: 0,
+            auth_hash: None, hibernation_until: 0, wall_clock_lock: 0, emission_claimed_epoch: 0, stake_floor_until: 0, wallet_format: axiom_core_logic::types::WalletFormat::CURRENT,
             wallet_id: None,
         };
         engine.storage.set_genesis_state(&pk_arr, 3, 1, &wallet_state).unwrap();
@@ -9382,94 +11337,7 @@ pub mod tests {
     // Step 9B.3 — Withdrawal mint witness handler
     // ─────────────────────────────────────────────────────────────────
 
-    /// Bad withdrawal (forged Nabla signature) is rejected at the
-    /// Lambda-side verify chain BEFORE the AVM round-trip — efficient
-    /// short-circuit, no signed mint emitted.
-    #[tokio::test(flavor = "current_thread")]
-    async fn withdrawal_mint_witness_rejects_bad_attestation_signature() {
-        use axiom_core_logic::types::WithdrawalMintWitnessRequest;
-        use axiom_core_logic::wire_client::{
-            EarningsEntry, QueryValidatorEarningsResponse,
-            QueryValidatorPoolResponse, ValidatorWithdrawalRequest,
-        };
 
-        // Build a withdrawal request with a tampered signature.
-        use fips205::slh_dsa_sha2_128s;
-        use fips205::traits::SerDes;
-        let (sphincs_pk, _sphincs_sk) = slh_dsa_sha2_128s::try_keygen()
-            .expect("sphincs keygen");
-        let sphincs_pk_bytes = sphincs_pk.into_bytes().to_vec();
-        let validator_id: [u8; 32] = *blake3::hash(&sphincs_pk_bytes).as_bytes();
-        let chosen_witnesses = vec![[0x44; 32], [0x55; 32], [0x66; 32]];
-        let entries = vec![EarningsEntry {
-            tx_hash: [0x01; 32], amount: 30, tick: 5,
-            full_fee_breakdown: vec![],
-        }];
-        let nabla_sk = ed25519_dalek::SigningKey::from_bytes(&[0xAB; 32]);
-        let nabla_pk = nabla_sk.verifying_key().to_bytes().to_vec();
-        let earnings = QueryValidatorEarningsResponse {
-            validator_id, since_tick: 0, until_tick: 100,
-            total_amount: 30, net_balance: 27, entries, is_authoritative: true,
-            nabla_node_id: [0xCC; 32], nabla_node_pk: nabla_pk,
-            nabla_signature: vec![0u8; 64],  // BOGUS sig — won't verify
-            nbc_issuer_pk: vec![], nbc_signature: vec![], nbc_commitment: vec![],
-        };
-        let req = WithdrawalMintWitnessRequest {
-            request_id: "test-bad-sig".into(),
-            withdrawal: ValidatorWithdrawalRequest {
-                validator_id,
-                earnings_attestation: earnings,
-                pool_linkage: QueryValidatorPoolResponse {
-                    validator_id, registered: true,
-                    linked_wallet_id: [0xAA; 32],
-                    linkage_epoch: 1, registered_at_tick: 50,
-                },
-                sphincs_pk: sphincs_pk_bytes,
-                sphincs_sig: vec![0u8; 7856],  // also bogus
-                chosen_witnesses,
-            },
-        };
-
-        let engine = tests::create_test_engine();
-        let resp = engine.process_withdrawal_mint_witness(&req).await;
-        assert_eq!(resp.status, "REJECTED_EARNINGS_SIG");
-        assert!(resp.witness_sig.is_none(),
-            "no signature on a rejection");
-        assert!(resp.mint.is_none(),
-            "no mint output on a rejection");
-    }
-
-    /// Missing withdrawal_inputs (caller bug — should never happen in
-    /// practice, but the handler defensively rejects with a clear
-    /// status string).
-    #[tokio::test(flavor = "current_thread")]
-    async fn withdrawal_mint_witness_rejects_zero_validator_id() {
-        use axiom_core_logic::types::WithdrawalMintWitnessRequest;
-        use axiom_core_logic::wire_client::{
-            QueryValidatorEarningsResponse, QueryValidatorPoolResponse,
-            ValidatorWithdrawalRequest,
-        };
-
-        // SPHINCS+ pk that does NOT hash to validator_id=0.
-        let sphincs_pk_bytes = vec![0xDE; 32];
-        let req = WithdrawalMintWitnessRequest {
-            request_id: "test-id-mismatch".into(),
-            withdrawal: ValidatorWithdrawalRequest {
-                validator_id: [0; 32],  // doesn't match BLAKE3(sphincs_pk)
-                earnings_attestation: QueryValidatorEarningsResponse::default(),
-                pool_linkage: QueryValidatorPoolResponse::default(),
-                sphincs_pk: sphincs_pk_bytes,
-                sphincs_sig: vec![],
-                chosen_witnesses: vec![[1; 32], [2; 32], [3; 32]],
-            },
-        };
-
-        let engine = tests::create_test_engine();
-        let resp = engine.process_withdrawal_mint_witness(&req).await;
-        assert_eq!(resp.status, "REJECTED_ID_MISMATCH");
-        assert!(resp.witness_sig.is_none());
-        assert!(resp.mint.is_none());
-    }
 
     // ── YPX-001 §1.5.1 scar-consent gate trigger ─────────────────────────
     // These pin the ACTIVE trigger contract (2026-07-11): unresolved links
@@ -9486,6 +11354,7 @@ pub mod tests {
             tx_id: [0x11; 32],
             previous_state_id: [0x22; 32],
             new_state_id: [0x33; 32],
+            out_of_order_confirmation: None,
             amount: 1_000_000,
             burn_target_tx_id: None,
             tick: 7,
@@ -9505,13 +11374,13 @@ pub mod tests {
             } else {
                 None
             },
-            receiver_contact: None,
             burn_proof: None,
             recall_proof: None,
             sender_anchor: None,
             is_dev_class: false,
             inherited_scar_txids: Vec::new(),
             inherited_scar_resolutions: Vec::new(),
+            receiver_witness: None,
         }
     }
 
@@ -9534,7 +11403,6 @@ pub mod tests {
             nonce: 42,
             epoch: 1_700_000_000,
             client_sig: vec![0xCC; 64],
-            owner_proof: None,
             scar_passcode: None,
             burn_target_tx_id: None,
             recall_target_tx_id: None,
@@ -9556,7 +11424,7 @@ pub mod tests {
             scar_test_link(3, true),
             scar_test_link(3, false), // unresolved → gates
         ]);
-        assert_eq!(scar_consent_gate_count(&chain, &scar_test_tx(), false), 1);
+        assert_eq!(scar_consent_gate_count(&chain, &scar_test_tx(), None), 1);
     }
 
     #[test]
@@ -9565,7 +11433,7 @@ pub mod tests {
             scar_test_link(3, true),
             scar_test_link(3, true),
         ]);
-        assert_eq!(scar_consent_gate_count(&chain, &scar_test_tx(), false), 0);
+        assert_eq!(scar_consent_gate_count(&chain, &scar_test_tx(), None), 0);
     }
 
     #[test]
@@ -9576,13 +11444,29 @@ pub mod tests {
             scar_test_link(0, false),
             scar_test_link(0, false),
         ]);
-        assert_eq!(scar_consent_gate_count(&chain, &scar_test_tx(), false), 0);
+        assert_eq!(scar_consent_gate_count(&chain, &scar_test_tx(), None), 0);
         // …but a connected-mode scar alongside them still gates.
         let mixed = scar_test_chain(vec![
             scar_test_link(0, false),
             scar_test_link(3, false),
         ]);
-        assert_eq!(scar_consent_gate_count(&mixed, &scar_test_tx(), false), 1);
+        assert_eq!(scar_consent_gate_count(&mixed, &scar_test_tx(), None), 1);
+    }
+
+    #[test]
+    fn scar_gate_clara_exempts_only_the_heal_link() {
+        // KI#256 / YPX-001 §1.5.1: the heal link (confirmation on /clara) is not a
+        // scar; every OTHER unresolved link still gates the post-heal send.
+        let mut heal_link = scar_test_link(3, false);
+        heal_link.tx_id = [0x77; 32];
+        let chain = scar_test_chain(vec![heal_link.clone()]);
+        assert_eq!(scar_consent_gate_count(&chain, &scar_test_tx(), Some([0x77; 32])), 0);
+        assert_eq!(scar_consent_gate_count(&chain, &scar_test_tx(), None), 1);
+        let mut other = scar_test_link(3, false);
+        other.tx_id = [0x55; 32];
+        let both = scar_test_chain(vec![other, heal_link]);
+        assert_eq!(scar_consent_gate_count(&both, &scar_test_tx(), Some([0x77; 32])), 1,
+            "a CLARA attestation must not waive consent for another scar");
     }
 
     #[test]
@@ -9590,25 +11474,26 @@ pub mod tests {
         let chain = scar_test_chain(vec![scar_test_link(3, false)]);
 
         // CLARA attestation present (YPX-018)
-        assert_eq!(scar_consent_gate_count(&chain, &scar_test_tx(), true), 0);
+        assert_eq!(scar_consent_gate_count(&chain, &scar_test_tx(), Some([0xEE; 32])), 1,
+            "a CLARA attestation for ANOTHER link waives nothing (KI#256)");
 
         // Burn — the cure for scars
         let mut burn = scar_test_tx();
         burn.burn_target_tx_id = Some([0x11; 32]);
-        assert_eq!(scar_consent_gate_count(&chain, &burn, false), 0);
+        assert_eq!(scar_consent_gate_count(&chain, &burn, None), 0);
 
         // Recall — self-send recovery (YPX-022)
         let mut recall = scar_test_tx();
         recall.kind = TxKind::Recall;
-        assert_eq!(scar_consent_gate_count(&chain, &recall, false), 0);
+        assert_eq!(scar_consent_gate_count(&chain, &recall, None), 0);
 
         // Heal / HAL — self-sends, no external receiver
         let mut heal = scar_test_tx();
         heal.kind = TxKind::Heal;
-        assert_eq!(scar_consent_gate_count(&chain, &heal, false), 0);
+        assert_eq!(scar_consent_gate_count(&chain, &heal, None), 0);
         let mut hal = scar_test_tx();
         hal.kind = TxKind::HalReanchor;
-        assert_eq!(scar_consent_gate_count(&chain, &hal, false), 0);
+        assert_eq!(scar_consent_gate_count(&chain, &hal, None), 0);
     }
 
     // ── YPX-001 §1.5.1 consent-voucher verification ──────────────────────
@@ -9623,6 +11508,7 @@ pub mod tests {
         validator_pk: Vec<u8>,
     ) -> Receipt {
         Receipt {
+            sender_state: None,
             txid: [0u8; 32],
             state_hash: [0u8; 32],
             produced_state_id: [0u8; 32],
@@ -9657,6 +11543,7 @@ pub mod tests {
             fee_breakdown: vec![],
             is_dev_class: false,
             oods_flag: None,
+            confidence_index: None,
         }
     }
 
@@ -9722,11 +11609,907 @@ pub mod tests {
         let chain = scar_test_chain(vec![scar_test_link(3, false)]);
         let mut tx = scar_test_tx();
         tx.receiver_wallet_id = ark_id;
-        assert_eq!(scar_consent_gate_count(&chain, &tx, false), 0);
+        assert_eq!(scar_consent_gate_count(&chain, &tx, None), 0);
 
         // Mangled wallet_ids fall through to gating (fail-closed).
         let mut mangled = scar_test_tx();
         mangled.receiver_wallet_id = "not-a-wallet-id".to_string();
-        assert_eq!(scar_consent_gate_count(&chain, &mangled, false), 1);
+        assert_eq!(scar_consent_gate_count(&chain, &mangled, None), 1);
+    }
+}
+
+/// The two shape rules a `TxKind::VbcRequest` certificate must satisfy before
+/// this validator will sign it.
+///
+/// Free-standing (not a method) so a test can drive it directly — see
+/// `sign_requested_vbc`, which is `async` and needs a whole engine.
+/// Why a validator that knows nothing of a redeem's declared receiver state
+/// refuses the redeem early. See [`fresh_validator_redeem_refusal`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FreshRedeemRefusal {
+    /// Fable review 2026-10-01 F-1(a): the declared receiver state claims
+    /// history (it is not the wallet's OPENING state —
+    /// `WalletState::is_opening_state` is false), this
+    /// validator neither holds a row for the receiver nor witnessed the tx that
+    /// produced the declared state, and the request carries fewer prior-hop
+    /// sigs (`fact_witness_sigs`) than the receipt's overlap needs — so this
+    /// validator cannot be overlapped and cannot be carried by overlap either.
+    UnanchoredDeclaredState,
+}
+
+/// The fresh-validator redeem gate (redeem Step 1b) — ONE function, so a test
+/// drives the rule the production path runs (RULE 6 §3a). LAMBDA HYGIENE: an
+/// early, cheap refusal. The ENFORCEMENT is Core CL5 (Fable review 2026-10-01
+/// F-1(b)): `modes::cl5_anchor_receiver_state` anchors the declared state to
+/// the receiver's last k-signed receipt (`RedeemRequestEnvelope::prev_receipts`)
+/// and `modes::cl5_receiver_overlap` requires `sabr_overlap(prev_k)` verified
+/// prior-hop sigs at any validator that did not witness that receipt.
+///
+/// `known` = this validator holds a non-zero row for the receiver OR stores the
+/// `TransactionRecord` of the tx that PRODUCED the declared state
+/// (`get_transaction_record(declared.state_id)`). `fact_sig_count` =
+/// `request.fact_witness_sigs.len()`; `required_overlap` = `sabr_overlap(prev_k)`
+/// of the carried receipt. `declared_is_opening` = `Some(current_state.
+/// is_opening_state(receiver_pk, tier))`, `None` when `current_state` is
+/// missing (refused by the §15 gate further down, `E_MISSING_WALLET_STATE`). The
+/// wallet's OPENING state needs no anchor and is never refused here.
+///
+/// ⚠ WRONG READING #3, corrected the same day (B2, measured in code): the first
+/// build's "first-time" predicate was `is_first_time_zero` (`state_id == 0`),
+/// but the SDK's fresh wallet declares its OPENING id (`wallet.rs::
+/// create_with_key`) — so every FIRST-TIME receive was refused at every
+/// validator (none holds a row for a never-seen wallet). The predicate is now
+/// `WalletState::is_opening_state`, the one Core's anchor uses.
+///
+/// ⚠ WRONG READING #1, corrected 2026-10-01 (Fable review F-1; RULE 0 §4). Until
+/// that date the gate fired only `if overlap_count > 0 && overlap_count <
+/// required` on the envelope's `overlapped_signatures` — a field the SDK ALWAYS
+/// sent empty — so it never fired for an honest client (a ghost), and its
+/// comment called the zero-overlap case "either first-time (legitimate) or a
+/// replay routed to avoid overlap (illegitimate)", with the txid attestation as
+/// "the second line of defense". That attestation is about the CHEQUE, not the
+/// receiver's state, and Step 6 computed on the declared state with the lock /
+/// floor from the row (0 with no row), so ONE redeem at k row-less validators
+/// walked a wallet out of its stake lock and floor. `overlapped_signatures` is
+/// DELETED from the redeem envelope (replaced by `prev_receipts`).
+///
+/// ⚠ WRONG READING #2, corrected the same day (Fable F-1(b) review §6 — a
+/// LIVENESS defect in the first fix). The first F-1(a) build keyed "known" on
+/// the `wallets` row ALONE. The send path writes that row at the FINALIZER only
+/// (V1/V2 store just the `TransactionRecord`), so a wallet whose last tx was a
+/// SEND — the genesis claim's self-send → self-redeem is exactly this shape —
+/// was refused by two of its three previous witnesses. Keyed on the
+/// TransactionRecord too, every witness of the producing round knows the state
+/// (test: `f1a_genesis_claim_self_redeem_shape_is_known_at_all_three_witnesses`).
+pub(crate) fn fresh_validator_redeem_refusal(
+    known: bool,
+    fact_sig_count: usize,
+    required_overlap: usize,
+    declared_is_opening: Option<bool>,
+) -> Option<FreshRedeemRefusal> {
+    if known {
+        return None;
+    }
+    if fact_sig_count < required_overlap && declared_is_opening == Some(false) {
+        return Some(FreshRedeemRefusal::UnanchoredDeclaredState);
+    }
+    None
+}
+
+/// TARDIS forward-only bound, applied by the VALIDATOR to a client-carried
+/// Nabla OODS attestation (Fable review 2026-10-01 F-3; YP §26.7.4, YPX-003
+/// §1.3.4 "wall clock is allowed in exactly two places"). The SAME rule a Nabla node applies to a gossiped
+/// tick (`nabla/src/tardis.rs`, handle_tick step 2) — forward-only, refuse a
+/// tick too far ahead of this node's own wall clock — with a WIDER, stated
+/// skew: `tuning_gen::ATTESTED_TICK_FUTURE_SKEW_SECS` (= 300 s,
+/// protocol_lambda.toml; owner ruling 2026-10-02) instead of gossip's
+/// `TICK_INTERVAL_SECS` (5 s). Mail delay only makes a carried tick OLDER, so
+/// it never trips this; only validator clock skew does, and 300 s still blocks
+/// a far-future tick (negligible vs a ~6-month floor / 1-year lock). NO past-side bound
+/// — an old attestation is not a timing violation (every time-gated Core rule
+/// reads an OLD tick as "not yet", which fails closed); only a FUTURE tick buys
+/// a lapsed stake floor, a released lock or an expired certificate early.
+///
+/// Why Lambda and not Core: Core has no clock (RULE 7; CLAUDE.md "only Core
+/// checks 64-bit time at launch"), and `tx.epoch` is client-chosen, so Core
+/// cannot bound an attested tick against anything the client does not pick.
+/// Every Lambda entry point that hands an attestation to Core —
+/// `process_witness_request` (CL2/CL3, and CL8 via `sign_requested_vbc`) and
+/// `process_redeem_request` (CL5) — calls this ONE helper first.
+///
+/// `None` (no attestation) passes: absence is judged by each Core gate on its
+/// own terms (a floor / lock gate reads `None` as "holds").
+pub(crate) fn check_attested_tick_not_future(
+    oods_attestation: Option<&axiom_core_logic::types::NablaOodsAttestation>,
+    now_secs: u64,
+) -> Result<(), LambdaError> {
+    let Some(att) = oods_attestation else { return Ok(()) };
+    let bound = now_secs.saturating_add(crate::tuning_gen::ATTESTED_TICK_FUTURE_SKEW_SECS);
+    if att.tick > bound {
+        return Err(LambdaError::AttestedTickInFuture { tick: att.tick, now_secs, bound });
+    }
+    Ok(())
+}
+
+/// §5.2.2d — the fields an ISSUER derives, checked against what the candidate
+/// declared on a certificate about to be signed VERBATIM.
+///
+/// Checked, never overwritten. Silently rewriting one of these would produce a
+/// perfectly valid signature over a document the candidate is not holding —
+/// which is the failure mode `validator_join.rs::assemble` reports as "the
+/// issuers signed a DIFFERENT certificate", and the reason the old rebuild-from-
+/// scalars path could not work.
+pub(crate) fn check_issuer_derived_fields(
+    vbc: &axiom_core_logic::types::VBC,
+    validator_id: [u8; 32],
+    founding_vbc_hash: [u8; 32],
+    oods_attestation: Option<&axiom_core_logic::types::NablaOodsAttestation>,
+) -> Result<(), String> {
+    // (a) `validator_id` is BLAKE3 of the subject's SPHINCS+ key. Derived,
+    //     never declared — an id that disagrees with the key it is supposed to
+    //     name is a forged identity.
+    if vbc.validator_id != validator_id {
+        return Err("vbc_request validator_id is not BLAKE3 of its own \
+             subject_pubkey_sphincs".into());
+    }
+
+    // (b) `founding_vbc_hash` is HERITAGE, and heritage is earned through the
+    //     renewal gate, never declared. A candidate claiming a founding hash it
+    //     did not earn is claiming standing from someone else's history.
+    if vbc.founding_vbc_hash != founding_vbc_hash {
+        return Err(format!(
+            "vbc_request founding_vbc_hash is not the one this request earns \
+             ({} declared) — heritage is derived from the renewal predecessor, \
+             not stated",
+            hex::encode(&vbc.founding_vbc_hash[..8]),
+        ));
+    }
+
+    // (c) The OODS record must be the reading THIS validator was given, not a
+    //     number the candidate chose. The owner: the OODS record in the VBC is what
+    //     later justifies whether the certificate is trustworthy at all
+    //     (YPX-021 §7), so an issuer must not sign a health claim it has been
+    //     shown no evidence for.
+    //
+    //     ⚠ DEFENCE IN DEPTH, NOT THE ENFORCEMENT (RULE 5). A patched Lambda
+    //     skips this. THE ENFORCEMENT IS IN CORE: `execute_cl8` refuses to
+    //     sign a stamp that disagrees with the attestation it was given
+    //     (`Cl8OodsStampMismatch`), which is what makes the stamp trustworthy
+    //     enough for §5.3's issuing bar to be judged on it at every later
+    //     verification (`vbc::issuing_tick_for`). RULED 2026-09-04;
+    //     ValidatorJoin §5.3.5d. This check survives so the refusal carries a
+    //     legible message instead of a bare Core reject code.
+    if let Some(att) = oods_attestation {
+        if vbc.network_size_baseline != att.oods_size || vbc.baseline_tick != att.tick {
+            return Err(format!(
+                "vbc_request OODS stamp ({}, tick {}) disagrees with the \
+                 attestation carried by the request ({}, tick {}) — refusing to \
+                 sign a network-health record this validator has not been shown",
+                vbc.network_size_baseline, vbc.baseline_tick,
+                att.oods_size, att.tick,
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// §5.2.2e part iii — the issuer-side checks on a candidacy proof, as a pure
+/// function so a test drives every arm (RULE 6). `last_seed_tick` = the
+/// attested tick of this key's previous request at this issuer, if any.
+///
+/// Order is the cost order: window (free) → entry cap (free) → signature over
+/// Core's ONE payload (cheap; an unsigned proof is left to Core, never replayed)
+/// → the Argon2id sample replay (paid only for a signed, in-window, capped claim).
+pub(crate) fn check_candidacy_at_issuer(
+    p: &axiom_core_logic::wire_client::PulseProofRequest,
+    last_seed_tick: Option<u64>,
+) -> Result<(), LambdaError> {
+    const MAX_ENTRIES: u64 = crate::tuning_gen::PULSE_CANDIDACY_MAX_ENTRIES;
+    const INTERVAL: u64 = crate::tuning_gen::PULSE_CANDIDACY_MIN_REQUEST_INTERVAL_TICKS;
+    // Untimed (part i shape): Core refuses it (1321); nothing to replay.
+    let Some(seed_tick) = p.attested_tick else { return Ok(()) };
+    if let Some(last) = last_seed_tick {
+        let since = seed_tick.saturating_sub(last);
+        if since < INTERVAL {
+            return Err(LambdaError::CandidacyPulseRate {
+                key_hex: hex::encode(p.validator_pk),
+                wait_ticks: INTERVAL - since,
+            });
+        }
+    }
+    if p.entry_count as u64 > MAX_ENTRIES {
+        return Err(LambdaError::CandidacyPulseWork(format!(
+            "entry_count {} exceeds this issuer's replay cap {}", p.entry_count, MAX_ENTRIES)));
+    }
+    let payload = axiom_core_logic::pulse::pulse_proof_sign_payload(
+        &p.validator_pk, p.epoch, &p.full_accumulator, &p.audit_hash, Some(seed_tick));
+    if !axiom_core_logic::pulse::verify_pulse_proof_sig(&p.validator_pk, &p.signature, &payload) {
+        return Ok(()); // Core refuses it (1320); do not pay Argon2id for an unsigned claim
+    }
+    // The replay is the one check here that costs real work, so it says
+    // so in the log either way — a check nobody can see run is a ghost.
+    let t0 = std::time::Instant::now();
+    match axiom_dmap_vm::verify_self_audit_sample(
+        &p.validator_pk, seed_tick, p.entry_count, p.sample_size, &p.full_accumulator, &p.audit_hash,
+    ) {
+        Ok(()) => {
+            info!(
+                "[CANDIDACY-PULSE] replay OK key={} seed_tick={} entries={} sample={} argon2id_per_sec={} replay_ms={}",
+                &hex::encode(p.validator_pk)[..16], seed_tick, p.entry_count, p.sample_size,
+                p.argon2id_per_sec, t0.elapsed().as_millis());
+            Ok(())
+        }
+        Err(why) => {
+            warn!(
+                "[CANDIDACY-PULSE] replay REFUSED key={} seed_tick={} entries={} sample={} replay_ms={}: {}",
+                &hex::encode(p.validator_pk)[..16], seed_tick, p.entry_count, p.sample_size,
+                t0.elapsed().as_millis(), why);
+            Err(LambdaError::CandidacyPulseWork(why.to_string()))
+        }
+    }
+}
+
+#[cfg(test)]
+mod candidacy_issuer_tests {
+    use super::*;
+    use ed25519_dalek::Signer;
+
+    fn signed(sk: &ed25519_dalek::SigningKey, tick: u64, entries: u32) -> axiom_core_logic::wire_client::PulseProofRequest {
+        let pk = sk.verifying_key().to_bytes();
+        let p = axiom_dmap_vm::self_audit_pulse(&pk, tick, entries);
+        let payload = axiom_core_logic::pulse::pulse_proof_sign_payload(&pk, p.epoch, &p.full_accumulator, &p.audit_hash, Some(tick));
+        axiom_core_logic::wire_client::PulseProofRequest {
+            validator_pk: pk, epoch: p.epoch, full_accumulator: p.full_accumulator, entry_count: p.entry_count,
+            sample_size: p.sample_size, audit_hash: p.audit_hash, argon2id_per_sec: p.argon2id_per_sec,
+            signature: sk.sign(&payload).to_bytes().to_vec(), attested_tick: Some(tick),
+        }
+    }
+
+    /// Every arm, in cost order: a real proof passes; the same key inside the
+    /// window is rated; over the cap is refused without replay; a forged hash
+    /// is refused BY THE REPLAY; an unsigned proof is left to Core.
+    #[test]
+    fn the_issuer_pays_only_for_a_signed_in_window_claim_and_refuses_what_does_not_reproduce() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x81u8; 32]);
+        let tick = 2_000_000u64;
+        let entries = axiom_core_logic::pulse::PULSE_CANDIDACY_MIN_ENTRIES as u32;
+        let p = signed(&sk, tick, entries);
+        assert!(check_candidacy_at_issuer(&p, None).is_ok(), "a real self-audit reproduces at the issuer");
+        match check_candidacy_at_issuer(&p, Some(tick - 1)) {
+            Err(LambdaError::CandidacyPulseRate { .. }) => {}
+            other => panic!("inside the window must be rated, got {:?}", other.map(|_| ())),
+        }
+        assert!(check_candidacy_at_issuer(&p, Some(tick - crate::tuning_gen::PULSE_CANDIDACY_MIN_REQUEST_INTERVAL_TICKS)).is_ok());
+        let mut big = p.clone(); big.entry_count = (crate::tuning_gen::PULSE_CANDIDACY_MAX_ENTRIES + 1) as u32;
+        assert!(matches!(check_candidacy_at_issuer(&big, None), Err(LambdaError::CandidacyPulseWork(_))), "over the cap is refused");
+        let mut forged = p.clone(); forged.audit_hash[0] ^= 1;
+        let payload = axiom_core_logic::pulse::pulse_proof_sign_payload(&forged.validator_pk, forged.epoch, &forged.full_accumulator, &forged.audit_hash, Some(tick));
+        forged.signature = sk.sign(&payload).to_bytes().to_vec(); // signed, so the replay is what catches it
+        assert!(matches!(check_candidacy_at_issuer(&forged, None), Err(LambdaError::CandidacyPulseWork(_))), "a signed forged hash is caught by the replay");
+        let mut unsigned = p.clone(); unsigned.signature[3] ^= 1;
+        assert!(check_candidacy_at_issuer(&unsigned, None).is_ok(), "an unsigned claim is Core's to refuse, never replayed");
+        let mut untimed = p.clone(); untimed.attested_tick = None;
+        assert!(check_candidacy_at_issuer(&untimed, None).is_ok(), "an untimed proof is Core's 1321");
+    }
+}
+
+pub(crate) fn check_vbc_request_shape(
+    vbc: &axiom_core_logic::types::VBC,
+    client_pk: &[u8],
+) -> Result<(), String> {
+    // (a) It must be UNSIGNED. A cert arriving with signatures already on it
+    //     is a replay, or an attempt to have us countersign work we did not
+    //     do — either way we are not being asked to ISSUE.
+    if !vbc.signatures.is_empty() {
+        return Err("vbc_request certificate already carries signatures — \
+             refusing to countersign a cert this validator did not issue"
+            .into());
+    }
+
+    // (b) ⚠ SUBJECT BINDING — the load-bearing check.
+    //     The witness round proves who SENT the request (the transaction is
+    //     signed by `client_pk`). It proves NOTHING about who the certificate
+    //     is FOR. Without this pin, any wallet could run a VbcRequest round
+    //     naming SOMEONE ELSE'S keys as the subject and collect three
+    //     signatures on a certificate it does not hold the key to — or, worse,
+    //     on one whose subject is an existing validator.
+    //
+    //     Ed25519 is the right key to pin: it is the transaction signer and,
+    //     per `validator-setup.sh`, a validator's Ed25519 IS its wallet key
+    //     ("One key. One identity."). The SPHINCS+ key rides the certificate
+    //     and is covered by the issuer signature once we sign.
+    if vbc.subject_pubkey_ed25519.as_slice() != client_pk {
+        return Err("vbc_request subject_pubkey_ed25519 does not match the \
+             transaction signer — refusing to issue a certificate for a key \
+             the requester has not proved it holds"
+            .into());
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod vbc_request_shape_tests {
+    use super::{check_issuer_derived_fields, check_vbc_request_shape};
+    use axiom_core_logic::types::{NablaOodsAttestation, VBC};
+
+    fn candidate_cert(signer: &[u8]) -> VBC {
+        VBC {
+            network_size_baseline: 0,
+            baseline_tick: 0,
+            version: 0x09,
+            validator_id: [1u8; 32],
+            subject_pubkey_sphincs: vec![2u8; 32],
+            subject_pubkey_dilithium: vec![],
+            subject_pubkey_ed25519: signer.to_vec(),
+            pgp_fingerprint: vec![],
+            node_name: "candidate".into(),
+            issued_at: 1_000,
+            expires_at: 1_000 + 3_600,
+            chain_depth: 1,
+            issuer_set: vec![vec![9u8; 32], vec![8u8; 32], vec![7u8; 32]],
+            signatures: vec![],
+            proof_cap: "1".into(),
+            max_tx: 0,
+            founding_vbc_hash: [0u8; 32],
+            genesis_lineage: [0u8; 32],
+            nabla_registration: None,
+        }
+    }
+
+    /// The honest case: the requester asks for a certificate for its own key.
+    #[test]
+    fn a_self_addressed_request_is_accepted() {
+        let signer = vec![3u8; 32];
+        assert!(check_vbc_request_shape(&candidate_cert(&signer), &signer).is_ok());
+    }
+
+    /// ⚠ THE ATTACK THIS CHECK EXISTS FOR.
+    ///
+    /// A wallet runs a perfectly valid witness round — its own signature, its
+    /// own sequence, its own anchoring — but names SOMEONE ELSE as the
+    /// certificate's subject. Every other gate in the round passes, because
+    /// nothing else in a witness round has any opinion about who a certificate
+    /// is for. Remove this check and three issuers will happily sign a
+    /// credential for a key the requester does not hold.
+    #[test]
+    fn a_request_naming_someone_elses_key_is_refused() {
+        let victim = vec![3u8; 32];
+        let attacker = vec![4u8; 32];
+        let err = check_vbc_request_shape(&candidate_cert(&victim), &attacker)
+            .expect_err(
+                "a certificate request whose subject is NOT the transaction \
+                 signer must be refused — signing it issues a credential for \
+                 a key the requester has not proved it holds",
+            );
+        assert!(err.contains("does not match the"), "got: {err}");
+    }
+
+    // ── §5.2.2d — the certificate is signed VERBATIM, so the fields the
+    //    ISSUER owns must be checked rather than rebuilt ─────────────────
+    //
+    // Before 2026-09-04 `commit_vbc_sign` reconstructed the certificate from
+    // eight scalars, which dropped `genesis_lineage`, both OODS baseline
+    // fields and the issuers' own certificates — CL8 then refused at the first
+    // §5.3 issuer lookup. Signing the presented document fixes that, and these
+    // are the three things that must NOT come from the candidate.
+
+    fn attestation(size: u32, tick: u64) -> NablaOodsAttestation {
+        NablaOodsAttestation {
+            oods_size: size,
+            tick,
+            baseline_size: 0,
+            baseline_tick: 0,
+            nabla_node_pk: [0u8; 32],
+            nabla_signature: vec![],
+            nbc_issuer_pk: vec![],
+            nbc_signature: vec![],
+            nbc_commitment: vec![],
+        }
+    }
+
+    /// A well-formed request: the id is BLAKE3 of its own subject key, no
+    /// heritage is claimed, and the OODS stamp is the reading the issuer holds.
+    /// Without this positive control the refusal tests below could all be
+    /// passing because the fixture is broken.
+    #[test]
+    fn a_correctly_derived_certificate_is_accepted() {
+        let mut vbc = candidate_cert(&[3u8; 32]);
+        let id = *blake3::hash(&vbc.subject_pubkey_sphincs).as_bytes();
+        vbc.validator_id = id;
+        vbc.network_size_baseline = 12;
+        vbc.baseline_tick = 1_700_000_000;
+        assert!(check_issuer_derived_fields(
+            &vbc, id, [0u8; 32], Some(&attestation(12, 1_700_000_000)),
+        ).is_ok());
+    }
+
+    /// An id that does not name its own subject key is a forged identity.
+    #[test]
+    fn a_validator_id_that_does_not_derive_from_the_subject_key_is_refused() {
+        let vbc = candidate_cert(&[3u8; 32]); // validator_id is [1u8; 32]
+        let real = *blake3::hash(&vbc.subject_pubkey_sphincs).as_bytes();
+        let err = check_issuer_derived_fields(&vbc, real, [0u8; 32], None)
+            .expect_err("validator_id is DERIVED — a declared one must be refused");
+        assert!(err.contains("BLAKE3"), "got: {err}");
+    }
+
+    /// HERITAGE THEFT. `founding_vbc_hash` is what a renewal carries forward;
+    /// a candidate that states one is claiming standing from a history that is
+    /// not its own.
+    #[test]
+    fn a_declared_founding_hash_is_refused() {
+        let mut vbc = candidate_cert(&[3u8; 32]);
+        let id = *blake3::hash(&vbc.subject_pubkey_sphincs).as_bytes();
+        vbc.validator_id = id;
+        vbc.founding_vbc_hash = [0x77u8; 32]; // someone else's lineage anchor
+        let err = check_issuer_derived_fields(&vbc, id, [0u8; 32], None)
+            .expect_err("heritage is derived from the renewal predecessor, not stated");
+        assert!(err.contains("founding_vbc_hash"), "got: {err}");
+    }
+
+    /// The OODS record is what later justifies whether the certificate is
+    /// TRUSTWORTHY (YPX-021 §7). An issuer must not sign a network-health
+    /// claim it has been shown no evidence for — including the zero stamp,
+    /// which reads as "genesis-exempt", i.e. excused from that judgement
+    /// entirely.
+    #[test]
+    fn an_oods_stamp_the_issuer_was_not_shown_is_refused() {
+        let mut vbc = candidate_cert(&[3u8; 32]);
+        let id = *blake3::hash(&vbc.subject_pubkey_sphincs).as_bytes();
+        vbc.validator_id = id;
+        let att = attestation(12, 1_700_000_000);
+
+        // Invented health.
+        vbc.network_size_baseline = 9_999;
+        vbc.baseline_tick = att.tick;
+        let err = check_issuer_derived_fields(&vbc, id, [0u8; 32], Some(&att))
+            .expect_err("a self-declared network size must be refused");
+        assert!(err.contains("OODS stamp"), "got: {err}");
+
+        // Right size, wrong moment — a stale reading is not this reading.
+        vbc.network_size_baseline = att.oods_size;
+        vbc.baseline_tick = att.tick - 10_000;
+        assert!(
+            check_issuer_derived_fields(&vbc, id, [0u8; 32], Some(&att)).is_err(),
+            "a baseline_tick that is not the attestation's must be refused",
+        );
+
+        // The zero stamp — "genesis-exempt" — is not available to a newcomer.
+        vbc.network_size_baseline = 0;
+        vbc.baseline_tick = 0;
+        assert!(
+            check_issuer_derived_fields(&vbc, id, [0u8; 32], Some(&att)).is_err(),
+            "a zero OODS stamp reads as genesis-exempt and must not be signed \
+             for a candidate whose request carried a real reading",
+        );
+    }
+
+    /// A certificate arriving already signed is not an issuance request.
+    #[test]
+    fn a_presigned_certificate_is_refused() {
+        let signer = vec![3u8; 32];
+        let mut vbc = candidate_cert(&signer);
+        vbc.signatures = vec![vec![0u8; 64]];
+        let err = check_vbc_request_shape(&vbc, &signer)
+            .expect_err("a pre-signed certificate must not be countersigned");
+        assert!(err.contains("already carries signatures"), "got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod vbc_bundle_load_tests {
+    //! ValidatorJoin §6b.12 (KI#171) — the validator's certificate loads as Core's bundle, whole.
+    use super::*;
+    use axiom_core_logic::types::VBC;
+
+    fn vbc(sphincs: u8) -> VBC {
+        VBC {
+            genesis_lineage: [0u8; 32], version: 0x09, validator_id: [sphincs; 32],
+            subject_pubkey_sphincs: vec![sphincs; 32], subject_pubkey_dilithium: vec![], subject_pubkey_ed25519: vec![2u8; 32],
+            pgp_fingerprint: vec![], node_name: String::new(), proof_cap: String::new(), issued_at: 1, expires_at: 2,
+            chain_depth: 0, issuer_set: vec![], signatures: vec![], max_tx: 0, founding_vbc_hash: [0u8; 32],
+            network_size_baseline: 0, baseline_tick: 0, nabla_registration: None,
+        }
+    }
+
+    /// Every signed field the hand-rolled JSON loader dropped must survive the load, and the
+    /// issuer chain with it. Red if anyone reintroduces a lossy file shape.
+    #[test]
+    fn the_certificate_bundle_loads_whole() {
+        let mut target = vbc(7);
+        target.proof_cap = "dmap".into();
+        target.genesis_lineage = [9u8; 32];
+        target.network_size_baseline = 10;
+        target.baseline_tick = 1_789_391_415;
+        target.chain_depth = 1;
+        target.node_name = "community-1".into();
+        target.issuer_set = vec![vec![1u8; 32], vec![3u8; 32], vec![4u8; 32]];
+        target.signatures = vec![vec![0u8; 8]; 3];
+        let issuer = vbc(1);
+        let bundle = VBCProofBundle { target_vbc: target, supporting_vbcs: vec![issuer.clone(), issuer.clone(), issuer], candidacy_pulse: None, renewal_work_receipt: None };
+        let path = std::env::temp_dir().join(format!("vbc_bundle_load_{}.cbor", std::process::id()));
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&bundle, &mut cbor).unwrap();
+        std::fs::write(&path, &cbor).unwrap();
+        let loaded = ConsensusEngine::load_vbc_from_file(&path).expect("a CBOR bundle loads");
+        let _ = std::fs::remove_file(&path);
+        let t = &loaded.target_vbc;
+        assert_eq!((t.proof_cap.as_str(), t.genesis_lineage, t.network_size_baseline, t.baseline_tick, t.chain_depth),
+                   ("dmap", [9u8; 32], 10, 1_789_391_415, 1));
+        assert_eq!(t.node_name, "community-1");
+        assert_eq!(loaded.supporting_vbcs.len(), 3, "the issuer chain is loaded, not dropped");
+    }
+
+    /// No fallback: a legacy JSON file at vbc_path is a startup error that names the fix.
+    #[test]
+    fn a_json_file_at_vbc_path_is_refused() {
+        let path = std::env::temp_dir().join(format!("vbc_json_refused_{}.json", std::process::id()));
+        std::fs::write(&path, br#"{"subject_pubkey_sphincs_hex":"07"}"#).unwrap();
+        let err = ConsensusEngine::load_vbc_from_file(&path).err().expect("JSON must not load");
+        let _ = std::fs::remove_file(&path);
+        assert!(format!("{err}").contains("vbc-bundle.cbor"), "the error names the file to use: {err}");
+    }
+}
+
+/// Fable review 2026-10-01 — F-1(a) (the fresh-validator redeem gate) and F-3
+/// (the TARDIS forward-only bound on a carried OODS attestation). The pure
+/// rules are driven directly (RULE 6 §3a); the engine-level tests prove each
+/// Lambda entry point actually routes through them, so deleting a call site
+/// turns a named test red.
+#[cfg(test)]
+mod fable_20261001_tests {
+    use super::*;
+    use axiom_core_logic::types::{NablaOodsAttestation, WalletFormat, WalletState};
+    use std::sync::atomic::Ordering::Relaxed;
+
+    fn zero_state() -> WalletState {
+        WalletState {
+            public_key: vec![9u8; 32],
+            balance: 0,
+            wallet_seq: 0,
+            state_id: [0u8; 32],
+            auth_hash: None,
+            wallet_id: None,
+            group_members: None,
+            hibernation_until: 0,
+            wall_clock_lock: 0,
+            emission_claimed_epoch: 0,
+            stake_floor_until: 0,
+            wallet_format: WalletFormat::CURRENT,
+        }
+    }
+
+    /// A returning wallet that has just been floored + is stake-locked, as the
+    /// F-1 attacker would declare it at a row-less validator WITH the floor and
+    /// lock zeroed: balance and seq are still non-zero, so it is history.
+    fn returning_state_with_floor_declared_away() -> WalletState {
+        WalletState { balance: 500, wallet_seq: 7, state_id: [0x5A; 32], ..zero_state() }
+    }
+
+    fn att(tick: u64) -> NablaOodsAttestation {
+        NablaOodsAttestation {
+            oods_size: 10,
+            tick,
+            baseline_size: 10,
+            baseline_tick: 0,
+            nabla_node_pk: [0u8; 32],
+            nabla_signature: vec![],
+            nbc_issuer_pk: vec![],
+            nbc_signature: vec![],
+            nbc_commitment: vec![],
+        }
+    }
+
+    // ── F-1(a) — the pure rule ───────────────────────────────────────────
+
+    /// The receiver tier of every test cheque below (`test@example.com`, "45").
+    fn tier() -> (u8, u8) {
+        let wid = axiom_core_logic::wallet_id::generate_wallet_id("test@example.com", "45", &[0u8; 32]).unwrap();
+        axiom_core_logic::wallet_id::extract_security_level(&wid).unwrap()
+    }
+    fn opening(s: &WalletState) -> Option<bool> {
+        let (k, pt) = tier();
+        Some(s.is_opening_state(&[9u8; 32], k, pt))
+    }
+
+    /// A genuinely first-time receiver (zero state) redeems ANYWHERE — a fresh
+    /// validator with no row and no overlap signatures must accept it.
+    #[test]
+    fn f1a_first_time_zero_receiver_redeems_at_a_fresh_validator() {
+        assert_eq!(fresh_validator_redeem_refusal(false, 0, 2, opening(&zero_state())), None);
+    }
+
+    /// The F-1 attack: a non-zero declared state, zero overlap signatures, at a
+    /// validator holding no row → refused. Mutation-tested: deleting the
+    /// `UnanchoredDeclaredState` arm (the pre-2026-10-01 gate) turns this red.
+    #[test]
+    fn f1a_fresh_validator_refuses_unanchored_non_zero_declared_state() {
+        assert_eq!(
+            fresh_validator_redeem_refusal(false, 0, 2, opening(&returning_state_with_floor_declared_away())),
+            Some(FreshRedeemRefusal::UnanchoredDeclaredState),
+        );
+        // Each history-bearing field ALONE is enough — a wallet whose only
+        // history is a floor / lock / hibernation term is still not first-time.
+        let lone: [(&str, fn(&mut WalletState)); 6] = [
+            ("balance", |s| s.balance = 1),
+            ("wallet_seq", |s| s.wallet_seq = 1),
+            ("stake_floor_until", |s| s.stake_floor_until = 1),
+            ("wall_clock_lock", |s| s.wall_clock_lock = 1),
+            ("hibernation_until", |s| s.hibernation_until = 1),
+            ("emission_claimed_epoch", |s| s.emission_claimed_epoch = 1),
+        ];
+        for (name, set) in lone {
+            let mut s = zero_state();
+            set(&mut s);
+            assert_eq!(
+                fresh_validator_redeem_refusal(false, 0, 2, opening(&s)),
+                Some(FreshRedeemRefusal::UnanchoredDeclaredState),
+                "{} alone must be refused at a row-less validator", name,
+            );
+        }
+    }
+
+    /// A validator that KNOWS the state (holds a row, or witnessed the tx that
+    /// produced it) is not judged by this gate — Core's anchor + overlap judge
+    /// it — so the returning receiver redeems there.
+    #[test]
+    fn f1a_known_validator_is_not_refused_by_the_fresh_gate() {
+        assert_eq!(
+            fresh_validator_redeem_refusal(true, 0, 2, opening(&returning_state_with_floor_declared_away())),
+            None,
+        );
+    }
+
+    /// F-1(b): a FRESH validator carried by enough prior-hop sigs (the
+    /// finalizer of a round whose earlier hops were the receiver's previous
+    /// witnesses) is not refused early — Core verifies those sigs. One short is
+    /// refused. Mutation-tested: `<` → `<=` turns the first row red.
+    #[test]
+    fn f1b_fresh_validator_carried_by_overlap_sigs_is_judged_by_core() {
+        let s = returning_state_with_floor_declared_away();
+        assert_eq!(fresh_validator_redeem_refusal(false, 2, 2, opening(&s)), None);
+        assert_eq!(fresh_validator_redeem_refusal(false, 1, 2, opening(&s)),
+                   Some(FreshRedeemRefusal::UnanchoredDeclaredState));
+        // A first-time zero state is never refused here, carried sigs or not.
+        assert_eq!(fresh_validator_redeem_refusal(false, 1, 2, opening(&zero_state())), None);
+        // A missing current_state is refused later (§15 gate), not here.
+        assert_eq!(fresh_validator_redeem_refusal(false, 0, 2, None), None);
+    }
+
+    /// B2 (2026-10-01, measured): the SDK's FRESH wallet declares its OPENING
+    /// id, not the zero id — `sdk/core/src/wallet.rs::create_with_key`. The
+    /// first F-1(a) build (`is_first_time_zero`) refused that at every
+    /// validator, i.e. EVERY first-time receive. Mutation-tested: restoring the
+    /// `state_id == 0` predicate turns this red.
+    #[test]
+    fn f1a_sdk_fresh_wallet_opening_id_is_first_time_not_history() {
+        let (k, pt) = tier();
+        let fresh = WalletState {
+            state_id: axiom_core_logic::genesis::opening_state_id_for(&[9u8; 32], k, pt),
+            ..zero_state()
+        };
+        assert_eq!(fresh_validator_redeem_refusal(false, 0, 2, opening(&fresh)), None,
+                   "a never-seen wallet's first receive must pass at any validator");
+    }
+
+    // ── F-3 — the pure rule ──────────────────────────────────────────────
+
+    /// Forward-only: `tick <= now + ATTESTED_TICK_FUTURE_SKEW_SECS` (300 s,
+    /// owner ruling 2026-10-02) passes, one second more
+    /// is refused, and there is NO past-side bound. Mutation-tested: `>` → `>=`
+    /// turns the boundary row red; deleting the comparison turns the future row
+    /// red; adding any past bound turns the ancient row red.
+    #[test]
+    fn f3_forward_only_bound_at_the_validator() {
+        let now = 1_800_000_000u64;
+        let iv = crate::tuning_gen::ATTESTED_TICK_FUTURE_SKEW_SECS;
+        assert_eq!(iv, 300, "owner ruling 2026-10-02: the validator's forward skew is 300 s");
+        assert!(check_attested_tick_not_future(None, now).is_ok(), "no attestation: nothing to bound");
+        assert!(check_attested_tick_not_future(Some(&att(now + axiom_core_logic::types::TICK_INTERVAL_SECS + 1)), now).is_ok(),
+                "a carried tick past gossip's 5 s but inside 300 s is ordinary validator clock skew — admitted");
+        assert!(check_attested_tick_not_future(Some(&att(now)), now).is_ok());
+        assert!(check_attested_tick_not_future(Some(&att(now + iv)), now).is_ok(), "the bound itself is admitted");
+        match check_attested_tick_not_future(Some(&att(now + iv + 1)), now) {
+            Err(LambdaError::AttestedTickInFuture { tick, now_secs, bound }) => {
+                assert_eq!((tick, now_secs, bound), (now + iv + 1, now, now + iv));
+            }
+            other => panic!("one second past the bound must be refused, got {:?}", other),
+        }
+        assert!(check_attested_tick_not_future(Some(&att(u64::MAX)), now).is_err(), "far future (a bought clock)");
+        assert!(check_attested_tick_not_future(Some(&att(1)), now).is_ok(), "NO past-side bound");
+    }
+
+    /// The refusal reaches the wire as its own code (consumers read
+    /// `error_response.code`, not the Rust enum).
+    #[test]
+    fn f3_refusal_maps_to_its_wire_code() {
+        let e = LambdaError::AttestedTickInFuture { tick: 10, now_secs: 1, bound: 6 };
+        let resp: axiom_errors::ErrorResponse = (&e).into();
+        assert_eq!(resp.code.as_str(), axiom_errors::error_code::E_LAMBDA_ATTESTED_TICK_FUTURE);
+        assert_eq!(resp.category, axiom_errors::ErrorCategory::ProtocolReject);
+    }
+
+    // ── Routing: every entry point calls the helpers ─────────────────────
+
+    fn future_tick() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 3_600
+    }
+
+    /// `process_witness_request` (CL2 / CL3 / CL8 via `sign_requested_vbc`)
+    /// refuses a future attested tick before any Core execution, and counts it.
+    /// Mutation-tested: deleting its `refuse_future_attested_tick` call turns
+    /// this red (the request then reaches Core and fails on something else).
+    #[tokio::test]
+    async fn f3_witness_entry_point_refuses_future_tick() {
+        let engine = super::tests::create_test_engine();
+        let mut request = super::tests::create_test_request();
+        request.oods_attestation = Some(att(future_tick()));
+        match engine.process_witness_request(request).await {
+            Err(LambdaError::AttestedTickInFuture { .. }) => {}
+            other => panic!("witness entry must refuse a future attested tick first, got {:?}", other.map(|r| r.success)),
+        }
+        assert_eq!(engine.stats.attested_tick_future_refused.load(Relaxed), 1);
+    }
+
+    fn redeem_request(current_state: WalletState, tick: Option<u64>) -> RedeemRequestEnvelope {
+        let receiver_wallet_id = axiom_core_logic::wallet_id::generate_wallet_id(
+            "test@example.com", "45", &[0u8; 32],
+        ).unwrap();
+        let cheque = |n: u8| ValidatorCheque {
+            fact_certificates: Vec::new(),
+            recall_target_tx_id: None,
+            txid: [0x12; 32],
+            validator_id: [n; 32],
+            validator_pk: vec![n; 32],
+            signature: vec![0u8; 64],
+            execution_proof: vec![],
+            vbc_bundle: None,
+            carrier_type: "test".to_string(),
+            carrier_address: "test-validator".to_string(),
+            sender_wallet_id: "alice@example.com/87654321".to_string(),
+            receiver_wallet_id: receiver_wallet_id.clone(),
+            amount: 1_000,
+            rate_bps: 10,
+            reference: "test".to_string(),
+            epoch: 1,
+            created_at: 12345,
+            state_hash: [0x11; 32],
+            produced_state_id: [0x22; 32],
+            sender_fact_chain: None,
+            zkp_nonce: None,
+            proof_type: 1,
+            dmap_input_hash: [0u8; 32],
+            dmap_output_hash: [0u8; 32],
+            oracle_claim: None,
+            nabla_hint: None,
+            sender_wallet_pk: None,
+        };
+        RedeemRequestEnvelope {
+            request_id: String::new(),
+            cheque_bundle: ChequeBundle { cheques: vec![cheque(1), cheque(2), cheque(3), cheque(4), cheque(5)], fact_chain: None },
+            receiver_pk: vec![9u8; 32],
+            current_state: Some(current_state),
+            prev_receipts: vec![],
+            receiver_sig: vec![0u8; 64],
+            validator_hints: vec![],
+            receiver_fact_chain: None,
+            cl5_execution_proof: vec![1u8],
+            txid_attestation: None,
+            cheque_claim_proof: None,
+            oods_attestation: tick.map(att),
+            fact_witness_sigs: vec![],
+        }
+    }
+
+    /// `process_redeem_request` (CL5) refuses a future attested tick first.
+    /// Mutation-tested: deleting its `refuse_future_attested_tick` call turns
+    /// this red.
+    #[tokio::test]
+    async fn f3_redeem_entry_point_refuses_future_tick() {
+        let engine = super::tests::create_test_engine();
+        let req = redeem_request(zero_state(), Some(future_tick()));
+        match engine.process_redeem_request(req).await {
+            Err(LambdaError::AttestedTickInFuture { .. }) => {}
+            other => panic!("redeem entry must refuse a future attested tick first, got {:?}",
+                            other.map(|r| r.error_response.map(|e| e.code.as_str().to_string()))),
+        }
+        assert_eq!(engine.stats.attested_tick_future_refused.load(Relaxed), 1);
+    }
+
+    /// The redeem path runs the F-1(a) gate: at an engine holding no row for
+    /// the receiver, the attacker's non-zero declared state is refused at Step
+    /// 1b and counted; the first-time zero state passes Step 1b (it fails later,
+    /// on the dummy cheques — the point is that it is NOT this refusal).
+    /// Mutation-tested: restoring the pre-fix gate (`overlap_count > 0 && …`
+    /// only) turns the first half red.
+    #[tokio::test]
+    async fn f1a_redeem_entry_point_runs_the_fresh_validator_gate() {
+        let engine = super::tests::create_test_engine();
+        let resp = engine
+            .process_redeem_request(redeem_request(returning_state_with_floor_declared_away(), None))
+            .await
+            .expect("Step 1b answers with a RedeemResponse, not an Err");
+        assert!(!resp.success);
+        let er = resp.error_response.expect("refusal carries an error_response");
+        assert_eq!(er.code.as_str(), axiom_errors::error_code::E_SABR_INSUFFICIENT_OVERLAP);
+        assert!(er.message.contains("never witnessed the receiver's declared"), "{}", er.message);
+        assert_eq!(engine.stats.redeem_unanchored_state_refused.load(Relaxed), 1);
+
+        let first_time = engine.process_redeem_request(redeem_request(zero_state(), None)).await;
+        if let Ok(r) = &first_time {
+            if let Some(er) = &r.error_response {
+                assert!(!er.message.contains("never witnessed the receiver's declared"),
+                        "a first-time zero state must pass the fresh-validator gate: {}", er.message);
+            }
+        }
+        assert_eq!(engine.stats.redeem_unanchored_state_refused.load(Relaxed), 1,
+                   "the zero state did not touch the F-1 counter");
+    }
+
+    /// Fable F-1(b) review §6 — THE LIVENESS DEFECT in the first F-1(a) build,
+    /// measured on the genesis-claim shape: the claim SEND is witnessed by
+    /// {V1, V2, V3}; the send path writes the `wallets` row at the FINALIZER
+    /// only, while EVERY witness stores the `TransactionRecord` keyed by the
+    /// produced state. The self-REDEEM goes back to the same three. An engine
+    /// standing in for each witness role must let the redeem past Step 1b:
+    ///   * V1/V2 (non-finalizers): record only, no row  — the case the
+    ///     row-only predicate refused;
+    ///   * V3 (finalizer): row + record.
+    /// Mutation-tested: keying `known` on the row alone (the first build)
+    /// turns the V1/V2 rows red (counter 1, the F-1 message).
+    #[tokio::test]
+    async fn f1a_genesis_claim_self_redeem_shape_is_known_at_all_three_witnesses() {
+        let claim_state = WalletState {
+            balance: 0, wallet_seq: 1, state_id: [0xC1; 32], ..zero_state()
+        };
+        let record = || TransactionRecord {
+            tx_id: [0xC0; 32],
+            produced_state_id: claim_state.state_id,
+            wallet_pk: claim_state.public_key.clone(),
+            balance_after: 0,
+            wallet_seq_after: 1,
+            group_members_after: None,
+            is_genesis_claim: Some(true),
+            status: WalletStateStatus::Pending,
+            required_k: 3,
+            proof_type: 1,
+            amount: 0,
+            sender_balance: 0,
+        };
+        for (role, with_row) in [("V1 (non-finalizer)", false), ("V2 (non-finalizer)", false), ("V3 (finalizer)", true)] {
+            let engine = super::tests::create_test_engine();
+            engine.storage.store_transaction_record(&record()).unwrap();
+            if with_row {
+                let row = StoredWalletState {
+                    public_key: claim_state.public_key.clone(), balance: 0, wallet_seq: 1,
+                    state_id: claim_state.state_id, last_tx_id: None,
+                    status: WalletStateStatus::Pending, group_members: None, auth_hash: None,
+                    hibernation_until: 0, wall_clock_lock: 0, emission_claimed_epoch: 0,
+                    stake_floor_until: 0, wallet_format: WalletFormat::CURRENT, wallet_id: None,
+                };
+                // The receiver tier of the test cheques (`test@example.com`, "45").
+                let (k, pt) = axiom_core_logic::wallet_id::extract_security_level(
+                    &redeem_request(claim_state.clone(), None).cheque_bundle.cheques[0].receiver_wallet_id,
+                ).unwrap();
+                engine.storage.set_wallet_state(&row, k, pt).unwrap();
+            }
+            // Honest SDK, pre-dispatched non-final hop: ZERO prior-hop sigs.
+            let resp = engine.process_redeem_request(redeem_request(claim_state.clone(), None)).await;
+            if let Ok(r) = &resp {
+                if let Some(er) = &r.error_response {
+                    assert!(!er.message.contains("never witnessed the receiver's declared"),
+                            "{}: a witness of the claim send must pass Step 1b: {}", role, er.message);
+                }
+            }
+            assert_eq!(engine.stats.redeem_unanchored_state_refused.load(Relaxed), 0,
+                       "{}: the F-1 counter must not move", role);
+        }
+        // Control: an engine that witnessed NOTHING refuses the same request.
+        let engine = super::tests::create_test_engine();
+        let _ = engine.process_redeem_request(redeem_request(claim_state, None)).await;
+        assert_eq!(engine.stats.redeem_unanchored_state_refused.load(Relaxed), 1,
+                   "a validator that never witnessed the state refuses early");
     }
 }

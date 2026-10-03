@@ -66,6 +66,46 @@ impl From<&LambdaError> for ErrorResponse {
                 ErrorCategory::Internal,
                 format!("Core execution error: {}", s),
             ),
+            // YPX-009 §7.2 (RULED 2026-09-10, the owner: "if pulse fail, reject").
+            // Operational, not a protocol reject of the client's transaction:
+            // THIS validator cannot vouch for its own DB right now. The client
+            // retries with another validator (S-ABR picks one).
+            // §5.2.2e part iii — the issuer replayed the proof's sample and it
+            // does not reproduce: the candidate's claim is wrong, not the mesh.
+            LambdaError::CandidacyPulseWork(why) => ErrorResponse::new(
+                ErrorCode::from_static(error_code::E_LAMBDA_CANDIDACY_PULSE_WORK),
+                ErrorCategory::ProtocolReject,
+                format!("candidacy Pulse refused by the issuer's replay: {}", why),
+            )
+            .with_yp_reference("ValidatorJoin §5.2.2e part iii"),
+            LambdaError::CandidacyPulseRate { key_hex, wait_ticks } => ErrorResponse::new(
+                ErrorCode::from_static(error_code::E_LAMBDA_CANDIDACY_PULSE_RATE),
+                ErrorCategory::Operational,
+                format!("one provisional request per key per window at this issuer — key {} must wait {} ticks", key_hex, wait_ticks),
+            )
+            .with_recovery(RecoveryHint::WaitAndRetry)
+            .with_yp_reference("ValidatorJoin §5.2.2e part iii"),
+            // Fable review 2026-10-01 F-3 — the TARDIS forward-only bound at the
+            // validator. The CARRIED attestation is the problem (a Nabla node whose
+            // clock runs ahead, or a bought one), so a different validator with an
+            // honest clock refuses it identically: fetch a fresh attestation.
+            LambdaError::AttestedTickInFuture { tick, now_secs, bound } => ErrorResponse::new(
+                ErrorCode::from_static(error_code::E_LAMBDA_ATTESTED_TICK_FUTURE),
+                ErrorCategory::ProtocolReject,
+                format!(
+                    "carried OODS attestation tick {} is ahead of this validator's clock {} \
+                     by more than the forward skew bound (max {}) — refused before execution",
+                    tick, now_secs, bound,
+                ),
+            )
+            .with_yp_reference("YP §26.7.4 / YPX-003 §1.3.4"),
+            LambdaError::PulseAuditFailed(label) => ErrorResponse::new(
+                ErrorCode::from_static(error_code::E_LAMBDA_PULSE_AUDIT_FAILED),
+                ErrorCategory::Operational,
+                format!("Pulse audit failed on {} — this validator refuses to sign", label),
+            )
+            .with_recovery(RecoveryHint::RetryDifferentValidator)
+            .with_yp_reference("YPX-009 §7.2"),
             LambdaError::CoreError(s) => ErrorResponse::new(
                 ErrorCode::from_static("E_CORE_UNCLASSIFIED"),
                 ErrorCategory::Internal,
@@ -420,13 +460,6 @@ fn classify_core_pass_through(
             None,
             None,
         )
-    } else if s.contains("E_AUTH_HASH_REQUIRED") {
-        (
-            error_code::E_AUTH_HASH_REQUIRED,
-            ErrorCategory::ClientBug,
-            None,
-            Some("YPX-007 §39.3"),
-        )
     } else if s.contains("E_GENESIS_STAKE_LOCKED") {
         (
             error_code::E_GENESIS_STAKE_LOCKED,
@@ -627,5 +660,38 @@ mod tests {
         let resp: ErrorResponse = err.into();
         assert_eq!(resp.category, ErrorCategory::Internal);
         assert!(resp.message.contains("sqlite busy"));
+    }
+
+    /// A PROTOCOL rejection must never be reported as an internal fault.
+    ///
+    /// Regression for 2026-07-27: the S-ABR early-reject in
+    /// `consensus.rs::process_witness_request` and the CL9 reject (CL9 since
+    /// removed, 2026-09-15) both wrapped
+    /// their verdict in `CoreError(String)`, which maps to
+    /// `E_CORE_UNCLASSIFIED` / `Internal`. The client therefore could not tell a
+    /// protocol refusal from a crash, and the `ClaraHealNextSend` hint — the
+    /// whole point of the S-ABR drift path — was dropped. Both sites now carry
+    /// `CoreRejected(ValidationError)`, which classifies structurally.
+    #[test]
+    fn sabr_mismatch_is_a_typed_protocol_verdict_not_internal() {
+        use axiom_core_logic::types::ValidationError;
+
+        let err = LambdaError::CoreRejected(Box::new(ValidationError::SABRHashMismatch));
+        let resp: ErrorResponse = (&err).into();
+
+        assert_eq!(resp.code.as_str(), "E_SABR_HASH_MISMATCH");
+        assert_ne!(resp.code.as_str(), "E_CORE_UNCLASSIFIED",
+                   "S-ABR mismatch must not be reported as an unclassified Core error");
+        assert_ne!(resp.category, ErrorCategory::Internal,
+                   "a protocol rejection is not an internal fault");
+        assert_eq!(resp.recovery, Some(RecoveryHint::ClaraHealNextSend),
+                   "the heal hint must survive — the SDK dispatches recovery on it");
+
+        // The generic wrapper still exists for genuine internal faults, and
+        // still classifies as Internal — that contrast is the point.
+        let internal: ErrorResponse = (&LambdaError::CoreError(
+            "Core did not provide commitment_hash".into())).into();
+        assert_eq!(internal.category, ErrorCategory::Internal);
+        assert_eq!(internal.code.as_str(), "E_CORE_UNCLASSIFIED");
     }
 }

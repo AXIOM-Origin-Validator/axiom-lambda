@@ -70,36 +70,9 @@ impl LambdaServer {
             &mgmt_key,
         )?);
 
-        // Load seed hints if configured (one-time bootstrap)
-        if let Some(ref seed_path) = config.storage.seed_hints_path {
-            if seed_path.exists() {
-                match std::fs::read_to_string(seed_path) {
-                    Ok(json_str) => {
-                        match serde_json::from_str::<Vec<axiom_core_logic::types::ValidatorHint>>(&json_str) {
-                            Ok(hints) => {
-                                let mut new_count = 0;
-                                for hint in &hints {
-                                    if let Ok(true) = storage.add_hint(hint) {
-                                        new_count += 1;
-                                    }
-                                }
-                                if new_count > 0 {
-                                    info!("Loaded {} new seed hints from {:?} (total: {})", 
-                                          new_count, seed_path, storage.hint_count());
-                                }
-                            }
-                            Err(e) => {
-                                info!("Could not parse seed hints {:?}: {} (skipping)", seed_path, e);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        info!("Could not read seed hints {:?}: {} (skipping)", seed_path, e);
-                    }
-                }
-            }
-        }
-        
+        // No seed-hints file (KI#174): `seed-hints.json` was retired 2026-05-19 (55f26e6d) —
+        // wallets relay hints into this table; `seeds/validators.list` seeds clients.
+
         // VBC path is mandatory — Lambda cannot start without a real VBC
         let vbc_path = config.validator.vbc_path.as_ref()
             .ok_or_else(|| LambdaError::ConfigError(
@@ -188,11 +161,17 @@ impl LambdaServer {
         engine.set_fee_and_operator_config(config.fees.clone(), config.operator.clone());
         engine.set_oracle_config(config.oracle.clone());
 
-        // YPX-009: Run ignition TX sequence (pulse-gate feature).
-        // Core stays blocked until this completes. Without pulse-gate, this is a no-op.
-        engine.ignite_sync()?;
+        // YPX-009: bind the validator pk into the AVM before any execution.
+        engine.bind_avm_validator_pk();
 
         let engine = Arc::new(engine);
+
+        // YPX-009 ignition = YPX-007 §9 ZKP qualification run (KI#125), on EVERY
+        // build, in the background: listening never waits on Nabla or the prover,
+        // and no Nabla/prover outcome stops service (status + optional record only).
+        // With `pulse-gate` the AVM blocks execution until the ignition completes;
+        // an ignition that never completes (error or panic) EXITS the process.
+        tokio::spawn(engine.clone().run_ignition());
         
         // Sync stats with storage (picks up seed hints loaded earlier)
         engine.sync_stats_from_storage();
@@ -654,10 +633,13 @@ async fn process_request(
                     engine.storage().mark_passcode_delivered(&txid).ok();
                     GatewayResponse::WitnessResult(Box::new(
                         crate::types::WitnessResponse {
+                            sender_state: None,
                             request_id,
                             success: false,
                             witness_signature: None,
                             overlapped_signatures: Vec::new(),
+                            // A rejection issues nothing.
+                            vbc_signature: None,
                             rejection: Some(crate::types::RejectionInfo {
                                 code: axiom_errors::error_code::E_LAMBDA_SCAR_CONSENT_REQUIRED
                                     .to_string(),
@@ -757,14 +739,6 @@ async fn process_request(
             }
         }
 
-        GatewayRequest::WithdrawalMintWitness(req) => {
-            debug!(
-                "WithdrawalMintWitness request: vid={}",
-                hex::encode(&req.withdrawal.validator_id[..8])
-            );
-            let response = engine.process_withdrawal_mint_witness(&req).await;
-            GatewayResponse::WithdrawalMintWitnessResult(response)
-        }
 
         // YP §20.8 v3.x (Step 9A 2026-06-02): FeeRedemption variant is gone.
         // Validator fees settle direct-deposit at CL5 redeem via the
@@ -829,6 +803,31 @@ async fn process_request(
         }
         
         GatewayRequest::VBCSignRequest (VBCSignRequestPayload { request_id, sphincs_pk_hex: _, dilithium_pk_hex: _, ed25519_pk_hex, pgp_fingerprint_hex: _, proof_cap, node_name: _ }) => {
+            // ╔═══════════════════════════════════════════════════════════╗
+            // ║  ⚠ NO PRODUCTION EMITTER — RULE 3 shape 3                  ║
+            // ╚═══════════════════════════════════════════════════════════╝
+            // `VBCSignRequest` / `VBCSignCommit` are a COMPLETE receiver with
+            // NOT ONE sender anywhere in the tree (verified 2026-09-03: the
+            // only hits are the type definitions, `lambda/src/types.rs`
+            // re-exports, and these two arms). `scripts/validator-setup.sh`
+            // prints "--request-vbc (not yet implemented)".
+            //
+            // This is the scaffolding CLAUDE.md's "Don't recreate" note records
+            // as reverted at `51d993d7` — the receiver survived the revert.
+            //
+            // ⚠ AND IT IS NOW THE OLD SHAPE. The owner ruled 2026-09-02 that a VBC
+            // request is an ORDINARY TRANSACTION (§5.2.2d): the candidate runs a
+            // normal k-witness round and each witness returns a CL8 signature
+            // where a cheque would go. That path is LIVE — `consensus.rs::
+            // sign_requested_vbc`, driven by the SDK's `validator_join::
+            // request_vbc` — and it REUSES `commit_vbc_sign`, so these arms and
+            // the witness path share one issuance rule, one budget, one lineage.
+            //
+            // Retained, not deleted (RULE 4: mark superseded text, never remove
+            // it): the genesis ceremony has no wallet to run a witness round
+            // with, so an admin door may still be needed there. Do NOT build a
+            // client for these arms without ruling on that first — a second
+            // emitter would be a second way to spend the same signing budget.
             info!("VBC sign request (Phase 1 — approval): {}", request_id);
             match engine.approve_vbc_sign_request(&ed25519_pk_hex, &proof_cap) {
                 Ok(approval) => GatewayResponse::VBCSignApprovalResult (VBCSignApprovalResponse {
@@ -839,31 +838,74 @@ async fn process_request(
             }
         }
 
-        GatewayRequest::VBCSignCommit (VBCSignCommitPayload { request_id, sphincs_pk_hex: _, dilithium_pk_hex: _, ed25519_pk_hex: _, pgp_fingerprint_hex: _, proof_cap: _, node_name: _, issued_at: _, expires_at: _, chain_depth: _, issuer_set_hex: _ }) => {
-            // Phase 2: This request should go Gateway → Core (sign) → Lambda (record)
-            // Core does the SPHINCS+ signing, Lambda just records the budget decrement
-            // For now, return error — this needs to be orchestrated by Gateway, not Lambda
-            info!("VBC sign commit (Phase 2): {} — must be handled by Gateway→Core→Lambda", request_id);
-            gateway_error_raw(
-                request_id,
-                axiom_errors::error_code::E_LAMBDA_INVALID_REQUEST,
-                axiom_errors::ErrorCategory::ClientBug,
-                "VBC sign commit must be orchestrated by Gateway through Core. Lambda only approves.",
-            )
+        GatewayRequest::VBCSignCommit (VBCSignCommitPayload { request_id, sphincs_pk_hex, dilithium_pk_hex: _, ed25519_pk_hex, pgp_fingerprint_hex: _, proof_cap, node_name, issued_at, expires_at, chain_depth, issuer_set_hex, previous_vbc }) => {
+            // Phase 2 (AXIOM_DESIGN_ValidatorJoin.md §6a): Lambda orchestrates
+            // Core (CL8 signs) -> budget -> record. Core stays the signing
+            // boundary; Lambda never touches sign_sphincs.
+            info!("VBC sign commit (Phase 2): {}", request_id);
+            match engine.commit_vbc_sign(
+                &sphincs_pk_hex, &ed25519_pk_hex, &proof_cap, &node_name,
+                issued_at, expires_at, chain_depth, &issuer_set_hex,
+                &request_id,
+                previous_vbc,
+                // Same time source as approve_vbc_sign_request above. Not an
+                // attested tick — Lambda has none (KI#130).
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                // The gateway path carries no OODS reading, so a depth>0
+                // certificate is refused here — correctly. See the emitterless
+                // note above: this door predates §5.3 and has no client.
+                None,
+                // ... and it carries no CERTIFICATE either, only the scalars
+                // above, so `commit_vbc_sign` builds one. That is the legacy
+                // half of the split introduced 2026-09-04; the VbcRequest path
+                // passes the candidate's own document instead of rebuilding it.
+                None,
+                // §5.2.2e — no transaction on this door: the same clock as above.
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            ).await {
+                Ok((signature, signer_pk, commitment)) =>
+                    GatewayResponse::VBCSignCommitResult(VBCSignCommitResponse {
+                        request_id,
+                        success: true,
+                        signature_hex: hex::encode(&signature),
+                        signer_sphincs_pk_hex: hex::encode(&signer_pk),
+                        // Core's own commitment, so the candidate can verify
+                        // the signature independently rather than trusting us.
+                        commitment_hex: hex::encode(commitment),
+                        error: None,
+                    }),
+                Err(e) => gateway_error_from_lambda(request_id, &e),
+            }
         }
 
         GatewayRequest::PeerAuditRequest (PeerAuditRequestEnvelope { request_id, peer_audit_request }) => {
             info!("§23.14.6: Peer audit request: {}", request_id);
-            let response = engine.handle_peer_audit_request(&peer_audit_request).await;
+            let answer = engine.handle_peer_audit_request(&peer_audit_request).await;
 
-            // Resolve requester's email from hints
-            let requester_pk_hex = hex::encode(&peer_audit_request.requester_pk);
-            let requester_email = engine.resolve_validator_email(&requester_pk_hex);
+            // Resolve requester's email from hints — by its Ed25519 key (KI#211 twin).
+            // `None` for a built answer is counted; ANTIE then replies to the
+            // request's From: (KI#229), never drops it.
+            let answered = !matches!(answer, crate::consensus::PeerAuditAnswer::Dropped);
+            let requester_email =
+                engine.resolve_peer_audit_reply_email(&peer_audit_request.requester_pk, answered);
 
+            // KI#213: a NotHeld is an ANSWER (success), not a failure — ANTIE mails it back.
+            let (response, not_held) = match answer {
+                crate::consensus::PeerAuditAnswer::Held(r) => (Some(r), None),
+                crate::consensus::PeerAuditAnswer::NotHeld(nh) => (None, Some(nh)),
+                crate::consensus::PeerAuditAnswer::Dropped => (None, None),
+            };
             GatewayResponse::PeerAuditResult (PeerAuditResultPayload {
                 request_id,
-                success: response.is_some(),
+                success: response.is_some() || not_held.is_some(),
                 response,
+                not_held,
                 requester_email,
                 error: None,
             })
@@ -872,6 +914,21 @@ async fn process_request(
         GatewayRequest::PeerAuditResponse (PeerAuditResponseEnvelope { request_id, peer_audit_response }) => {
             info!("§23.14.6: Peer audit response: {}", request_id);
             engine.handle_peer_audit_response(&peer_audit_response).await;
+            GatewayResponse::PeerAuditResponseAck (PeerAuditResponseAck {
+                request_id,
+                success: true,
+            })
+        }
+
+        GatewayRequest::PeerAuditDispatchFailed (axiom_core_logic::types::PeerAuditDispatchFailedEnvelope { request_id, target_email, error }) => {
+            info!("§23.14.3: Peer audit dispatch FAILED (carrier): {}", request_id);
+            engine.handle_peer_audit_dispatch_failed(&target_email, &error).await;
+            GatewayResponse::PeerAuditResponseAck (PeerAuditResponseAck { request_id, success: true })
+        }
+
+        GatewayRequest::PeerAuditNotHeld (axiom_core_logic::types::PeerAuditNotHeldEnvelope { request_id, peer_audit_not_held }) => {
+            info!("§23.14.6: Peer audit NotHeld: {}", request_id);
+            engine.handle_peer_audit_not_held(&peer_audit_not_held).await;
             GatewayResponse::PeerAuditResponseAck (PeerAuditResponseAck {
                 request_id,
                 success: true,
